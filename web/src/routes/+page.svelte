@@ -3,6 +3,9 @@
 	import { api, wakeDevice, type AddressEntry, type Device } from '#lib/api.js';
 	import { ago, formatId } from '#lib/format.js';
 	import Icon from '#lib/Icon.svelte';
+	import PeerCard, { type PeerAction } from '#lib/PeerCard.svelte';
+	import { saveView, savedView } from '#lib/peer.js';
+	import ViewToggle from '#lib/ViewToggle.svelte';
 
 	let entries = $state<AddressEntry[]>([]);
 	let shared = $state<Device[]>([]);
@@ -82,6 +85,31 @@
 		setTimeout(() => (toast = null), 4000);
 	}
 
+	let view = $state(savedView('redesk.home.view'));
+	const setView = (v: 'grid' | 'list') => saveView('redesk.home.view', v);
+
+	const editEntry = (e: AddressEntry) => (editing = { id: e.device_id, alias: e.alias, tags: e.tags.join(', '), favorite: e.favorite, isNew: false });
+	const addShared = (d: Device) => api.put(`/api/address-book/${d.id}`, { alias: '', tags: [], favorite: false }).then(load);
+
+	function entryActions(e: AddressEntry): PeerAction[] {
+		const d = e.device;
+		return [
+			{ label: 'เชื่อมต่อ', icon: 'link', href: `/connect/${e.device_id}`, disabled: !d?.online },
+			...(d?.can_wake ? [{ label: 'ปลุกเครื่อง', icon: 'power', onclick: () => wake(e.device_id), disabled: waking === d.id } satisfies PeerAction] : []),
+			{ label: e.favorite ? 'นำออกจากรายการโปรด' : 'เพิ่มในรายการโปรด', icon: 'star', onclick: () => toggleFavorite(e), divider: true },
+			{ label: 'แก้ไข', icon: 'edit', onclick: () => editEntry(e) },
+			{ label: 'ลบ', icon: 'trash', onclick: () => remove(e.device_id), danger: true, divider: true }
+		];
+	}
+
+	function sharedActions(d: Device): PeerAction[] {
+		return [
+			{ label: 'เชื่อมต่อ', icon: 'link', href: `/connect/${d.id}`, disabled: !d.online },
+			...(d.can_wake ? [{ label: 'ปลุกเครื่อง', icon: 'power', onclick: () => wake(d.id), disabled: waking === d.id } satisfies PeerAction] : []),
+			...(!entries.some((e) => e.device_id === d.id) ? [{ label: 'เพิ่มในสมุดที่อยู่', icon: 'book', onclick: () => addShared(d) } satisfies PeerAction] : [])
+		];
+	}
+
 	async function toggleFavorite(e: AddressEntry) {
 		await api.put(`/api/address-book/${e.device_id}`, { alias: e.alias, tags: e.tags, favorite: !e.favorite });
 		await load();
@@ -113,8 +141,29 @@
 
 {#if shared.length}
 	<section class="mb-8">
-		<h2 class="mb-1 text-lg font-semibold">อุปกรณ์ที่แชร์กับฉัน</h2>
-		<p class="mb-4 text-sm text-muted">จากกลุ่มอุปกรณ์ที่ผู้ดูแลระบบเพิ่มคุณเป็นสมาชิก</p>
+		<div class="mb-4 flex flex-wrap items-end justify-between gap-3">
+			<div>
+				<h2 class="mb-1 text-lg font-semibold">อุปกรณ์ที่แชร์กับฉัน</h2>
+				<p class="text-sm text-muted">จากกลุ่มอุปกรณ์ที่ผู้ดูแลระบบเพิ่มคุณเป็นสมาชิก</p>
+			</div>
+			<ViewToggle bind:value={view} onchange={setView} />
+		</div>
+		{#if view === 'grid'}
+			<div class="grid grid-cols-[repeat(auto-fill,minmax(190px,1fr))] gap-4">
+				{#each shared as d (d.id)}
+					<PeerCard
+						id={d.id}
+						name={d.alias || d.hostname}
+						hostname={d.hostname}
+						os={d.os}
+						online={d.online}
+						canConnect={d.online}
+						detail={d.online ? d.os : `เห็นล่าสุด ${ago(d.last_seen_at)}`}
+						actions={sharedActions(d)}
+					/>
+				{/each}
+			</div>
+		{:else}
 		<div class="card divide-y divide-line">
 			{#each shared as d (d.id)}
 				<div class="flex items-center gap-3 px-4 py-3">
@@ -124,7 +173,7 @@
 						<p class="text-xs text-muted"><span class="mono">{formatId(d.id)}</span> · {d.online ? d.os : `เห็นล่าสุด ${ago(d.last_seen_at)}`}</p>
 					</div>
 					{#if !entries.some((e) => e.device_id === d.id)}
-						<button class="btn" title="เพิ่มในสมุดที่อยู่" onclick={() => api.put(`/api/address-book/${d.id}`, { alias: '', tags: [], favorite: false }).then(load)}>
+						<button class="btn" title="เพิ่มในสมุดที่อยู่" onclick={() => addShared(d)}>
 							<Icon name="book" />
 						</button>
 					{/if}
@@ -135,6 +184,7 @@
 				</div>
 			{/each}
 		</div>
+		{/if}
 	</section>
 {/if}
 
@@ -148,6 +198,7 @@
 		<button class="btn" onclick={() => (editing = { id: '', alias: '', tags: '', favorite: false, isNew: true })}>
 			<Icon name="plus" /> เพิ่ม
 		</button>
+		<ViewToggle bind:value={view} onchange={setView} />
 	</div>
 </div>
 
@@ -160,6 +211,24 @@
 		<Icon name="book" size={28} class="text-muted" />
 		<p class="font-medium">ยังไม่มีเครื่องในสมุดที่อยู่</p>
 		<p class="max-w-sm text-sm text-muted">เพิ่ม ID ของเครื่องที่ใช้บ่อย เพื่อดูสถานะออนไลน์และเชื่อมต่อได้ในคลิกเดียว</p>
+	</div>
+{:else if view === 'grid'}
+	<div class="grid grid-cols-[repeat(auto-fill,minmax(190px,1fr))] gap-4">
+		{#each shown as e (e.device_id)}
+			{@const d = e.device}
+			<PeerCard
+				id={e.device_id}
+				name={e.alias || d?.alias || d?.hostname || 'ไม่มีชื่อ'}
+				hostname={d?.hostname ?? ''}
+				os={d?.os ?? ''}
+				online={!!d?.online}
+				canConnect={!!d?.online}
+				favorite={e.favorite}
+				status={d ? '' : 'ยังไม่เคยลงทะเบียน'}
+				detail={[!d ? '' : d.online ? `ออนไลน์ · ${d.os}` : `เห็นล่าสุด ${ago(d.last_seen_at)}`, e.tags.length ? `แท็ก: ${e.tags.join(', ')}` : ''].filter(Boolean).join('\n')}
+				actions={entryActions(e)}
+			/>
+		{/each}
 	</div>
 {:else}
 	<div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
@@ -201,7 +270,7 @@
 					<button
 						class="btn"
 						title="แก้ไข"
-						onclick={() => (editing = { id: e.device_id, alias: e.alias, tags: e.tags.join(', '), favorite: e.favorite, isNew: false })}
+						onclick={() => editEntry(e)}
 					>
 						<Icon name="edit" />
 					</button>

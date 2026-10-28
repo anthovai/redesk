@@ -3,6 +3,9 @@
 	import { api, wakeDevice, type Device, type Group } from '#lib/api.js';
 	import { ago, fingerprint, formatId } from '#lib/format.js';
 	import Icon from '#lib/Icon.svelte';
+	import PeerCard, { type PeerAction } from '#lib/PeerCard.svelte';
+	import { saveView, savedView } from '#lib/peer.js';
+	import ViewToggle from '#lib/ViewToggle.svelte';
 
 	let devices = $state<Device[]>([]);
 	let loading = $state(true);
@@ -83,6 +86,18 @@
 		setTimeout(() => (toast = null), 4000);
 	}
 
+	let view = $state(savedView('redesk.devices.view'));
+
+	const canConnect = (d: Device) => d.online && !d.disabled;
+	function peerActions(d: Device): PeerAction[] {
+		return [
+			{ label: 'เชื่อมต่อ', icon: 'link', href: `/connect/${d.id}`, disabled: !canConnect(d) },
+			...(d.can_wake ? [{ label: 'ปลุกเครื่อง', icon: 'power', onclick: () => wake(d), disabled: waking === d.id } satisfies PeerAction] : []),
+			{ label: 'เพิ่มในสมุดที่อยู่', icon: 'book', onclick: () => addToBook(d) },
+			{ label: 'รายละเอียด', icon: 'edit', onclick: () => open(d), divider: true }
+		];
+	}
+
 	async function addToBook(d: Device) {
 		await act(() => api.put(`/api/address-book/${d.id}`, { alias: d.alias || d.hostname, tags: [], favorite: false }));
 	}
@@ -106,11 +121,36 @@
 			<Icon name="search" class="pointer-events-none absolute top-1/2 left-3 -translate-y-1/2 text-muted" />
 			<input class="input w-64 pl-9" placeholder="ค้นหา ID, ชื่อเครื่อง, IP" bind:value={filter} />
 		</div>
+		<ViewToggle bind:value={view} onchange={(v) => saveView('redesk.devices.view', v)} />
 	</div>
 </div>
 
 {#if error}<p class="mb-4 rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">{error}</p>{/if}
 
+{#if view === 'grid'}
+	{#if loading}
+		<p class="text-sm text-muted">กำลังโหลด…</p>
+	{:else if shown.length === 0}
+		<div class="card px-6 py-14 text-center text-sm text-muted">ไม่พบอุปกรณ์ — ติดตั้ง agent ตามคำแนะนำในหน้า "ตั้งค่าเซิร์ฟเวอร์"</div>
+	{:else}
+		<div class="grid grid-cols-[repeat(auto-fill,minmax(190px,1fr))] gap-4">
+			{#each shown as d (d.id)}
+				<PeerCard
+					id={d.id}
+					name={d.alias || d.hostname}
+					hostname={d.hostname}
+					os={d.os}
+					online={d.online}
+					canConnect={canConnect(d)}
+					dim={d.disabled}
+					status={d.disabled ? 'ปิดใช้งาน' : !d.public_key ? 'รอลงทะเบียนใหม่' : d.group_id ? groupName(d.group_id) : ''}
+					detail={[d.os && `${d.os} · v${d.agent_version}`, d.last_ip, d.online ? '' : `เห็นล่าสุด ${ago(d.last_seen_at)}`].filter(Boolean).join('\n')}
+					actions={peerActions(d)}
+				/>
+			{/each}
+		</div>
+	{/if}
+{:else}
 <div class="card overflow-x-auto">
 	<table class="table">
 		<thead>
@@ -168,6 +208,7 @@
 		</tbody>
 	</table>
 </div>
+{/if}
 
 {#if toast}
 	<div class="fixed bottom-5 left-1/2 z-30 -translate-x-1/2 rounded-lg border border-line bg-surface px-4 py-2 text-sm shadow-lg {toast.ok ? '' : 'text-danger'}" role="status">
