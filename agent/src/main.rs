@@ -7,7 +7,7 @@ use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use clap::{Parser, Subcommand};
 use tokio::io::AsyncBufReadExt;
 
-use aegiron_agent::config::{ApproveMode, Config, Verification};
+use aegiron_agent::config::{ApproveMode, Config, EncoderPref, Verification};
 use aegiron_agent::net::ProxyConfig;
 use aegiron_agent::{fingerprint, identity, service, signal};
 
@@ -72,6 +72,12 @@ enum Cmd {
         /// Let viewers draw on this screen (shown only by the desktop app)
         #[arg(long)]
         allow_whiteboard: Option<bool>,
+        /// Send this machine's audio to viewers (macOS 13+, Windows).
+        #[arg(long)]
+        allow_audio: Option<bool>,
+        /// H.264 encoder: auto (hardware when available) or software (OpenH264)
+        #[arg(long, value_enum)]
+        video_encoder: Option<EncoderPref>,
         #[arg(long)]
         max_fps: Option<u32>,
         #[arg(long)]
@@ -201,6 +207,8 @@ async fn main() -> Result<()> {
             allow_clipboard,
             allow_file_transfer,
             allow_whiteboard,
+            allow_audio,
+            video_encoder,
             max_fps,
             jpeg_quality,
             max_width,
@@ -221,6 +229,8 @@ async fn main() -> Result<()> {
             if let Some(v) = allow_clipboard { c.allow_clipboard = v; }
             if let Some(v) = allow_file_transfer { c.allow_file_transfer = v; }
             if let Some(v) = allow_whiteboard { c.allow_whiteboard = v; }
+            if let Some(v) = allow_audio { c.allow_audio = v; }
+            if let Some(v) = video_encoder { c.video_encoder = v; }
             if let Some(v) = max_fps { c.max_fps = v.clamp(1, 60); }
             if let Some(v) = jpeg_quality { c.jpeg_quality = v.clamp(10, 95); }
             if let Some(v) = max_width { c.max_width = v.clamp(320, 3840); }
@@ -255,7 +265,8 @@ async fn main() -> Result<()> {
             println!("Verification: {:?}, approve mode: {:?}", c.verification, c.approve_mode);
             println!("Device key:   {}", fingerprint(identity(&c)?.verifying_key().as_bytes()));
             println!("Server key:   {}", fingerprint(&B64.decode(&c.server_key)?));
-            println!("Input: {}, clipboard: {}, file transfer: {}, whiteboard: {}", c.allow_input, c.allow_clipboard, c.allow_file_transfer, c.allow_whiteboard);
+            println!("Input: {}, clipboard: {}, file transfer: {}, whiteboard: {}, audio: {}", c.allow_input, c.allow_clipboard, c.allow_file_transfer, c.allow_whiteboard, c.allow_audio);
+            println!("Encoder:      {:?}", c.video_encoder);
             println!("Direct/P2P:   {} (TCP port {})", if c.direct_enabled { "allowed" } else { "off (relay only)" }, c.direct_port);
             println!("Proxy:        {}", c.proxy.as_ref().map(|p| p.display()).unwrap_or_else(|| "none".into()));
             service::status()?;

@@ -57,6 +57,7 @@ struct Perms {
     clipboard: bool,
     files: bool,
     whiteboard: bool,
+    audio: bool,
 }
 
 fn split_who(who: &str) -> (String, String) {
@@ -107,6 +108,7 @@ enum Glyph {
     Clipboard,
     Folder,
     Pen,
+    Speaker,
 }
 
 fn glyph(ui: &Ui, rect: Rect, g: Glyph, color: Color32) {
@@ -141,6 +143,17 @@ fn glyph(ui: &Ui, rect: Rect, g: Glyph, color: Color32) {
         Glyph::Pen => {
             p.add(Shape::closed_line(vec![at(10.8, 2.2), at(13.8, 5.2), at(5.5, 13.5), at(1.8, 14.2), at(2.5, 10.5)], st));
             p.line_segment([at(9.0, 4.0), at(12.0, 7.0)], st);
+        }
+        Glyph::Speaker => {
+            p.add(Shape::convex_polygon(
+                [(1.5, 5.8), (4.5, 5.8), (8.5, 2.2), (8.5, 13.8), (4.5, 10.2), (1.5, 10.2)].iter().map(|&(x, y)| at(x, y)).collect(),
+                color,
+                Stroke::NONE,
+            ));
+            p.line_segment([at(11.0, 5.5), at(12.2, 8.0)], st);
+            p.line_segment([at(12.2, 8.0), at(11.0, 10.5)], st);
+            p.line_segment([at(13.4, 3.5), at(15.0, 8.0)], st);
+            p.line_segment([at(15.0, 8.0), at(13.4, 12.5)], st);
         }
     }
 }
@@ -192,9 +205,9 @@ impl App {
             .as_ref()
             .map(|a| {
                 let c = a.config.lock().unwrap();
-                Perms { input: c.allow_input, clipboard: c.allow_clipboard, files: c.allow_file_transfer, whiteboard: c.allow_whiteboard }
+                Perms { input: c.allow_input, clipboard: c.allow_clipboard, files: c.allow_file_transfer, whiteboard: c.allow_whiteboard, audio: c.allow_audio }
             })
-            .unwrap_or(Perms { input: false, clipboard: false, files: false, whiteboard: false });
+            .unwrap_or(Perms { input: false, clipboard: false, files: false, whiteboard: false, audio: false });
 
         // Tabs in arrival order: live sessions, then requests waiting for an answer.
         let mut entries: Vec<Entry> = sessions
@@ -357,6 +370,9 @@ impl App {
             }
             if c.allow_file_transfer {
                 p.push("รับ-ส่งไฟล์");
+            }
+            if c.allow_audio {
+                p.push("เสียง");
             }
             p.join(" · ")
         });
@@ -569,6 +585,7 @@ fn details(ui: &mut Ui, e: &Entry, perms: Perms) {
     });
     ui.horizontal(|ui| {
         perm_tile(ui, Glyph::Pen, "วาดบนหน้าจอ", perms.whiteboard, size);
+        perm_tile(ui, Glyph::Speaker, "เสียง", perms.audio, size);
     });
 }
 

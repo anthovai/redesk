@@ -28,6 +28,17 @@ pub enum ApproveMode {
     Both,
 }
 
+/// Which H.264 encoder sessions use.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum EncoderPref {
+    /// The platform's hardware encoder (VideoToolbox, Media Foundation) when it works, else OpenH264.
+    #[default]
+    Auto,
+    /// Always OpenH264 (software).
+    Software,
+}
+
 /// The person signed in from the desktop app (bearer token for the Aegiron API).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
@@ -84,6 +95,12 @@ pub struct Config {
     pub allow_clipboard: bool,
     #[serde(default = "yes")]
     pub allow_file_transfer: bool,
+    /// Send this machine's sound to viewers that ask for it.
+    #[serde(default = "yes")]
+    pub allow_audio: bool,
+    /// Hardware or software H.264 (absent in older configs = auto).
+    #[serde(default)]
+    pub video_encoder: EncoderPref,
     pub max_fps: u32,
     pub jpeg_quality: u8,
     pub max_width: u32,
@@ -138,6 +155,8 @@ impl Config {
             allow_input: true,
             allow_clipboard: true,
             allow_file_transfer: true,
+            allow_audio: true,
+            video_encoder: EncoderPref::Auto,
             max_fps: 15,
             jpeg_quality: 70,
             max_width: 1920,

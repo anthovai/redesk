@@ -108,6 +108,24 @@
 	});
 	const peerName = $derived(viewer.device?.alias || viewer.info?.hostname || viewer.device?.hostname || formatId(viewer.deviceId));
 	const codecLabel = $derived((viewer.info?.codec ?? 'jpeg').toUpperCase());
+	const encoderNames: Record<string, string> = {
+		videotoolbox: 'VideoToolbox (ฮาร์ดแวร์)',
+		mediafoundation: 'Media Foundation (ฮาร์ดแวร์)',
+		openh264: 'OpenH264 (ซอฟต์แวร์)',
+		jpeg: 'JPEG'
+	};
+	// Older agents do not report the encoder; they always used OpenH264 for H.264.
+	const encoderLabel = $derived.by(() => {
+		const e = viewer.info?.encoder ?? (viewer.info?.codec === 'h264' ? 'openh264' : viewer.info ? 'jpeg' : '');
+		return e ? (encoderNames[e] ?? e) : '—';
+	});
+	const audioLabel = $derived.by(() => {
+		if (!viewer.info?.audio) return 'ไม่มี';
+		if (viewer.muted) return 'Opus · ปิดเสียงอยู่';
+		if (viewer.audioBlocked) return 'Opus · คลิกเพื่อเปิดเสียง';
+		const l = viewer.audioLevel;
+		return l === null ? 'Opus' : `Opus · ${Math.round(20 * Math.log10(Math.max(l, 1e-5)))} dB`;
+	});
 
 	const presets = {
 		high: { quality: 85, max_width: 2560, label: 'คมชัด' },
@@ -160,6 +178,7 @@
 		ev.preventDefault();
 		if (down) {
 			canvas?.focus();
+			viewer.unlockAudio(); // first click on the screen also lets remote audio play
 			canvas?.setPointerCapture(ev.pointerId);
 		}
 		viewer.mouseButton(ev.button, down, ...norm(ev));
@@ -382,6 +401,10 @@
 				<dd>{viewer.stats.kbps} kbps</dd>
 				<dt class="text-white/55">Codec</dt>
 				<dd>{codecLabel}</dd>
+				<dt class="text-white/55">ตัวเข้ารหัส</dt>
+				<dd>{encoderLabel}</dd>
+				<dt class="text-white/55">เสียง</dt>
+				<dd>{audioLabel}</dd>
 				<dt class="text-white/55">ความละเอียด</dt>
 				<dd>{viewer.frame.w ? `${viewer.frame.w}×${viewer.frame.h}` : '—'}</dd>
 				<dt class="text-white/55">E2E</dt>
@@ -505,6 +528,10 @@
 										<span class="text-muted">Codec</span>
 										<span class="mono text-xs">{codecLabel}{viewer.info?.codec === 'h264' ? ' · WebCodecs' : ''}</span>
 									</div>
+									<div class="flex items-center justify-between px-3 py-1.5 text-sm">
+										<span class="text-muted">ตัวเข้ารหัส</span>
+										<span class="mono text-xs">{encoderLabel}</span>
+									</div>
 								</div>
 							{/if}
 						</div>
@@ -546,6 +573,17 @@
 									</div>
 								{/if}
 							</div>
+						{/if}
+
+						{#if viewer.info?.audio}
+							<button
+								class={tb()}
+								title={viewer.muted ? 'เปิดเสียง' : viewer.audioBlocked ? 'คลิกเพื่อเปิดเสียง' : 'ปิดเสียง'}
+								aria-pressed={viewer.muted}
+								onclick={() => act(() => (viewer.audioBlocked ? viewer.unlockAudio() : viewer.setMuted(!viewer.muted)))}
+							>
+								<Icon name={viewer.muted || viewer.audioBlocked ? 'volumeOff' : 'volume'} />
+							</button>
 						{/if}
 
 						<button class={tb()} title={isFullscreen ? 'ออกจากเต็มจอ' : 'เต็มจอ'} onclick={() => act(fullscreen)}>

@@ -18,7 +18,7 @@ use eframe::egui::{
 use tokio::sync::mpsc;
 
 use crate::account::{self, BookEntry};
-use crate::config::{Account, ApproveMode, Config, Verification};
+use crate::config::{Account, ApproveMode, Config, EncoderPref, Verification};
 use crate::local::{self, LocalState, WindowGeom};
 use crate::signal::Agent;
 use crate::status::{ApprovalRequest, ServerState, SessionInfo, UiHooks};
