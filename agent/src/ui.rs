@@ -383,32 +383,6 @@ fn toggle(ui: &mut Ui, on: &mut bool) -> Response {
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-/// Segmented control; returns true when the selection changed.
-fn segmented<T: PartialEq + Copy>(ui: &mut Ui, value: &mut T, options: &[(T, &str)], enabled: bool) -> bool {
-    let pal = Palette::of(ui);
-    let mut changed = false;
-    Frame::new().fill(pal.field).corner_radius(9).inner_margin(Margin::same(3)).show(ui, |ui| {
-        ui.spacing_mut().item_spacing.x = 2.0;
-        ui.horizontal(|ui| {
-            for (v, label) in options {
-                let selected = *value == *v;
-                let text = RichText::new(*label).font(if selected { semi(13.5) } else { FontId::proportional(13.5) });
-                let text = text.color(if !enabled { pal.muted.gamma_multiply(0.6) } else if selected { pal.fg } else { pal.muted });
-                let b = Button::new(text)
-                    .fill(if selected { pal.bg } else { Color32::TRANSPARENT })
-                    .stroke(if selected { Stroke::new(1.0, pal.line) } else { Stroke::NONE })
-                    .corner_radius(7)
-                    .min_size(vec2(0.0, 30.0));
-                if ui.add_enabled(enabled, b).clicked() && !selected {
-                    *value = *v;
-                    changed = true;
-                }
-            }
-        });
-    });
-    changed
-}
-
 fn label(ui: &mut Ui, text: &str) {
     let c = Palette::of(ui).muted;
     ui.label(RichText::new(text).size(12.5).color(c));
@@ -1774,6 +1748,11 @@ impl App {
         }
         ui.add_space(18.0);
         self.address_book(ui, agent);
+        // Without separate windows there is no connection-manager window: list sessions here.
+        if ui.ctx().embed_viewports() {
+            ui.add_space(24.0);
+            self.sessions_list(ui, agent);
+        }
     }
 
     fn book_entry(&self, id: &str) -> Option<&BookEntry> {
