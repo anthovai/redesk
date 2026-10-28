@@ -92,6 +92,9 @@ pub struct Config {
     /// Answer LAN discovery broadcasts (UDP 21120) with id, hostname and OS.
     #[serde(default = "yes")]
     pub lan_discovery: bool,
+    /// argon2id PHC hash of the 4-8 digit PIN that guards Settings and sign-out in the app.
+    #[serde(default)]
+    pub unlock_pin: Option<String>,
 }
 
 fn yes() -> bool {
@@ -123,6 +126,7 @@ impl Config {
             max_width: 1920,
             account: None,
             lan_discovery: true,
+            unlock_pin: None,
         })
     }
 

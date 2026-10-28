@@ -113,7 +113,13 @@ pub struct BookEntry {
     pub alias: String,
     #[serde(default)]
     pub favorite: bool,
+    #[serde(default, deserialize_with = "null_as_empty")]
+    pub tags: Vec<String>,
     pub device: Option<BookDevice>,
+}
+
+fn null_as_empty<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    Ok(Option::<Vec<String>>::deserialize(d)?.unwrap_or_default())
 }
 
 impl BookEntry {
