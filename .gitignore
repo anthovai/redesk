@@ -6,3 +6,4 @@ web/build/
 web/.svelte-kit/
 .env
 dist/
+.claude/
