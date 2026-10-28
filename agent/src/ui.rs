@@ -23,6 +23,7 @@ use crate::local::{self, LocalState, WindowGeom};
 use crate::signal::Agent;
 use crate::status::{ApprovalRequest, ServerState, SessionInfo, UiHooks};
 use crate::lan::LanPeer;
+use crate::viewer::Viewer;
 use crate::updater::{self, Release};
 use crate::{fingerprint, format_id, lan, service};
 
@@ -34,6 +35,14 @@ const PIN_LOCKOUT: Duration = Duration::from_secs(60);
 
 #[path = "ui_permissions.rs"]
 mod permissions_ui;
+#[path = "ui_settings.rs"]
+mod settings_ui;
+#[path = "ui_cm.rs"]
+mod cm_ui;
+#[path = "ui_viewer.rs"]
+mod viewer_ui;
+
+pub use viewer_ui::ViewerWindow;
 
 // ---------------------------------------------------------------------------------------------
 // Look and feel
@@ -58,33 +67,34 @@ impl Palette {
     fn of(ui: &Ui) -> Self {
         if ui.visuals().dark_mode {
             Self {
-                bg: Color32::from_rgb(0x1a, 0x1e, 0x22),
-                side: Color32::from_rgb(0x14, 0x17, 0x1a),
-                field: Color32::from_rgb(0x24, 0x29, 0x2e),
-                line: Color32::from_rgb(0x2e, 0x34, 0x3a),
-                fg: Color32::from_rgb(0xe8, 0xec, 0xef),
-                muted: Color32::from_rgb(0x95, 0x9f, 0xa8),
-                accent: Color32::from_rgb(0x2d, 0xd4, 0xbf),
-                on_accent: Color32::from_rgb(0x05, 0x26, 0x22),
-                accent_soft: Color32::from_rgb(0x15, 0x33, 0x30),
-                ok: Color32::from_rgb(0x4a, 0xde, 0x80),
-                warn: Color32::from_rgb(0xfb, 0xbf, 0x24),
-                danger: Color32::from_rgb(0xf8, 0x71, 0x71),
+                bg: Color32::from_rgb(0x25, 0x25, 0x28),
+                side: Color32::from_rgb(0x18, 0x19, 0x1e),
+                field: Color32::from_rgb(0x2f, 0x30, 0x35),
+                line: Color32::from_rgb(0x3d, 0x3e, 0x44),
+                fg: Color32::from_rgb(0xf2, 0xf2, 0xf2),
+                muted: Color32::from_rgb(0x99, 0x99, 0x99),
+                accent: Color32::from_rgb(0x3d, 0x8b, 0xff),
+                on_accent: Color32::WHITE,
+                accent_soft: Color32::from_rgb(0x1b, 0x2c, 0x48),
+                ok: Color32::from_rgb(0x3b, 0xc4, 0x6b),
+                warn: Color32::from_rgb(0xf5, 0xa6, 0x23),
+                danger: Color32::from_rgb(0xff, 0x5c, 0x5c),
             }
         } else {
             Self {
+                // RustDesk's light theme: white panes, #EFEFF2 gray, #0071FF accent.
                 bg: Color32::WHITE,
-                side: Color32::from_rgb(0xf3, 0xf5, 0xf6),
-                field: Color32::from_rgb(0xf3, 0xf5, 0xf6),
-                line: Color32::from_rgb(0xe2, 0xe6, 0xe9),
-                fg: Color32::from_rgb(0x16, 0x1b, 0x20),
-                muted: Color32::from_rgb(0x6b, 0x75, 0x80),
-                accent: Color32::from_rgb(0x0f, 0x76, 0x6e),
+                side: Color32::from_rgb(0xef, 0xef, 0xf2),
+                field: Color32::from_rgb(0xf4, 0xf4, 0xf6),
+                line: Color32::from_rgb(0xe0, 0xe0, 0xe5),
+                fg: Color32::from_rgb(0x22, 0x22, 0x22),
+                muted: Color32::from_rgb(0x88, 0x88, 0x88),
+                accent: Color32::from_rgb(0x00, 0x71, 0xff),
                 on_accent: Color32::WHITE,
-                accent_soft: Color32::from_rgb(0xe3, 0xf2, 0xf0),
-                ok: Color32::from_rgb(0x16, 0xa3, 0x4a),
-                warn: Color32::from_rgb(0xd9, 0x77, 0x06),
-                danger: Color32::from_rgb(0xdc, 0x26, 0x26),
+                accent_soft: Color32::from_rgb(0xe5, 0xf0, 0xff),
+                ok: Color32::from_rgb(0x2e, 0xb8, 0x5c),
+                warn: Color32::from_rgb(0xf0, 0x8c, 0x00),
+                danger: Color32::from_rgb(0xff, 0x3b, 0x30),
             }
         }
     }
@@ -152,11 +162,11 @@ fn style(ctx: &egui::Context) {
         s.spacing.item_spacing = vec2(8.0, 8.0);
         s.spacing.button_padding = vec2(14.0, 7.0);
         s.spacing.interact_size.y = 34.0;
-        let line = if dark { Color32::from_rgb(0x2e, 0x34, 0x3a) } else { Color32::from_rgb(0xe2, 0xe6, 0xe9) };
-        let field = if dark { Color32::from_rgb(0x24, 0x29, 0x2e) } else { Color32::from_rgb(0xf3, 0xf5, 0xf6) };
-        let accent = if dark { Color32::from_rgb(0x2d, 0xd4, 0xbf) } else { Color32::from_rgb(0x0f, 0x76, 0x6e) };
+        let line = if dark { Color32::from_rgb(0x3d, 0x3e, 0x44) } else { Color32::from_rgb(0xe0, 0xe0, 0xe5) };
+        let field = if dark { Color32::from_rgb(0x2f, 0x30, 0x35) } else { Color32::from_rgb(0xf4, 0xf4, 0xf6) };
+        let accent = if dark { Color32::from_rgb(0x3d, 0x8b, 0xff) } else { Color32::from_rgb(0x00, 0x71, 0xff) };
         let v = &mut s.visuals;
-        v.panel_fill = if dark { Color32::from_rgb(0x1a, 0x1e, 0x22) } else { Color32::WHITE };
+        v.panel_fill = if dark { Color32::from_rgb(0x25, 0x25, 0x28) } else { Color32::WHITE };
         v.window_fill = v.panel_fill;
         v.extreme_bg_color = field;
         v.selection.bg_fill = accent.gamma_multiply(0.35);
@@ -170,14 +180,14 @@ fn style(ctx: &egui::Context) {
         v.widgets.inactive.weak_bg_fill = field;
         v.widgets.inactive.bg_fill = field;
         v.widgets.inactive.bg_stroke = Stroke::new(1.0, line);
-        v.widgets.hovered.weak_bg_fill = if dark { Color32::from_rgb(0x2c, 0x32, 0x38) } else { Color32::from_rgb(0xe9, 0xed, 0xef) };
+        v.widgets.hovered.weak_bg_fill = if dark { Color32::from_rgb(0x38, 0x39, 0x3f) } else { Color32::from_rgb(0xe8, 0xe8, 0xec) };
         v.widgets.hovered.bg_stroke = Stroke::new(1.0, line);
         v.widgets.active.weak_bg_fill = v.widgets.hovered.weak_bg_fill;
         v.widgets.active.bg_stroke = Stroke::new(1.0, accent);
     });
 }
 
-/// Window and tray icon pixels: teal rounded square with a white screen outline.
+/// Window and tray icon pixels: blue rounded square with a white screen outline.
 pub fn icon_rgba(size: u32) -> Vec<u8> {
     let s = size as f32;
     let mut px = vec![0u8; (size * size * 4) as usize];
@@ -191,7 +201,7 @@ pub fn icon_rgba(size: u32) -> Vec<u8> {
                 continue;
             }
             let i = ((y * size + x) * 4) as usize;
-            let mut c = [0x0f, 0x76, 0x6e];
+            let mut c = [0x00, 0x71, 0xff];
             let (l, t, rr, b, w) = (s * 0.22, s * 0.28, s * 0.78, s * 0.66, (s * 0.07).max(1.0));
             let on_frame = (fx >= l && fx <= rr && fy >= t && fy <= b) && (fx - l < w || rr - fx < w || fy - t < w || b - fy < w);
             let stand = fx >= s * 0.38 && fx <= s * 0.62 && fy >= s * 0.74 && fy <= s * 0.74 + w;
@@ -199,7 +209,7 @@ pub fn icon_rgba(size: u32) -> Vec<u8> {
             if on_frame || stand {
                 c = [255, 255, 255];
             } else if dot {
-                c = [0x5e, 0xea, 0xd4];
+                c = [0x9c, 0xc8, 0xff];
             }
             px[i..i + 4].copy_from_slice(&[c[0], c[1], c[2], 255]);
         }
@@ -1551,298 +1561,6 @@ impl App {
         }
     }
 
-    fn settings(&mut self, ui: &mut Ui, agent: &Agent) {
-        let pal = Palette::of(ui);
-        let c = agent.config.lock().unwrap().clone();
-        ui.label(RichText::new("ตั้งค่า").font(semi(20.0)).color(pal.fg));
-        ui.add_space(6.0);
-        if cfg!(target_os = "macos") {
-            permissions_ui::permissions_card(ui);
-        }
-
-        let section = |ui: &mut Ui, title: &str| {
-            ui.add_space(12.0);
-            ui.label(RichText::new(title).font(semi(13.0)).color(pal.muted));
-        };
-        let group = |ui: &mut Ui, add: &mut dyn FnMut(&mut Ui)| {
-            Frame::new().stroke(Stroke::new(1.0, pal.line)).corner_radius(12).inner_margin(Margin::symmetric(16, 6)).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                add(ui);
-            });
-        };
-        let row_sep = |ui: &mut Ui| {
-            let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
-            ui.painter().rect_filled(r, 0.0, pal.line);
-        };
-        // A settings row: title + description on the left, a switch on the right.
-        let switch_row = |ui: &mut Ui, title: &str, desc: &str, value: &mut bool| -> bool {
-            let mut changed = false;
-            ui.horizontal(|ui| {
-                ui.set_min_height(52.0);
-                ui.vertical(|ui| {
-                    ui.add_space(8.0);
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    ui.label(RichText::new(title).color(pal.fg));
-                    ui.label(RichText::new(desc).size(12.5).color(pal.muted));
-                });
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    changed = toggle(ui, value).changed();
-                });
-            });
-            changed
-        };
-
-        section(ui, "สิ่งที่ผู้ควบคุมทำได้");
-        let (mut input, mut clip, mut files) = (c.allow_input, c.allow_clipboard, c.allow_file_transfer);
-        let mut changed = false;
-        group(ui, &mut |ui| {
-            changed |= switch_row(ui, "ควบคุมเมาส์และคีย์บอร์ด", "ถ้าปิด ผู้เชื่อมต่อจะดูหน้าจอได้อย่างเดียว", &mut input);
-            row_sep(ui);
-            changed |= switch_row(ui, "คลิปบอร์ด", "คัดลอกและวางข้อความระหว่างสองเครื่อง", &mut clip);
-            row_sep(ui);
-            changed |= switch_row(ui, "รับ-ส่งไฟล์", "ไฟล์ที่ได้รับจะอยู่ในโฟลเดอร์ Downloads/ReDesk", &mut files);
-        });
-        if changed {
-            self.save_config(|c| {
-                c.allow_input = input;
-                c.allow_clipboard = clip;
-                c.allow_file_transfer = files;
-            });
-        }
-
-        section(ui, "ความปลอดภัย");
-        let mut approve = c.approve_mode;
-        let mut verification = c.verification;
-        let has_perm = c.permanent_password.is_some();
-        let (mut a_changed, mut v_changed, mut save_pw) = (false, false, false);
-        let (pw1, pw2) = (&mut self.new_pw, &mut self.new_pw2);
-        group(ui, &mut |ui| {
-            ui.add_space(10.0);
-            ui.label(RichText::new("วิธีอนุญาตการเชื่อมต่อ").color(pal.fg));
-            a_changed = segmented(
-                ui,
-                &mut approve,
-                &[(ApproveMode::Password, "ใช้รหัสผ่าน"), (ApproveMode::Click, "กดอนุญาต"), (ApproveMode::Both, "ทั้งสองอย่าง")],
-                true,
-            );
-            ui.add_space(8.0);
-            row_sep(ui);
-            ui.add_space(8.0);
-            ui.label(RichText::new("รหัสผ่านที่ยอมรับ").color(pal.fg));
-            v_changed = segmented(
-                ui,
-                &mut verification,
-                &[(Verification::Temporary, "ใช้ครั้งเดียว"), (Verification::Permanent, "ถาวร"), (Verification::Both, "ทั้งสองแบบ")],
-                has_perm,
-            );
-            if !has_perm {
-                ui.label(RichText::new("ตั้งรหัสผ่านถาวรด้านล่างก่อน จึงจะเลือกได้").size(12.5).color(pal.muted));
-            }
-            ui.add_space(8.0);
-            row_sep(ui);
-            ui.add_space(8.0);
-            ui.label(RichText::new(if has_perm { "เปลี่ยนรหัสผ่านถาวร" } else { "รหัสผ่านถาวร" }).color(pal.fg));
-            ui.label(RichText::new("สำหรับเข้าเครื่องโดยไม่มีคนเฝ้า เช่น เซิร์ฟเวอร์หรือเครื่องในห้องประชุม").size(12.5).color(pal.muted));
-            ui.horizontal(|ui| {
-                let w = ((ui.available_width() - 120.0) / 2.0).max(120.0);
-                ui.add(TextEdit::singleline(pw1).password(true).hint_text("รหัสผ่านใหม่").margin(Margin::symmetric(10, 8)).desired_width(w));
-                ui.add(TextEdit::singleline(pw2).password(true).hint_text("ยืนยันรหัสผ่าน").margin(Margin::symmetric(10, 8)).desired_width(w));
-                save_pw = secondary(ui, "บันทึก", None).clicked();
-            });
-            ui.add_space(8.0);
-        });
-        if a_changed {
-            self.save_config(|c| c.approve_mode = approve);
-        }
-        if v_changed {
-            self.save_config(|c| c.verification = verification);
-        }
-        if save_pw {
-            if self.new_pw.chars().count() < 8 {
-                self.flash("รหัสผ่านต้องมีอย่างน้อย 8 ตัวอักษร");
-            } else if self.new_pw != self.new_pw2 {
-                self.flash("รหัสผ่านทั้งสองช่องไม่ตรงกัน");
-            } else if let Ok(hash) = crate::hash_password(&self.new_pw) {
-                self.new_pw.clear();
-                self.new_pw2.clear();
-                self.save_config(|c| {
-                    c.permanent_password = Some(hash);
-                    if c.verification == Verification::Temporary {
-                        c.verification = Verification::Both;
-                    }
-                });
-            }
-        }
-
-        section(ui, "ล็อกการตั้งค่า");
-        let has_pin = c.unlock_pin.is_some();
-        let (mut set_pin, mut remove_pin) = (false, false);
-        let (p1, p2) = (&mut self.pin.new_pin, &mut self.pin.new_pin2);
-        group(ui, &mut |ui| {
-            ui.add_space(10.0);
-            ui.scope(|ui| {
-                ui.spacing_mut().interact_size.y = 0.0; // compact status chip
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("PIN ปลดล็อก").color(pal.fg));
-                    if has_pin {
-                        Frame::new().fill(pal.accent_soft).corner_radius(6).inner_margin(Margin::symmetric(8, 1)).show(ui, |ui| {
-                            ui.label(RichText::new("เปิดใช้อยู่").size(12.0).color(pal.accent));
-                        });
-                    }
-                });
-            });
-            ui.label(RichText::new("ต้องใส่ PIN ก่อนเปิดหน้าตั้งค่าหรือออกจากระบบ กันคนอื่นแก้การตั้งค่าเครื่องนี้").size(12.5).color(pal.muted));
-            ui.horizontal(|ui| {
-                let w = ((ui.available_width() - if has_pin { 230.0 } else { 120.0 }) / 2.0).max(96.0);
-                fn field<'a>(hint: &str, v: &'a mut String, w: f32) -> TextEdit<'a> {
-                    TextEdit::singleline(v).password(true).char_limit(8).hint_text(hint).margin(Margin::symmetric(10, 8)).desired_width(w)
-                }
-                ui.add(field(if has_pin { "PIN ใหม่" } else { "PIN 4–8 หลัก" }, p1, w));
-                ui.add(field("ยืนยัน PIN", p2, w));
-                set_pin = secondary(ui, if has_pin { "เปลี่ยน" } else { "ตั้ง PIN" }, None).clicked();
-                if has_pin {
-                    remove_pin = secondary(ui, "ลบ PIN", Some(pal.danger)).clicked();
-                }
-            });
-            ui.add_space(8.0);
-        });
-        if set_pin {
-            if let Some(problem) = pin_problem(&self.pin.new_pin) {
-                self.flash(problem);
-            } else if self.pin.new_pin != self.pin.new_pin2 {
-                self.flash("PIN ทั้งสองช่องไม่ตรงกัน");
-            } else if let Ok(hash) = crate::hash_password(&self.pin.new_pin) {
-                if has_pin {
-                    // Changing an existing PIN asks for the current one first.
-                    let ctx = ui.ctx().clone();
-                    self.guarded(&ctx, PinAction::Change(hash));
-                } else {
-                    self.pin.new_pin.clear();
-                    self.pin.new_pin2.clear();
-                    self.save_config(|c| c.unlock_pin = Some(hash));
-                }
-            }
-        }
-        if remove_pin {
-            let ctx = ui.ctx().clone();
-            self.guarded(&ctx, PinAction::Remove);
-        }
-
-        section(ui, "ระบบ");
-        let mut auto = self.autostart;
-        let mut auto_changed = false;
-        let (mut lan_on, mut lan_changed) = (c.lan_discovery, false);
-        let server_fp = B64.decode(&c.server_key).map(|k| fingerprint(&k)).unwrap_or_default();
-        let device_fp = fingerprint(agent.identity.verifying_key().as_bytes());
-        group(ui, &mut |ui| {
-            auto_changed = switch_row(ui, "เปิด ReDesk เมื่อล็อกอิน", "เริ่มทำงานในถาดระบบ (tray) โดยไม่เปิดหน้าต่าง", &mut auto);
-            row_sep(ui);
-            lan_changed = switch_row(ui, "ให้เครื่องอื่นในเครือข่ายค้นพบ", "ตอบ ID และชื่อเครื่องแก่เครื่องในวงแลนเดียวกัน (UDP 21120)", &mut lan_on);
-            row_sep(ui);
-            ui.add_space(6.0);
-            let console = c.server_url.clone();
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("คอนโซลบนเว็บ (จัดการผู้ใช้ อุปกรณ์ และ audit log)").size(13.0).color(pal.muted));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.add(Button::new(RichText::new("เปิดคอนโซล").size(13.0).color(pal.accent)).frame(false)).clicked() {
-                        let _ = open_url(&console);
-                    }
-                });
-            });
-            egui::Grid::new("about").num_columns(2).spacing([20.0, 6.0]).show(ui, |ui| {
-                for (k, v, m) in [
-                    ("เซิร์ฟเวอร์", c.server_url.clone(), false),
-                    ("กุญแจเซิร์ฟเวอร์", server_fp.clone(), true),
-                    ("กุญแจเครื่องนี้", device_fp.clone(), true),
-                    ("เวอร์ชัน", env!("CARGO_PKG_VERSION").to_string(), false),
-                ] {
-                    ui.label(RichText::new(k).size(13.0).color(pal.muted));
-                    let t = RichText::new(v).color(pal.fg);
-                    ui.label(if m { t.font(mono(13.0)) } else { t.size(13.0) });
-                    ui.end_row();
-                }
-            });
-            ui.add_space(6.0);
-        });
-        if lan_changed {
-            self.save_config(|c| c.lan_discovery = lan_on);
-        }
-        self.update_section(ui, &c);
-        if auto_changed {
-            let res = if auto { service::install(&self.config_path) } else { service::uninstall() };
-            match res {
-                Ok(()) => self.autostart = auto,
-                Err(e) => self.flash(format!("ตั้งค่าไม่สำเร็จ: {e}")),
-            }
-        }
-    }
-
-    /// "อัปเดต": check the server for a newer agent, download it after the user asks, verify
-    /// it (size + SHA-256, in updater::download) and show it; installing stays a user action.
-    fn update_section(&mut self, ui: &mut Ui, c: &Config) {
-        let pal = Palette::of(ui);
-        ui.add_space(12.0);
-        ui.label(RichText::new("อัปเดต").font(semi(13.0)).color(pal.muted));
-        let mut action: Option<u8> = None; // 1 check, 2 download, 3 show file
-        Frame::new().stroke(Stroke::new(1.0, pal.line)).corner_radius(12).inner_margin(Margin::symmetric(16, 12)).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                let (text, color) = match &self.update {
-                    UpdateState::Idle => (format!("เวอร์ชันปัจจุบัน {}", env!("CARGO_PKG_VERSION")), pal.fg),
-                    UpdateState::Checking => ("กำลังตรวจหาอัปเดต…".into(), pal.muted),
-                    UpdateState::UpToDate => (format!("เป็นเวอร์ชันล่าสุดแล้ว ({})", env!("CARGO_PKG_VERSION")), pal.fg),
-                    UpdateState::Available(r) => (format!("มีเวอร์ชันใหม่ {} ({:.1} MB)", r.version, r.size as f64 / 1e6), pal.accent),
-                    UpdateState::Downloading(r) => (format!("กำลังดาวน์โหลด {}…", r.version), pal.muted),
-                    UpdateState::Downloaded(p) => (format!("ดาวน์โหลดและตรวจ SHA-256 แล้ว: {}", p.file_name().unwrap_or_default().to_string_lossy()), pal.fg),
-                    UpdateState::Failed(e) => (e.clone(), pal.danger),
-                };
-                ui.label(RichText::new(text).size(13.5).color(color));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| match &self.update {
-                    UpdateState::Available(_) => {
-                        if primary(ui, "ดาวน์โหลด", true).clicked() {
-                            action = Some(2);
-                        }
-                    }
-                    UpdateState::Downloaded(_) => {
-                        if secondary(ui, "แสดงไฟล์", None).clicked() {
-                            action = Some(3);
-                        }
-                    }
-                    UpdateState::Checking | UpdateState::Downloading(_) => {}
-                    _ => {
-                        if secondary(ui, "ตรวจหาอัปเดต", None).clicked() {
-                            action = Some(1);
-                        }
-                    }
-                });
-            });
-            if let UpdateState::Available(r) = &self.update
-                && !r.notes.trim().is_empty()
-            {
-                ui.label(RichText::new(r.notes.trim()).size(12.5).color(pal.muted));
-            }
-        });
-        let ctx = ui.ctx().clone();
-        match action {
-            Some(1) => self.check_update(&ctx, c.server_url.clone(), c.allow_insecure_transport),
-            Some(2) => {
-                if let UpdateState::Available(rel) = std::mem::take(&mut self.update) {
-                    let dir = dirs::download_dir().unwrap_or_else(std::env::temp_dir).join("ReDesk");
-                    self.update = UpdateState::Downloading(rel.clone());
-                    self.spawn_job(&ctx, move || Job::UpdateDownload(updater::download(&rel, &dir).map_err(|e| format!("{e:#}"))));
-                }
-            }
-            Some(3) => {
-                if let UpdateState::Downloaded(p) = &self.update
-                    && let Some(dir) = p.parent()
-                {
-                    let _ = open_url(&dir.to_string_lossy());
-                }
-            }
-            _ => {}
-        }
-    }
-
     fn book_entry(&self, id: &str) -> Option<&BookEntry> {
         self.book.iter().find(|e| e.device_id == id)
     }
@@ -2345,77 +2063,6 @@ impl App {
         Agent::new(c, self.config_path.clone(), None)
     }
 
-    fn approval_modal(&mut self, ui: &mut Ui) {
-        let Some((req, at)) = self.pending.front() else { return };
-        let pal = Palette::of(ui);
-        let left = APPROVAL_TIMEOUT.saturating_sub(at.elapsed());
-        let (name, email) = match req.who.split_once(" <") {
-            Some((n, e)) => (n.to_string(), e.trim_end_matches('>').to_string()),
-            None => (req.who.clone(), String::new()),
-        };
-        let ip = req.ip.clone();
-        let perms = self.agent.as_ref().map(|a| {
-            let c = a.config.lock().unwrap();
-            let mut p = vec![if c.allow_input { "ควบคุมเมาส์และคีย์บอร์ด" } else { "ดูหน้าจอ" }];
-            if c.allow_clipboard {
-                p.push("คลิปบอร์ด");
-            }
-            if c.allow_file_transfer {
-                p.push("รับ-ส่งไฟล์");
-            }
-            p.join(" · ")
-        });
-        let mut answer = None;
-        egui::Modal::new(egui::Id::unique("approval")).backdrop_color(Color32::from_black_alpha(110)).show(ui.ctx(), |ui| {
-            ui.set_width(360.0);
-            ui.vertical_centered(|ui| {
-                ui.add_space(6.0);
-                avatar(ui, &initials(&name, &email), 56.0);
-                ui.add_space(4.0);
-                ui.label(RichText::new("มีผู้ขอควบคุมเครื่องนี้").size(13.0).color(pal.muted));
-                ui.label(RichText::new(&name).font(semi(18.0)).color(pal.fg));
-                if !email.is_empty() {
-                    ui.label(RichText::new(&email).size(13.0).color(pal.muted));
-                }
-                ui.label(RichText::new(format!("IP {ip}")).font(mono(12.5)).color(pal.muted));
-                if let Some(p) = &perms {
-                    ui.add_space(6.0);
-                    ui.label(RichText::new(format!("ถ้าอนุญาต จะทำได้: {p}")).size(12.5).color(pal.muted));
-                }
-            });
-            ui.add_space(12.0);
-            let frac = left.as_secs_f32() / APPROVAL_TIMEOUT.as_secs_f32();
-            let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 4.0), Sense::hover());
-            ui.painter().rect_filled(r, 2.0, pal.field);
-            ui.painter().rect_filled(Rect::from_min_size(r.min, vec2(r.width() * frac, r.height())), 2.0, pal.warn);
-            ui.label(RichText::new(format!("ปฏิเสธอัตโนมัติใน {} วินาที", left.as_secs())).size(12.5).color(pal.muted));
-            ui.add_space(8.0);
-            ui.columns(2, |cols| {
-                let deny = Button::new(RichText::new("ปฏิเสธ").font(semi(14.5)).color(pal.fg))
-                    .fill(pal.bg)
-                    .stroke(Stroke::new(1.0, pal.line))
-                    .corner_radius(8)
-                    .min_size(vec2(cols[0].available_width(), 42.0));
-                if cols[0].vertical_centered(|ui| ui.add(deny)).inner.clicked() {
-                    answer = Some(false);
-                }
-                let allow = Button::new(RichText::new("อนุญาต").font(semi(14.5)).color(pal.on_accent))
-                    .fill(pal.accent)
-                    .stroke(Stroke::NONE)
-                    .corner_radius(8)
-                    .min_size(vec2(cols[1].available_width(), 42.0));
-                if cols[1].vertical_centered(|ui| ui.add(allow)).inner.clicked() {
-                    answer = Some(true);
-                }
-            });
-        });
-        if let Some(a) = answer {
-            let (req, _) = self.pending.pop_front().unwrap();
-            let _ = req.reply.send(a);
-        }
-        ui.ctx().request_repaint_after(Duration::from_millis(250));
-    }
-
     fn toast_view(&mut self, ui: &mut Ui) {
         let Some((msg, at)) = &self.toast else { return };
         if at.elapsed() > Duration::from_secs(3) {
@@ -2430,510 +2077,4 @@ impl App {
             });
         });
     }
-}
-
-// ---------------------------------------------------------------------------------------------
-// Remote-control window (one native window per connection, like RustDesk)
-
-use crate::viewer::{Phase, TransferStatus, Viewer};
-
-const QUALITY: [(&str, u8, u32); 3] = [("คมชัด", 85, 2560), ("สมดุล", 70, 1920), ("ประหยัดเน็ต", 45, 1280)];
-
-#[derive(Default)]
-struct WinUi {
-    texture: Option<egui::TextureHandle>,
-    password: String,
-    quality: usize,
-    fullscreen: bool,
-    toast: Option<(String, Instant)>,
-}
-
-pub struct ViewerWindow {
-    pub viewer: Arc<Viewer>,
-    pub viewport: egui::ViewportId,
-    pub device_id: String,
-    ui: Mutex<WinUi>,
-    pub closed: AtomicBool,
-    pub reconnect: AtomicBool,
-}
-
-
-impl ViewerWindow {
-    pub fn new(viewer: Arc<Viewer>, device_id: String, viewport: egui::ViewportId) -> Arc<Self> {
-        Arc::new(Self {
-            viewer,
-            viewport,
-            device_id,
-            ui: Mutex::new(WinUi { quality: 1, ..Default::default() }),
-            closed: AtomicBool::new(false),
-            reconnect: AtomicBool::new(false),
-        })
-    }
-
-    fn flash(w: &mut WinUi, msg: impl Into<String>) {
-        w.toast = Some((msg.into(), Instant::now()));
-    }
-
-    pub fn show(&self, ui: &mut Ui) {
-        let ctx = ui.ctx().clone();
-        if ui.input(|i| i.viewport().close_requested()) {
-            self.viewer.close();
-            self.closed.store(true, Ordering::Relaxed);
-            return;
-        }
-        let pal = Palette::of(ui);
-        let mut w = self.ui.lock().unwrap();
-
-        // Pull new screen regions into the GPU texture and pick up state for this frame.
-        let (phase, error, name, fp, info, fps, kbps, clip, transfers, fb_size, cursor, codec) = {
-            let mut st = self.viewer.state.lock().unwrap();
-            if st.fb.w > 0 {
-                let opts = egui::TextureOptions::LINEAR;
-                if w.texture.is_none() || st.fb.resized {
-                    let img = egui::ColorImage::from_rgba_unmultiplied([st.fb.w, st.fb.h], &st.fb.rgba);
-                    w.texture = Some(ctx.load_texture(format!("remote-{}", self.device_id), img, opts));
-                    st.fb.resized = false;
-                    st.fb.dirty.clear();
-                } else if let Some(tex) = w.texture.as_mut() {
-                    let fbw = st.fb.w;
-                    for [x, y, dw, dh] in std::mem::take(&mut st.fb.dirty) {
-                        if dw == 0 || dh == 0 {
-                            continue;
-                        }
-                        let mut sub = Vec::with_capacity(dw * dh * 4);
-                        for row in y..y + dh {
-                            let i = (row * fbw + x) * 4;
-                            sub.extend_from_slice(&st.fb.rgba[i..i + dw * 4]);
-                        }
-                        tex.set_partial([x, y], egui::ColorImage::from_rgba_unmultiplied([dw, dh], &sub), opts);
-                    }
-                }
-            }
-            (
-                st.phase.clone(),
-                st.error.clone(),
-                st.device_name.clone(),
-                st.fingerprint.clone(),
-                st.info.clone(),
-                st.fps,
-                st.kbps,
-                st.remote_clipboard.take(),
-                st.transfers.clone(),
-                (st.fb.w, st.fb.h),
-                st.cursor,
-                st.codec.clone(),
-            )
-        };
-        let connected = phase == Phase::Connected;
-        let remote_mac = info.as_ref().is_some_and(|i| i.os == "macos");
-        self.debug_hooks(&ctx, &phase, fb_size);
-
-        if let Some(text) = clip {
-            if arboard::Clipboard::new().and_then(|mut c| c.set_text(text)).is_ok() {
-                Self::flash(&mut w, "ได้รับคลิปบอร์ดจากเครื่องปลายทาง");
-            }
-        }
-        let dropped: Vec<PathBuf> = ui.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
-        if !dropped.is_empty() {
-            if connected && info.as_ref().is_some_and(|i| i.files) {
-                let n = dropped.len();
-                for p in dropped {
-                    self.viewer.upload(p);
-                }
-                Self::flash(&mut w, format!("กำลังส่ง {n} ไฟล์ไปที่ Downloads/ReDesk ของเครื่องปลายทาง"));
-            } else {
-                Self::flash(&mut w, "เครื่องปลายทางไม่อนุญาตให้รับไฟล์");
-            }
-        }
-
-        // Toolbar
-        egui::Panel::top("remote-bar")
-            .exact_size(52.0)
-            .resizable(false)
-            .show_separator_line(false)
-            .frame(Frame::new().fill(pal.side).inner_margin(Margin::symmetric(14, 0)).stroke(Stroke::new(1.0, pal.line)))
-            .show(ui, |ui| {
-                ui.horizontal_centered(|ui| {
-                    ui.vertical(|ui| {
-                        ui.add_space(7.0);
-                        ui.spacing_mut().item_spacing.y = 0.0;
-                        ui.label(RichText::new(format!("{name}  ")).font(semi(14.5)).color(pal.fg));
-                        let mut sub = format_id(&self.device_id);
-                        if !fp.is_empty() {
-                            sub.push_str(&format!("  ·  E2E {fp}"));
-                        }
-                        ui.label(RichText::new(sub).font(mono(11.5)).color(pal.muted));
-                    });
-                    if !connected {
-                        return;
-                    }
-                    ui.add_space(8.0);
-                    Frame::new().fill(pal.field).corner_radius(6).inner_margin(Margin::symmetric(8, 3)).show(ui, |ui| {
-                        ui.label(RichText::new(format!("{} · {fps} fps · {kbps} kbps", codec.to_uppercase())).font(mono(11.5)).color(pal.muted));
-                    });
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        if secondary(ui, "ตัดการเชื่อมต่อ", Some(pal.danger)).clicked() {
-                            self.viewer.close();
-                        }
-                        let fs_tip = if w.fullscreen { "ออกจากเต็มจอ" } else { "เต็มจอ" };
-                        if ui.button(if w.fullscreen { "⤡" } else { "⤢" }).on_hover_text(fs_tip).clicked() {
-                            w.fullscreen = !w.fullscreen;
-                            ctx.send_viewport_cmd(ViewportCommand::Fullscreen(w.fullscreen));
-                        }
-                        if icon_button(ui, Icon::Refresh, "รีเฟรชภาพ").clicked() {
-                            self.viewer.send(serde_json::json!({"t": "refresh"}));
-                        }
-                        if info.as_ref().is_some_and(|i| i.input) && ui.button("Ctrl+Alt+Del").clicked() {
-                            send_combo(&self.viewer, &[("ControlLeft", "Control"), ("AltLeft", "Alt")], ("Delete", "Delete"));
-                        }
-                        if info.as_ref().is_some_and(|i| i.clipboard) && icon_button(ui, Icon::Copy, "ส่งคลิปบอร์ดของเครื่องนี้ไปปลายทาง").clicked() {
-                            match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
-                                Ok(t) => {
-                                    self.viewer.send(serde_json::json!({"t": "clip", "s": t}));
-                                    Self::flash(&mut w, "ส่งคลิปบอร์ดแล้ว");
-                                }
-                                Err(_) => Self::flash(&mut w, "คลิปบอร์ดว่าง"),
-                            }
-                        }
-                        let mut q = w.quality;
-                        // Right-to-left row: list in reverse so it reads คมชัด → ประหยัดเน็ต.
-                        if segmented(ui, &mut q, &[(2, QUALITY[2].0), (1, QUALITY[1].0), (0, QUALITY[0].0)], true) {
-                            w.quality = q;
-                            self.viewer.send(serde_json::json!({"t": "cfg", "quality": QUALITY[q].1, "max_width": QUALITY[q].2}));
-                        }
-                        if let Some(i) = &info {
-                            if i.displays.len() > 1 {
-                                let current = i.displays.iter().find(|d| d.index == i.display).map(|d| d.name.clone()).unwrap_or_default();
-                                egui::ComboBox::from_id_salt("display").selected_text(current).show_ui(ui, |ui| {
-                                    for d in &i.displays {
-                                        let label = if d.primary { format!("{} (หลัก)", d.name) } else { d.name.clone() };
-                                        if ui.selectable_label(d.index == i.display, label).clicked() {
-                                            self.viewer.send(serde_json::json!({"t": "cfg", "display": d.index}));
-                                            if let Some(info) = self.viewer.state.lock().unwrap().info.as_mut() {
-                                                info.display = d.index;
-                                            }
-                                        }
-                                    }
-                                });
-                            }
-                        }
-                    });
-                });
-            });
-
-        // Remote screen
-        egui::CentralPanel::default().frame(Frame::new().fill(Color32::BLACK)).show(ui, |ui| {
-            let area = ui.max_rect();
-            if let (Some(tex), (fw, fh)) = (&w.texture, fb_size) {
-                let scale = (area.width() / fw as f32).min(area.height() / fh as f32);
-                let rect = Rect::from_center_size(area.center(), vec2(fw as f32 * scale, fh as f32 * scale));
-                ui.painter().image(tex.id(), rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
-                let resp = ui.allocate_rect(rect, Sense::click_and_drag());
-                if connected && info.as_ref().is_some_and(|i| i.input) && ui.input(|i| i.viewport().focused != Some(false)) {
-                    forward_input(&self.viewer, ui, rect, remote_mac);
-                    if resp.hovered() {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
-                    }
-                }
-                // The remote pointer (captures do not include it), unless ours is on top of it.
-                if let Some((cx, cy)) = cursor.filter(|_| !resp.hovered()) {
-                    paint_pointer(ui.painter(), pos2(rect.left() + cx * rect.width(), rect.top() + cy * rect.height()));
-                }
-            } else if connected {
-                ui.centered_and_justified(|ui| ui.label(RichText::new("กำลังรอภาพหน้าจอ…").color(Color32::from_gray(170))));
-            }
-
-            if !connected {
-                self.overlay(ui, &mut w, &phase, error.as_deref(), area);
-            }
-
-            // File transfers (drag & drop uploads)
-            let shown: Vec<_> = transfers.iter().rev().take(4).collect();
-            if !shown.is_empty() {
-                egui::Area::new(egui::Id::unique(("transfers", self.viewport)))
-                    .anchor(Align2::LEFT_BOTTOM, [12.0, -12.0])
-                    .show(ui.ctx(), |ui| {
-                        Frame::new().fill(pal.bg).corner_radius(10).stroke(Stroke::new(1.0, pal.line)).inner_margin(Margin::symmetric(12, 10)).show(ui, |ui| {
-                            ui.set_width(280.0);
-                            for t in shown {
-                                ui.label(RichText::new(&t.name).size(12.5).color(pal.fg));
-                                match &t.status {
-                                    TransferStatus::Active => {
-                                        let frac = if t.size > 0 { t.sent as f32 / t.size as f32 } else { 0.0 };
-                                        let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 4.0), Sense::hover());
-                                        ui.painter().rect_filled(r, 2.0, pal.field);
-                                        ui.painter().rect_filled(Rect::from_min_size(r.min, vec2(r.width() * frac, 4.0)), 2.0, pal.accent);
-                                    }
-                                    TransferStatus::Done(_) => {
-                                        ui.label(RichText::new("ส่งแล้ว").size(12.0).color(pal.ok));
-                                    }
-                                    TransferStatus::Failed(e) => {
-                                        ui.label(RichText::new(format!("ไม่สำเร็จ: {e}")).size(12.0).color(pal.danger));
-                                    }
-                                }
-                            }
-                        });
-                    });
-            }
-        });
-
-        if let Some((msg, at)) = &w.toast {
-            if at.elapsed() > Duration::from_secs(3) {
-                w.toast = None;
-            } else {
-                let msg = msg.clone();
-                egui::Area::new(egui::Id::unique(("vtoast", self.viewport))).anchor(Align2::CENTER_BOTTOM, [0.0, -24.0]).show(&ctx, |ui| {
-                    Frame::new().fill(pal.fg).corner_radius(8).inner_margin(Margin::symmetric(14, 8)).show(ui, |ui| {
-                        ui.label(RichText::new(msg).size(13.5).color(pal.bg));
-                    });
-                });
-            }
-        }
-        if !connected || !transfers.is_empty() {
-            ctx.request_repaint_after(Duration::from_millis(200));
-        }
-    }
-
-    /// Automation for tests: REDESK_UI_PASSWORD answers the password prompt once.
-    fn debug_hooks(&self, _ctx: &egui::Context, phase: &Phase, _fb: (usize, usize)) {
-        static SUBMITTED: AtomicBool = AtomicBool::new(false);
-        if *phase == Phase::Password
-            && let Ok(pw) = std::env::var("REDESK_UI_PASSWORD")
-            && !SUBMITTED.swap(true, Ordering::Relaxed)
-        {
-            self.viewer.submit_password(&pw);
-        }
-    }
-
-    fn overlay(&self, ui: &mut Ui, w: &mut WinUi, phase: &Phase, error: Option<&str>, area: Rect) {
-        let pal = Palette::of(ui);
-        let card = Rect::from_center_size(area.center(), vec2(380.0, 230.0));
-        ui.scope_builder(egui::UiBuilder::new().max_rect(card), |ui| {
-            Frame::new().fill(pal.bg).corner_radius(14).inner_margin(Margin::same(24)).show(ui, |ui| {
-                ui.set_width(332.0);
-                ui.vertical_centered(|ui| match phase {
-                    Phase::Password => {
-                        let (r, _) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::hover());
-                        paint_icon(ui, r, Icon::Shield, pal.accent);
-                        ui.label(RichText::new("ใส่รหัสผ่านของเครื่องปลายทาง").font(semi(16.0)).color(pal.fg));
-                        ui.label(RichText::new("ดูได้ที่หน้าต่าง ReDesk ของเครื่องนั้น").size(12.5).color(pal.muted));
-                        let r = ui.add(
-                            TextEdit::singleline(&mut w.password)
-                                .password(true)
-                                .font(mono(16.0))
-                                .margin(Margin::symmetric(10, 8))
-                                .desired_width(f32::INFINITY),
-                        );
-                        if !r.has_focus() && w.password.is_empty() {
-                            r.request_focus();
-                        }
-                        if let Some(e) = error {
-                            ui.label(RichText::new(e).size(12.5).color(pal.danger));
-                        }
-                        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                        let ok = Button::new(RichText::new("เชื่อมต่อ").font(semi(14.5)).color(pal.on_accent))
-                            .fill(pal.accent)
-                            .stroke(Stroke::NONE)
-                            .corner_radius(8)
-                            .min_size(vec2(ui.available_width(), 38.0));
-                        if (ui.add_enabled(!w.password.is_empty(), ok).clicked() || enter) && !w.password.is_empty() {
-                            self.viewer.submit_password(&w.password);
-                            w.password.clear();
-                        }
-                    }
-                    Phase::Closed => {
-                        let failed = error.is_some_and(|e| !e.is_empty());
-                        ui.label(RichText::new(if failed { "เชื่อมต่อไม่สำเร็จ" } else { "ตัดการเชื่อมต่อแล้ว" }).font(semi(17.0)).color(pal.fg));
-                        if let Some(e) = error {
-                            ui.label(RichText::new(e).size(13.0).color(pal.muted));
-                        }
-                        ui.add_space(10.0);
-                        ui.columns(2, |c| {
-                            if c[0].vertical_centered(|ui| secondary(ui, "ปิดหน้าต่าง", None)).inner.clicked() {
-                                self.closed.store(true, Ordering::Relaxed);
-                            }
-                            let again = Button::new(RichText::new("เชื่อมต่ออีกครั้ง").font(semi(14.0)).color(pal.on_accent))
-                                .fill(pal.accent)
-                                .stroke(Stroke::NONE)
-                                .corner_radius(8)
-                                .min_size(vec2(0.0, 36.0));
-                            if c[1].vertical_centered(|ui| ui.add(again)).inner.clicked() {
-                                self.reconnect.store(true, Ordering::Relaxed);
-                            }
-                        });
-                    }
-                    other => {
-                        ui.add_space(8.0);
-                        ui.add(egui::Spinner::new().size(28.0).color(pal.accent));
-                        let text = match other {
-                            Phase::Requesting => "กำลังขอเชื่อมต่อ…",
-                            Phase::Waiting => "รอเครื่องปลายทางตอบรับ…",
-                            Phase::Handshake => "กำลังแลกเปลี่ยนกุญแจเข้ารหัส…",
-                            Phase::Approval => "รอผู้ใช้ที่เครื่องปลายทางกดอนุญาต…",
-                            _ => "",
-                        };
-                        ui.label(RichText::new(text).color(pal.fg));
-                        if let Some(e) = error {
-                            ui.label(RichText::new(e).size(12.5).color(pal.danger));
-                        }
-                    }
-                });
-            });
-        });
-    }
-}
-
-/// Presses modifiers, taps `key`, releases in reverse order.
-fn send_combo(v: &Viewer, mods: &[(&str, &str)], key: (&str, &str)) {
-    let k = |code: &str, name: &str, down: bool| v.send(serde_json::json!({"t": "key", "code": code, "key": name, "down": down}));
-    for (c, n) in mods {
-        k(c, n, true);
-    }
-    k(key.0, key.1, true);
-    k(key.0, key.1, false);
-    for (c, n) in mods.iter().rev() {
-        k(c, n, false);
-    }
-}
-
-/// Modifiers held on this keyboard, translated for the remote OS
-/// (Cmd on a Mac viewer acts as Ctrl on a Windows/Linux machine, as in RustDesk).
-fn remote_mods(m: egui::Modifiers, remote_mac: bool) -> Vec<(&'static str, &'static str)> {
-    let mut out = Vec::new();
-    if m.ctrl || (m.mac_cmd && !remote_mac) {
-        out.push(("ControlLeft", "Control"));
-    }
-    if m.mac_cmd && remote_mac {
-        out.push(("MetaLeft", "Meta"));
-    }
-    if m.alt {
-        out.push(("AltLeft", "Alt"));
-    }
-    if m.shift {
-        out.push(("ShiftLeft", "Shift"));
-    }
-    out
-}
-
-/// Keys sent as key events (everything else that types text arrives as `Event::Text`).
-fn named_key(k: egui::Key) -> Option<(&'static str, &'static str)> {
-    use egui::Key::*;
-    Some(match k {
-        Enter => ("Enter", "Enter"),
-        Tab => ("Tab", "Tab"),
-        Backspace => ("Backspace", "Backspace"),
-        Escape => ("Escape", "Escape"),
-        Delete => ("Delete", "Delete"),
-        Home => ("Home", "Home"),
-        End => ("End", "End"),
-        PageUp => ("PageUp", "PageUp"),
-        PageDown => ("PageDown", "PageDown"),
-        ArrowUp => ("ArrowUp", "ArrowUp"),
-        ArrowDown => ("ArrowDown", "ArrowDown"),
-        ArrowLeft => ("ArrowLeft", "ArrowLeft"),
-        ArrowRight => ("ArrowRight", "ArrowRight"),
-        F1 => ("F1", "F1"),
-        F2 => ("F2", "F2"),
-        F3 => ("F3", "F3"),
-        F4 => ("F4", "F4"),
-        F5 => ("F5", "F5"),
-        F6 => ("F6", "F6"),
-        F7 => ("F7", "F7"),
-        F8 => ("F8", "F8"),
-        F9 => ("F9", "F9"),
-        F10 => ("F10", "F10"),
-        F11 => ("F11", "F11"),
-        F12 => ("F12", "F12"),
-        _ => return None,
-    })
-}
-
-/// Letter/digit keys for shortcuts: (KeyboardEvent.code, key).
-fn shortcut_key(k: egui::Key) -> Option<(String, String)> {
-    let name = k.name();
-    if name.len() == 1 {
-        let c = name.chars().next()?;
-        if c.is_ascii_alphabetic() {
-            return Some((format!("Key{}", c.to_ascii_uppercase()), c.to_ascii_lowercase().to_string()));
-        }
-        if c.is_ascii_digit() {
-            return Some((format!("Digit{c}"), c.to_string()));
-        }
-    }
-    None
-}
-
-fn forward_input(v: &Viewer, ui: &Ui, rect: Rect, remote_mac: bool) {
-    let norm = |p: Pos2| {
-        let q = rect.clamp(p);
-        (((q.x - rect.left()) / rect.width()) as f64, ((q.y - rect.top()) / rect.height()) as f64)
-    };
-    let (events, hover) = ui.input(|i| (i.events.clone(), i.pointer.hover_pos()));
-    let mut moved = None;
-    for e in events {
-        match e {
-            egui::Event::PointerMoved(p) if rect.contains(p) => moved = Some(norm(p)),
-            egui::Event::PointerButton { pos, button, pressed, .. } if rect.contains(pos) || !pressed => {
-                let b = match button {
-                    egui::PointerButton::Primary => 0,
-                    egui::PointerButton::Middle => 1,
-                    egui::PointerButton::Secondary => 2,
-                    _ => continue,
-                };
-                let (x, y) = norm(pos);
-                moved = None;
-                v.send(serde_json::json!({"t": "mb", "b": b, "down": pressed, "x": x, "y": y}));
-            }
-            egui::Event::MouseWheel { unit, delta, .. } if hover.is_some_and(|p| rect.contains(p)) => {
-                let lines = |d: f32| match unit {
-                    egui::MouseWheelUnit::Line => d,
-                    egui::MouseWheelUnit::Point => d / 40.0,
-                    egui::MouseWheelUnit::Page => d * 10.0,
-                };
-                // egui: positive = content moves down (scroll up); the agent's positive = scroll down.
-                let (dx, dy) = (-lines(delta.x).round() as i32, -lines(delta.y).round() as i32);
-                if dx != 0 || dy != 0 {
-                    v.send(serde_json::json!({"t": "wh", "dx": dx, "dy": dy}));
-                }
-            }
-            egui::Event::Text(t) => {
-                let t: String = t.chars().filter(|c| !c.is_control()).collect();
-                if !t.is_empty() {
-                    v.send(serde_json::json!({"t": "text", "s": t}));
-                }
-            }
-            egui::Event::Copy => send_combo(v, &remote_mods(ui.input(|i| i.modifiers), remote_mac), ("KeyC", "c")),
-            egui::Event::Cut => send_combo(v, &remote_mods(ui.input(|i| i.modifiers), remote_mac), ("KeyX", "x")),
-            egui::Event::Paste(text) => {
-                // Paste what is on this machine's clipboard: hand it over first, then press paste remotely.
-                v.send(serde_json::json!({"t": "clip", "s": text}));
-                send_combo(v, &remote_mods(ui.input(|i| i.modifiers), remote_mac), ("KeyV", "v"));
-            }
-            egui::Event::Key { key, pressed: true, modifiers, .. } => {
-                let mods = remote_mods(modifiers, remote_mac);
-                if let Some(k) = named_key(key) {
-                    send_combo(v, &mods, k);
-                } else if (modifiers.ctrl || modifiers.alt || modifiers.mac_cmd || modifiers.command)
-                    && let Some((code, name)) = shortcut_key(key)
-                {
-                    send_combo(v, &mods, (&code, &name));
-                }
-            }
-            _ => {}
-        }
-    }
-    if let Some((x, y)) = moved {
-        v.send(serde_json::json!({"t": "mm", "x": x, "y": y}));
-    }
-}
-
-/// Arrow pointer with its tip at `tip`, drawn over the remote screen.
-fn paint_pointer(p: &egui::Painter, tip: egui::Pos2) {
-    let pts = [(0.0, 0.0), (0.0, 16.0), (4.2, 12.3), (7.0, 18.5), (9.6, 17.4), (6.9, 11.3), (12.0, 11.3)];
-    let at = |i: &[usize]| i.iter().map(|&i| tip + vec2(pts[i].0, pts[i].1)).collect::<Vec<_>>();
-    // Head and tail are filled separately: convex_polygon needs convex input.
-    p.add(egui::Shape::convex_polygon(at(&[0, 1, 2, 5, 6]), Color32::BLACK, Stroke::NONE));
-    p.add(egui::Shape::convex_polygon(at(&[2, 3, 4, 5]), Color32::BLACK, Stroke::NONE));
-    p.add(egui::Shape::closed_line(at(&[0, 1, 2, 3, 4, 5, 6]), Stroke::new(1.2, Color32::WHITE)));
 }
