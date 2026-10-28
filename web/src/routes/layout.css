@@ -7,34 +7,39 @@
 		'Segoe UI', Roboto, sans-serif;
 	--font-mono: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
 
-	--color-canvas: #f6f7f9;
+	/* RustDesk-like palette, shared with the desktop app. */
+	--color-canvas: #efeff2;
 	--color-surface: #ffffff;
-	--color-raised: #f1f3f6;
-	--color-line: #e3e6eb;
-	--color-fg: #15191f;
-	--color-muted: #5d6673;
-	--color-accent: #0f766e;
+	--color-raised: #f5f5f8;
+	--color-line: #e0e0e5;
+	--color-fg: #222222;
+	--color-muted: #888888;
+	--color-accent: #0071ff;
+	--color-accent-hover: #0062dd;
 	--color-accent-fg: #ffffff;
-	--color-accent-soft: #e6f4f2;
-	--color-danger: #c2410c;
-	--color-danger-soft: #fdf0e9;
-	--color-ok: #15803d;
+	--color-accent-soft: #e6f0ff;
+	--color-danger: #e5383b;
+	--color-danger-soft: #fdecec;
+	--color-ok: #19b85c;
+	/* Remote viewer stage, the same in both themes. */
+	--color-stage: #18191e;
 }
 
 @media (prefers-color-scheme: dark) {
 	:root {
-		--color-canvas: #0d1015;
-		--color-surface: #151920;
-		--color-raised: #1c222b;
-		--color-line: #2a313c;
-		--color-fg: #e7eaee;
-		--color-muted: #949dab;
-		--color-accent: #2dd4bf;
-		--color-accent-fg: #062320;
-		--color-accent-soft: #12302d;
-		--color-danger: #fb923c;
-		--color-danger-soft: #34200f;
-		--color-ok: #4ade80;
+		--color-canvas: #18191e;
+		--color-surface: #252528;
+		--color-raised: #2e2e32;
+		--color-line: #38383e;
+		--color-fg: #f2f2f2;
+		--color-muted: #a0a0a8;
+		--color-accent: #3d8bff;
+		--color-accent-hover: #2a7cf5;
+		--color-accent-fg: #ffffff;
+		--color-accent-soft: #1d2c44;
+		--color-danger: #ff5c5f;
+		--color-danger-soft: #3a2224;
+		--color-ok: #2fd17a;
 	}
 }
 
@@ -49,7 +54,7 @@ body {
 		@apply inline-flex items-center justify-center gap-1.5 rounded-lg border border-line bg-surface px-3 py-1.5 text-sm font-medium text-fg transition-colors hover:bg-raised disabled:cursor-not-allowed disabled:opacity-50;
 	}
 	.btn-primary {
-		@apply border-transparent bg-accent text-accent-fg hover:bg-accent hover:brightness-110;
+		@apply border-transparent bg-accent text-accent-fg hover:bg-accent-hover;
 	}
 	.btn-danger {
 		@apply border-transparent bg-danger-soft text-danger hover:brightness-95;
