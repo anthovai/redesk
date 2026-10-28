@@ -95,6 +95,7 @@ export interface ServerInfo {
 	public_key: string;
 	require_enroll: boolean;
 	gateway: boolean;
+	oidc?: { enabled: boolean; name: string };
 }
 
 export interface SessionTicket {
@@ -126,7 +127,16 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 	return data as T;
 }
 
+/** Multipart upload (e.g. agent releases); the browser sets the boundary header. */
+async function upload<T>(path: string, form: FormData): Promise<T> {
+	const res = await fetch(path, { method: 'POST', credentials: 'same-origin', headers: { 'X-ReDesk': '1' }, body: form });
+	const data = await res.json().catch(() => ({}));
+	if (!res.ok) throw new ApiError(res.status, data.error ?? res.statusText);
+	return data as T;
+}
+
 export const api = {
+	upload,
 	get: <T>(p: string) => request<T>('GET', p),
 	post: <T>(p: string, b: unknown = {}) => request<T>('POST', p, b),
 	put: <T>(p: string, b: unknown) => request<T>('PUT', p, b),
@@ -180,4 +190,28 @@ export interface Integration {
 	group_id: number | null;
 	last_sync_at: string | null;
 	last_error: string;
+}
+
+export interface OIDCSettings {
+	name: string;
+	issuer: string;
+	client_id: string;
+	has_secret: boolean;
+	allowed_domains: string[];
+	auto_create: boolean;
+	enabled: boolean;
+}
+
+export interface AgentRelease {
+	id: number;
+	version: string;
+	os: 'windows' | 'macos' | 'linux';
+	arch: 'x86_64' | 'aarch64' | 'universal';
+	filename: string;
+	size: number;
+	sha256: string;
+	notes: string;
+	enabled: boolean;
+	created_by: number | null;
+	created_at: string;
 }

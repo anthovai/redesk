@@ -15,7 +15,12 @@ func (a *API) serverInfo(w http.ResponseWriter, r *http.Request) {
 		a.internal(w, err)
 		return
 	}
+	oidcInfo := map[string]any{"enabled": false, "name": ""}
+	if o, err := a.oidcEnabled(r.Context()); err == nil && o != nil {
+		oidcInfo = map[string]any{"enabled": true, "name": o.Name}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
+		"oidc":           oidcInfo,
 		"name":           "ReDesk",
 		"version":        Version,
 		"public_key":     auth.PublicKeyB64(a.key),

@@ -12,6 +12,7 @@ pub mod session;
 pub mod signal;
 pub mod status;
 pub mod ui;
+pub mod updater;
 pub mod viewer;
 
 use anyhow::{Result, anyhow};

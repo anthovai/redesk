@@ -68,8 +68,14 @@ func (a *API) agentLogin(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	a.issueAppSession(w, r, u, req.Device, nil)
+}
+
+// issueAppSession answers a successful desktop-app sign-in (password or OIDC) with
+// {user, token, server_key, enroll_token}. extra is merged into the audit detail.
+func (a *API) issueAppSession(w http.ResponseWriter, r *http.Request, u *store.User, device string, extra map[string]any) {
 	ip := a.clientIP(r)
-	device := trim(req.Device, 80)
+	device = trim(device, 80)
 	tok := auth.RandomToken(32)
 	if err := a.store.CreateAuthSession(r.Context(), auth.HashToken(tok), u.ID, ip, "ReDesk app: "+device,
 		time.Now().Add(agentSessionLifetime)); err != nil {
@@ -83,7 +89,11 @@ func (a *API) agentLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = a.store.TouchLogin(r.Context(), u.ID)
-	_ = a.store.AddAudit(r.Context(), &u.ID, ip, "auth.agent_login", u.Email, map[string]any{"device": device})
+	detail := map[string]any{"device": device}
+	for k, v := range extra {
+		detail[k] = v
+	}
+	_ = a.store.AddAudit(r.Context(), &u.ID, ip, "auth.agent_login", u.Email, detail)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"user":         u,
 		"token":        tok,
