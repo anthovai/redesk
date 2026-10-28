@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { page } from '$app/state';
-	import { api, type Device, type Group } from '#lib/api.js';
+	import { api, wakeDevice, type Device, type Group } from '#lib/api.js';
 	import { ago, fingerprint, formatId } from '#lib/format.js';
 	import Icon from '#lib/Icon.svelte';
 
@@ -74,6 +74,15 @@
 		editing = null;
 	}
 
+	let toast = $state<{ ok: boolean; message: string } | null>(null);
+	let waking = $state('');
+	async function wake(d: Device) {
+		waking = d.id;
+		toast = await wakeDevice(d.id);
+		waking = '';
+		setTimeout(() => (toast = null), 4000);
+	}
+
 	async function addToBook(d: Device) {
 		await act(() => api.put(`/api/address-book/${d.id}`, { alias: d.alias || d.hostname, tags: [], favorite: false }));
 	}
@@ -144,6 +153,11 @@
 					<td class="whitespace-nowrap text-muted">{d.online ? 'ตอนนี้' : ago(d.last_seen_at)}</td>
 					<td>
 						<div class="flex justify-end gap-1.5">
+							{#if d.can_wake}
+								<button class="btn" title="ส่ง Wake-on-LAN ผ่านเครื่องที่ออนไลน์ในเครือข่ายเดียวกัน" disabled={waking === d.id} onclick={() => wake(d)}>
+									ปลุกเครื่อง
+								</button>
+							{/if}
 							<a class="btn btn-primary {d.online && !d.disabled ? '' : 'pointer-events-none opacity-40'}" href="/connect/{d.id}">เชื่อมต่อ</a>
 							<button class="btn" title="เพิ่มในสมุดที่อยู่" onclick={() => addToBook(d)}><Icon name="book" /></button>
 							<button class="btn" title="รายละเอียด" onclick={() => open(d)}><Icon name="edit" /></button>
@@ -154,6 +168,12 @@
 		</tbody>
 	</table>
 </div>
+
+{#if toast}
+	<div class="fixed bottom-5 left-1/2 z-30 -translate-x-1/2 rounded-lg border border-line bg-surface px-4 py-2 text-sm shadow-lg {toast.ok ? '' : 'text-danger'}" role="status">
+		{toast.message}
+	</div>
+{/if}
 
 {#if editing}
 	<div class="fixed inset-0 z-20 grid place-items-center bg-black/40 p-4" role="presentation" onclick={(ev) => ev.target === ev.currentTarget && (editing = null)}>
@@ -173,6 +193,10 @@
 				<dd class="mono">{editing.fp || '— (ถูกรีเซ็ต)'}</dd>
 				<dt class="text-muted">IP ล่าสุด</dt>
 				<dd class="mono">{editing.d.last_ip || '—'}</dd>
+				<dt class="text-muted">MAC</dt>
+				<dd class="mono">{editing.d.macs?.join(', ') || '—'}</dd>
+				<dt class="text-muted">เครือข่าย LAN</dt>
+				<dd class="mono">{editing.d.lan?.map((l) => `${l.ip}/${l.prefix}`).join(', ') || '—'}</dd>
 			</dl>
 			<div>
 				<label class="label" for="d-alias">ชื่อเรียก (ทุกคนเห็น)</label>

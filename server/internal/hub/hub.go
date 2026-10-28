@@ -116,6 +116,9 @@ type registerMsg struct {
 	OS          string `json:"os"`
 	Version     string `json:"version"`
 	EnrollToken string `json:"enroll_token,omitempty"`
+	// LAN facts for Wake-on-LAN (optional; older agents omit them).
+	Macs []string        `json:"macs,omitempty"`
+	LAN  []store.LanAddr `json:"lan,omitempty"`
 }
 
 type agentMsg struct {
@@ -129,7 +132,7 @@ type agentMsg struct {
 // agentEvents are the session events an agent may report into the audit log.
 var agentEvents = map[string]bool{
 	"auth_failed": true, "auth_ok": true, "denied": true, "locked": true,
-	"file_upload": true, "file_download": true,
+	"file_upload": true, "file_download": true, "wol_sent": true,
 }
 
 func (h *Hub) HandleAgent(w http.ResponseWriter, r *http.Request) {
@@ -267,7 +270,7 @@ func (h *Hub) registerAgent(ctx context.Context, c *websocket.Conn, ip string) (
 		}
 	}
 
-	dev, created, err := h.store.RegisterDevice(ctx, m.ID, pk, trunc(m.Hostname, 128), trunc(m.OS, 64), trunc(m.Version, 32), ip, grant)
+	dev, created, err := h.store.RegisterDevice(ctx, m.ID, pk, trunc(m.Hostname, 128), trunc(m.OS, 64), trunc(m.Version, 32), ip, CleanMacs(m.Macs), cleanLAN(m.LAN), grant)
 	switch {
 	case errors.Is(err, store.ErrKeyMismatch):
 		_ = h.store.AddAudit(ctx, nil, ip, "device.key_mismatch", m.ID, nil)

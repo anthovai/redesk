@@ -7,6 +7,7 @@ pub mod config;
 pub mod crypto;
 pub mod files;
 pub mod input;
+pub mod lan;
 pub mod permissions;
 pub mod power;
 pub mod proto;

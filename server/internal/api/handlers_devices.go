@@ -15,14 +15,39 @@ var deviceIDPattern = regexp.MustCompile(`^[0-9]{9}$`)
 
 type deviceView struct {
 	*store.Device
-	Online bool `json:"online"`
+	Online  bool `json:"online"`
+	CanWake bool `json:"can_wake"` // offline, MAC known and an online helper on its LAN
 }
 
-func (a *API) view(d *store.Device, online map[string]bool) *deviceView {
+// viewCtx renders devices for one request: online state, wake helpers and
+// admin-only network fields.
+type viewCtx struct {
+	online  map[string]bool
+	helpers []*store.Device
+	admin   bool
+}
+
+func (a *API) viewCtx(r *http.Request) *viewCtx {
+	v := &viewCtx{online: a.hub.OnlineSet(), admin: userFrom(r).Role == "admin"}
+	helpers, err := a.hub.OnlineDevices(r.Context())
+	if err != nil {
+		a.log.Warn("cannot load online devices", "err", err)
+	}
+	v.helpers = helpers
+	return v
+}
+
+func (v *viewCtx) view(d *store.Device) *deviceView {
 	if d == nil {
 		return nil
 	}
-	return &deviceView{Device: d, Online: online[d.ID]}
+	dv := &deviceView{Device: d, Online: v.online[d.ID]}
+	dv.CanWake = !dv.Online && !d.Disabled && len(d.Macs) > 0 && hub.PickWakeHelper(d, v.helpers) != nil
+	if !v.admin {
+		// network location is admin-only
+		d.LastIP, d.Macs, d.LAN = "", nil, nil
+	}
+	return dv
 }
 
 func (a *API) listDevices(w http.ResponseWriter, r *http.Request) {
@@ -35,10 +60,10 @@ func (a *API) listDevices(w http.ResponseWriter, r *http.Request) {
 		a.internal(w, err)
 		return
 	}
-	online := a.hub.OnlineSet()
+	vc := a.viewCtx(r)
 	out := make([]*deviceView, len(devs))
 	for i, d := range devs {
-		out[i] = a.view(d, online)
+		out[i] = vc.view(d)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"devices": out})
 }
@@ -66,13 +91,10 @@ func (a *API) myDevices(w http.ResponseWriter, r *http.Request) {
 		a.internal(w, err)
 		return
 	}
-	online := a.hub.OnlineSet()
+	vc := a.viewCtx(r)
 	out := make([]*deviceView, len(devs))
 	for i, d := range devs {
-		if userFrom(r).Role != "admin" {
-			d.LastIP = ""
-		}
-		out[i] = a.view(d, online)
+		out[i] = vc.view(d)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"devices": out})
 }
@@ -91,10 +113,7 @@ func (a *API) getDevice(w http.ResponseWriter, r *http.Request) {
 		storeErr(a, w, err)
 		return
 	}
-	if userFrom(r).Role != "admin" {
-		d.LastIP = "" // network location is admin-only
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"device": a.view(d, a.hub.OnlineSet())})
+	writeJSON(w, http.StatusOK, map[string]any{"device": a.viewCtx(r).view(d)})
 }
 
 func (a *API) updateDevice(w http.ResponseWriter, r *http.Request) {
@@ -141,6 +160,64 @@ func (a *API) resetDeviceKey(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+// wakeDevice asks an online agent on the target's LAN to send a Wake-on-LAN packet.
+func (a *API) wakeDevice(w http.ResponseWriter, r *http.Request) {
+	u := userFrom(r)
+	if !a.limiter.allow("wake:"+u.Email, 10, time.Minute) {
+		writeCodeErr(w, http.StatusTooManyRequests, "rate_limited", "ส่งคำสั่งปลุกเครื่องบ่อยเกินไป กรุณารอสักครู่")
+		return
+	}
+	id := r.PathValue("id")
+	if ok, err := a.canAccess(r, id); err != nil {
+		a.internal(w, err)
+		return
+	} else if !ok {
+		writeErr(w, http.StatusNotFound, "not found")
+		return
+	}
+	d, err := a.store.GetDevice(r.Context(), id)
+	if err != nil {
+		storeErr(a, w, err)
+		return
+	}
+	if d.Disabled {
+		writeCodeErr(w, http.StatusForbidden, "disabled", "เครื่องนี้ถูกปิดใช้งาน")
+		return
+	}
+	if a.hub.Online(id) {
+		writeCodeErr(w, http.StatusConflict, "online_already", "เครื่องนี้ออนไลน์อยู่แล้ว")
+		return
+	}
+	if len(d.Macs) == 0 {
+		writeCodeErr(w, http.StatusConflict, "no_mac", "ยังไม่ทราบ MAC address ของเครื่องนี้ (ต้องเปิด agent รุ่นใหม่ให้ลงทะเบียนอย่างน้อยหนึ่งครั้ง)")
+		return
+	}
+	online, err := a.hub.OnlineDevices(r.Context())
+	if err != nil {
+		a.internal(w, err)
+		return
+	}
+	helper := hub.PickWakeHelper(d, online)
+	if helper == nil {
+		writeCodeErr(w, http.StatusConflict, "no_helper", "ไม่มีเครื่องอื่นที่ออนไลน์อยู่ในเครือข่ายเดียวกันเพื่อช่วยปลุกเครื่องนี้")
+		return
+	}
+	if err := a.hub.SendWol(helper.ID, d.Macs, d.ID); err != nil {
+		writeCodeErr(w, http.StatusServiceUnavailable, "helper_busy", "เครื่องที่ช่วยปลุกไม่ว่าง กรุณาลองใหม่")
+		return
+	}
+	a.audit(r, "device.wake", d.ID, map[string]any{"helper": helper.ID, "macs": len(d.Macs)})
+	resp := map[string]any{"ok": true}
+	if u.Role == "admin" {
+		resp["helper"] = helper.ID
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func writeCodeErr(w http.ResponseWriter, status int, code, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg, "code": code})
+}
+
 // --- address book ---
 
 func (a *API) listAddressBook(w http.ResponseWriter, r *http.Request) {
@@ -149,17 +226,14 @@ func (a *API) listAddressBook(w http.ResponseWriter, r *http.Request) {
 		a.internal(w, err)
 		return
 	}
-	online := a.hub.OnlineSet()
+	vc := a.viewCtx(r)
 	type entryView struct {
 		*store.AddressEntry
 		Device *deviceView `json:"device"`
 	}
 	out := make([]entryView, len(entries))
 	for i, e := range entries {
-		if e.Device != nil && userFrom(r).Role != "admin" {
-			e.Device.LastIP = ""
-		}
-		out[i] = entryView{AddressEntry: e, Device: a.view(e.Device, online)}
+		out[i] = entryView{AddressEntry: e, Device: vc.view(e.Device)}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"entries": out})
 }

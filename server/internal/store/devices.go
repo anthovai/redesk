@@ -28,13 +28,22 @@ type Device struct {
 	CreatedAt    time.Time  `json:"created_at"`
 	GroupID      *int64     `json:"group_id"`
 	OwnerID      *int64     `json:"owner_id"`
+	// LAN facts from the agent (admin-only in API responses; cleared for other users).
+	Macs []string  `json:"macs,omitempty"`
+	LAN  []LanAddr `json:"lan,omitempty"`
 }
 
-const deviceCols = `id, public_key, hostname, os, agent_version, last_ip, last_seen_at, alias, note, disabled, created_at, group_id, owner_id`
+// LanAddr is one IPv4 address of a device with its prefix length.
+type LanAddr struct {
+	IP     string `json:"ip"`
+	Prefix int    `json:"prefix"`
+}
+
+const deviceCols = `id, public_key, hostname, os, agent_version, last_ip, last_seen_at, alias, note, disabled, created_at, group_id, owner_id, macs, lan`
 
 func scanDevice(r scanner) (*Device, error) {
 	var d Device
-	err := r.Scan(&d.ID, &d.PublicKey, &d.Hostname, &d.OS, &d.AgentVersion, &d.LastIP, &d.LastSeenAt, &d.Alias, &d.Note, &d.Disabled, &d.CreatedAt, &d.GroupID, &d.OwnerID)
+	err := r.Scan(&d.ID, &d.PublicKey, &d.Hostname, &d.OS, &d.AgentVersion, &d.LastIP, &d.LastSeenAt, &d.Alias, &d.Note, &d.Disabled, &d.CreatedAt, &d.GroupID, &d.OwnerID, &d.Macs, &d.LAN)
 	if err != nil {
 		return nil, notFound(err)
 	}
@@ -53,14 +62,21 @@ func (s *Store) DeviceExists(ctx context.Context, id string) (bool, error) {
 
 // RegisterDevice binds id to publicKey on first contact (or after an admin key reset)
 // and refreshes metadata. A different key for a bound id is rejected.
-func (s *Store) RegisterDevice(ctx context.Context, id string, publicKey []byte, hostname, osName, version, ip string, grant EnrollGrant) (dev *Device, created bool, err error) {
+// Empty macs/lan (older agents) keep the stored values.
+func (s *Store) RegisterDevice(ctx context.Context, id string, publicKey []byte, hostname, osName, version, ip string, macs []string, lan []LanAddr, grant EnrollGrant) (dev *Device, created bool, err error) {
+	if macs == nil {
+		macs = []string{}
+	}
+	if lan == nil {
+		lan = []LanAddr{}
+	}
 	err = pgx.BeginFunc(ctx, s.DB, func(tx pgx.Tx) error {
 		cur, err := scanDevice(tx.QueryRow(ctx, `SELECT `+deviceCols+` FROM devices WHERE id=$1 FOR UPDATE`, id))
 		switch {
 		case errors.Is(err, ErrNotFound):
 			created = true
-			dev, err = scanDevice(tx.QueryRow(ctx, `INSERT INTO devices(id, public_key, hostname, os, agent_version, last_ip, last_seen_at, group_id, owner_id)
-				VALUES ($1,$2,$3,$4,$5,$6,now(),$7,$8) RETURNING `+deviceCols, id, publicKey, hostname, osName, version, ip, grant.GroupID, grant.OwnerID))
+			dev, err = scanDevice(tx.QueryRow(ctx, `INSERT INTO devices(id, public_key, hostname, os, agent_version, last_ip, last_seen_at, group_id, owner_id, macs, lan)
+				VALUES ($1,$2,$3,$4,$5,$6,now(),$7,$8,$9,$10) RETURNING `+deviceCols, id, publicKey, hostname, osName, version, ip, grant.GroupID, grant.OwnerID, macs, lan))
 			return err
 		case err != nil:
 			return err
@@ -71,11 +87,18 @@ func (s *Store) RegisterDevice(ctx context.Context, id string, publicKey []byte,
 		if cur.PublicKey != nil && !bytes.Equal(cur.PublicKey, publicKey) {
 			return ErrKeyMismatch
 		}
-		dev, err = scanDevice(tx.QueryRow(ctx, `UPDATE devices SET public_key=$2, hostname=$3, os=$4, agent_version=$5, last_ip=$6, last_seen_at=now()
-			WHERE id=$1 RETURNING `+deviceCols, id, publicKey, hostname, osName, version, ip))
+		dev, err = scanDevice(tx.QueryRow(ctx, `UPDATE devices SET public_key=$2, hostname=$3, os=$4, agent_version=$5, last_ip=$6, last_seen_at=now(),
+			macs=CASE WHEN cardinality($7::text[]) > 0 THEN $7 ELSE macs END,
+			lan=CASE WHEN jsonb_array_length($8::jsonb) > 0 THEN $8 ELSE lan END
+			WHERE id=$1 RETURNING `+deviceCols, id, publicKey, hostname, osName, version, ip, macs, lan))
 		return err
 	})
 	return dev, created, err
+}
+
+// DevicesByIDs returns the devices with the given ids (unknown ids are skipped).
+func (s *Store) DevicesByIDs(ctx context.Context, ids []string) ([]*Device, error) {
+	return s.queryDevices(ctx, `SELECT `+deviceCols+` FROM devices WHERE id = ANY($1)`, ids)
 }
 
 func (s *Store) TouchDevice(ctx context.Context, id string) error {

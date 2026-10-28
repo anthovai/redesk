@@ -77,6 +77,7 @@ func (a *API) Handler() http.Handler {
 	admin("PATCH /api/devices/{id}", a.updateDevice)
 	admin("DELETE /api/devices/{id}", a.deleteDevice)
 	admin("POST /api/devices/{id}/reset-key", a.resetDeviceKey)
+	user("POST /api/devices/{id}/wake", a.wakeDevice)
 
 	user("GET /api/my-devices", a.myDevices)
 	user("GET /api/address-book", a.listAddressBook)
