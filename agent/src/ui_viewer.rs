@@ -17,6 +17,32 @@ const BAR_LINGER: f64 = 0.6;
 /// The toolbar shows for this long after connecting, then collapses unless pinned.
 const BAR_INTRO: f64 = 2.5;
 const BAR_BUTTON: f32 = 30.0;
+/// Whiteboard pen colors (name, value) and width (fraction of the remote screen height).
+const PEN_COLORS: [(&str, Color32); 4] = [
+    ("แดง", Color32::from_rgb(0xff, 0x3b, 0x30)),
+    ("เหลือง", Color32::from_rgb(0xff, 0xd6, 0x0a)),
+    ("เขียว", Color32::from_rgb(0x30, 0xd1, 0x58)),
+    ("ฟ้า", Color32::from_rgb(0x0a, 0x84, 0xff)),
+];
+const PEN_WIDTH: f32 = 0.004;
+
+/// A stroke drawn in this window (normalised to the remote screen), mirrored on the remote.
+struct LocalStroke {
+    color: Color32,
+    pts: Vec<Pos2>,
+}
+
+/// Whiteboard state of one remote window.
+#[derive(Default)]
+struct Pen {
+    /// Drawing instead of controlling.
+    on: bool,
+    color: usize,
+    strokes: Vec<LocalStroke>,
+    next_id: u32,
+    /// Points of the active stroke not yet sent.
+    unsent: Vec<f32>,
+}
 
 #[derive(Default)]
 struct WinUi {
@@ -42,6 +68,7 @@ struct WinUi {
     held: u8,
     demo_menu: Option<String>,
     demo_done: bool,
+    pen: Pen,
 }
 
 pub struct ViewerWindow {
@@ -182,7 +209,11 @@ impl ViewerWindow {
                 };
                 ui.painter().image(tex.id(), rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
                 let resp = ui.allocate_rect(rect.intersect(area), Sense::click_and_drag());
-                if connected && info.as_ref().is_some_and(|i| i.input) && ui.input(|i| i.viewport().focused != Some(false)) {
+                let drawing = connected && w.pen.on && info.as_ref().is_some_and(|i| i.whiteboard);
+                if drawing {
+                    self.draw(&mut w.pen, &resp, rect);
+                    w.held = 0;
+                } else if connected && info.as_ref().is_some_and(|i| i.input) && ui.input(|i| i.viewport().focused != Some(false)) {
                     let keys = KeyMap { remote_mac, raw: w.raw_keys };
                     forward_input(&self.viewer, ui, rect, area, keys, &mut w.held);
                     if resp.hovered() {
@@ -191,6 +222,7 @@ impl ViewerWindow {
                 } else {
                     w.held = 0;
                 }
+                paint_strokes(ui.painter(), &w.pen.strokes, rect);
                 // The remote pointer (captures do not include it), unless ours is on top of it.
                 if let Some((cx, cy)) = cursor.filter(|_| !resp.hovered()) {
                     paint_pointer(ui.painter(), pos2(rect.left() + cx * rect.width(), rect.top() + cy * rect.height()));
@@ -208,6 +240,9 @@ impl ViewerWindow {
             let f = Frame1 { name: &name, id: &self.device_id, fp: &fp, info: info.as_ref(), fps, kbps, codec: &codec, fb: fb_size };
             if w.show_quality {
                 self.quality_monitor(&ctx, &f);
+            }
+            if f.info.is_some_and(|i| i.recording) {
+                self.recording_badge(&ctx);
             }
             self.toolbar(&ctx, w, &f);
         } else {
@@ -436,6 +471,37 @@ impl ViewerWindow {
             });
         }
 
+        // Whiteboard: draw on the remote screen (only when the remote machine shows annotations).
+        if f.info.is_some_and(|i| i.whiteboard) {
+            let id = egui::Id::unique(("menu-pen", self.viewport));
+            let tone = if w.pen.on { Tone::Danger } else { Tone::Accent };
+            let resp = bar_button(ui, Glyph::Pen, "วาดบนหน้าจอ", tone, Popup::is_id_open(&ctx, id));
+            self.demo_open(&ctx, w, "pen", id);
+            menu(&resp, id, pal).show(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                menu_header(ui, "วาดบนหน้าจอปลายทาง");
+                if menu_row(ui, Lead::Tick(w.pen.on), "ปากกา", "เมาส์ใช้วาดแทนการควบคุม", true).clicked() {
+                    w.pen.on = !w.pen.on;
+                }
+                menu_separator(ui);
+                menu_header(ui, "สี");
+                for (k, (name, color)) in PEN_COLORS.iter().enumerate() {
+                    let r = menu_row(ui, Lead::Check(w.pen.color == k), name, "", true);
+                    ui.painter().circle_filled(pos2(r.rect.right() - 20.0, r.rect.center().y), 6.0, *color);
+                    if r.clicked() {
+                        w.pen.color = k;
+                        w.pen.on = true;
+                    }
+                }
+                menu_separator(ui);
+                if menu_row(ui, Lead::Glyph(Glyph::Close), "ล้างทั้งหมด", "", !w.pen.strokes.is_empty()).clicked() {
+                    w.pen.strokes.clear();
+                    self.viewer.send(serde_json::json!({"t": "wb", "op": "clear"}));
+                }
+                menu_footer(ui, "เส้นจะหายไปเมื่อจบการเชื่อมต่อ");
+            });
+        }
+
         // Fullscreen
         let (g, tip) = if w.fullscreen { (Glyph::Shrink, "ออกจากเต็มจอ") } else { (Glyph::Expand, "เต็มจอ") };
         if bar_button(ui, g, tip, Tone::Accent, false).clicked() {
@@ -448,6 +514,61 @@ impl ViewerWindow {
         if bar_button(ui, Glyph::Close, "ตัดการเชื่อมต่อ", Tone::Danger, false).clicked() {
             self.viewer.close();
         }
+    }
+
+    /// Pen mode: a drag on the remote screen becomes a stroke, sent as it is drawn.
+    fn draw(&self, pen: &mut Pen, resp: &Response, rect: Rect) {
+        let norm = |p: Pos2| {
+            let q = rect.clamp(p);
+            pos2((q.x - rect.left()) / rect.width(), (q.y - rect.top()) / rect.height())
+        };
+        if resp.hovered() {
+            resp.ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+        }
+        if resp.drag_started_by(egui::PointerButton::Primary) {
+            pen.next_id += 1;
+            pen.unsent.clear();
+            pen.strokes.push(LocalStroke { color: PEN_COLORS[pen.color].1, pts: Vec::new() });
+        }
+        let active = resp.dragged_by(egui::PointerButton::Primary) || resp.drag_stopped_by(egui::PointerButton::Primary);
+        if active
+            && let Some(p) = resp.interact_pointer_pos().map(norm)
+            && let Some(s) = pen.strokes.last_mut()
+            && s.pts.last().is_none_or(|l| (*l - p).length() > 0.0015)
+        {
+            s.pts.push(p);
+            pen.unsent.extend([p.x, p.y]);
+        }
+        // One message per frame (and at the end of the stroke).
+        if !pen.unsent.is_empty() {
+            let c = PEN_COLORS[pen.color].1;
+            self.viewer.send(serde_json::json!({
+                "t": "wb", "op": "line", "id": pen.next_id,
+                "c": format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b()),
+                "w": PEN_WIDTH, "p": std::mem::take(&mut pen.unsent),
+            }));
+        }
+    }
+
+    /// "Recording" badge in the top-right corner while the remote machine records the session.
+    fn recording_badge(&self, ctx: &egui::Context) {
+        egui::Area::new(egui::Id::unique(("recording", self.viewport)))
+            .order(Order::Middle)
+            .interactable(true)
+            .anchor(Align2::RIGHT_TOP, [-12.0, 10.0])
+            .show(ctx, |ui| {
+                Frame::new().fill(Color32::from_black_alpha(175)).corner_radius(12).inner_margin(Margin::symmetric(10, 4)).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let a = 0.55 + 0.45 * (ui.input(|i| i.time) * 3.0).sin().abs() as f32;
+                        let (r, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
+                        ui.painter().circle_filled(r.center(), 4.5, Color32::from_rgb(0xff, 0x45, 0x3a).gamma_multiply(a));
+                        ui.label(RichText::new("กำลังบันทึก").font(semi(12.5)).color(Color32::WHITE));
+                    })
+                    .response
+                    .on_hover_text("องค์กรกำหนดให้บันทึกหน้าจอของเซสชันนี้ไว้ตรวจสอบย้อนหลัง");
+                });
+            });
+        ctx.request_repaint_after(Duration::from_millis(100));
     }
 
     /// Demo/screenshot hook: opens the named toolbar menu once.
@@ -672,7 +793,7 @@ impl ViewerWindow {
     }
 
     /// Screenshots: AEGIRON_UI_VIEWER_STATE="menu=display,quality,dark,..." sets up the demo
-    /// viewer once (flags: menu=monitor|actions|display|keyboard, pinned, collapsed, quality,
+    /// viewer once (flags: menu=monitor|actions|display|keyboard|pen, pinned, collapsed, quality, pen,
     /// original, cursor, dark, password, connecting, closed).
     fn demo_state(&self, ctx: &egui::Context, w: &mut WinUi) {
         if w.demo_done {
@@ -691,6 +812,14 @@ impl ViewerWindow {
                 "quality" => w.show_quality = true,
                 "original" => w.original = true,
                 "cursor" => st.cursor = Some((0.62, 0.55)),
+                "pen" => {
+                    w.pen.on = true;
+                    let ring = (0..=48).map(|i| {
+                        let a = i as f32 / 48.0 * TAU;
+                        pos2(0.42 + 0.08 * a.cos(), 0.4 + 0.11 * a.sin())
+                    });
+                    w.pen.strokes.push(LocalStroke { color: PEN_COLORS[0].1, pts: ring.collect() });
+                }
                 "dark" => ctx.set_theme(egui::Theme::Dark),
                 "password" => {
                     st.phase = Phase::Password;
@@ -907,6 +1036,7 @@ enum Glyph {
     Link,
     Info,
     Warn,
+    Pen,
 }
 
 fn glyph(ui: &Ui, rect: Rect, g: Glyph, color: Color32) {
@@ -987,6 +1117,10 @@ fn glyph(ui: &Ui, rect: Rect, g: Glyph, color: Color32) {
             line(&[(5.0, 14.5), (11.0, 14.5)]);
             line(&[(8.0, 11.8), (8.0, 14.5)]);
             line(&[(4.5, 7.8), (7.0, 5.3), (9.0, 7.3), (11.5, 4.8)]);
+        }
+        Glyph::Pen => {
+            p.add(Shape::closed_line(vec![at(10.8, 2.2), at(13.8, 5.2), at(5.5, 13.5), at(1.8, 14.2), at(2.5, 10.5)], st));
+            line(&[(9.0, 4.0), (12.0, 7.0)]);
         }
         Glyph::Info | Glyph::Warn => {
             p.circle_stroke(at(8.0, 8.0), 6.6 * s, st);
@@ -1175,6 +1309,23 @@ fn forward_input(v: &Viewer, ui: &Ui, rect: Rect, visible: Rect, keys: KeyMap, h
     }
     if let Some((x, y)) = moved {
         v.send(serde_json::json!({"t": "mm", "x": x, "y": y}));
+    }
+}
+
+/// Whiteboard strokes drawn in this window, over the remote screen at `rect`.
+fn paint_strokes(p: &egui::Painter, strokes: &[LocalStroke], rect: Rect) {
+    let width = (PEN_WIDTH * rect.height()).max(1.5);
+    for s in strokes {
+        let pts: Vec<Pos2> = s.pts.iter().map(|q| pos2(rect.left() + q.x * rect.width(), rect.top() + q.y * rect.height())).collect();
+        match pts.len() {
+            0 => {}
+            1 => {
+                p.circle_filled(pts[0], width / 2.0, s.color);
+            }
+            _ => {
+                p.add(Shape::line(pts, Stroke::new(width, s.color)));
+            }
+        }
     }
 }
 

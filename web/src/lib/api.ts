@@ -246,3 +246,30 @@ export interface AgentRelease {
 	created_by: number | null;
 	created_at: string;
 }
+
+/** Recording of an Aegiron remote session, made and uploaded by the controlled device. */
+export interface Recording {
+	id: number;
+	sid: string;
+	device_id: string;
+	device_name: string;
+	user_id: number | null;
+	user_email: string | null;
+	viewer_ip: string;
+	/** pending = the session was recorded but the device has not uploaded it yet. */
+	status: 'pending' | 'ready';
+	created_at: string;
+	uploaded_at: string | null;
+	duration_ms: number;
+	size_bytes: number;
+	sha256: string;
+	codec: string;
+	frames: number;
+}
+
+export interface RecordingSettings {
+	mode: 'off' | 'all' | 'groups';
+	group_ids: number[];
+	/** 0 = keep until deleted. */
+	retention_days: number;
+}

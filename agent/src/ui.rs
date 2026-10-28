@@ -46,6 +46,8 @@ mod settings_ui;
 mod cm_ui;
 #[path = "ui_viewer.rs"]
 mod viewer_ui;
+#[path = "ui_overlay.rs"]
+mod overlay_ui;
 
 pub use viewer_ui::ViewerWindow;
 
@@ -987,7 +989,19 @@ impl App {
                 ip: "203.150.12.34".into(),
                 started: SystemTime::now() - Duration::from_secs(754),
                 kill: Default::default(),
+                recording: view == "home" && std::env::var_os("AEGIRON_UI_DEMO_RECORDING").is_some(),
             });
+            if std::env::var_os("AEGIRON_UI_DEMO_WHITEBOARD").is_some() {
+                // A circled spot and an arrow pointing at it, as a viewer would draw them.
+                let mut b = crate::whiteboard::Board::new("demo", crate::capture::logical_area(0).unwrap_or([0.0, 0.0, 1440.0, 900.0]));
+                let ring: Vec<f32> = (0..=64).flat_map(|i| {
+                    let a = i as f32 / 64.0 * TAU;
+                    [0.5 + 0.09 * a.cos(), 0.45 + 0.12 * a.sin()]
+                }).collect();
+                b.apply("line", 1, "#ff3b30", 0.006, &ring);
+                b.apply("line", 2, "#ffd60a", 0.006, &[0.25, 0.75, 0.38, 0.6, 0.41, 0.56]);
+                st.boards.push(b);
+            }
         }
         drop(st);
         let now = local::unix_now();
@@ -1038,7 +1052,7 @@ impl App {
         if view == "approval" {
             let (reply, _) = tokio::sync::oneshot::channel();
             self.pending.push_back((
-                ApprovalRequest { sid: String::new(), who: "สุดา รักงาน <suda@kgarden.co.th>".into(), ip: "10.1.20.45".into(), reply },
+                ApprovalRequest { sid: String::new(), who: "สุดา รักงาน <suda@kgarden.co.th>".into(), ip: "10.1.20.45".into(), recording: std::env::var_os("AEGIRON_UI_DEMO_RECORDING").is_some(), reply },
                 Instant::now() - Duration::from_secs(8),
             ));
         }
@@ -1395,6 +1409,7 @@ impl App {
                 .with_title(title)
                 .with_inner_size(size)
                 .with_min_inner_size([640.0, 420.0])
+                .with_transparent(false)
                 .with_icon(Arc::new(egui::IconData { rgba: icon_rgba(64), width: 64, height: 64 }));
             // AEGIRON_UI_VIEWER_POS="x,y" places the window (automated screenshots).
             let builder = match std::env::var("AEGIRON_UI_VIEWER_POS").ok().and_then(|p| {
@@ -1579,7 +1594,14 @@ impl eframe::App for App {
         }
         self.show_viewers(ui.ctx());
         self.connection_manager(ui);
+        self.whiteboard_overlay(ui.ctx());
         self.toast_view(ui);
+    }
+
+    /// Transparent: every window paints its own background, and the whiteboard overlay must
+    /// let the desktop show through.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0; 4]
     }
 }
 

@@ -12,6 +12,7 @@ pub mod local;
 pub mod permissions;
 pub mod power;
 pub mod proto;
+pub mod recording;
 pub mod service;
 pub mod session;
 pub mod signal;
@@ -19,6 +20,7 @@ pub mod status;
 pub mod ui;
 pub mod updater;
 pub mod viewer;
+pub mod whiteboard;
 
 use anyhow::{Result, anyhow};
 use argon2::password_hash::{PasswordHasher, SaltString};

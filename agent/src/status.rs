@@ -22,6 +22,8 @@ pub struct SessionInfo {
     pub started: SystemTime,
     /// Notified to end the session from the UI.
     pub kill: Arc<Notify>,
+    /// The session is being recorded (policy from the server); shown as "กำลังบันทึก".
+    pub recording: bool,
 }
 
 /// Someone wants to take control; the UI answers through `reply`.
@@ -29,17 +31,21 @@ pub struct ApprovalRequest {
     pub sid: String,
     pub who: String,
     pub ip: String,
+    /// The session will be recorded if accepted (shown to the person deciding).
+    pub recording: bool,
     pub reply: oneshot::Sender<bool>,
 }
 
 pub struct Status {
     pub server: ServerState,
     pub sessions: Vec<SessionInfo>,
+    /// Annotations viewers draw on this screen, one board per session that allows it.
+    pub boards: Vec<crate::whiteboard::Board>,
 }
 
 impl Default for Status {
     fn default() -> Self {
-        Self { server: ServerState::Connecting, sessions: Vec::new() }
+        Self { server: ServerState::Connecting, sessions: Vec::new(), boards: Vec::new() }
     }
 }
 

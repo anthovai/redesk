@@ -39,7 +39,11 @@
 		check: 'M20 6 9 17l-5-5',
 		minimize: 'M8 3v3a2 2 0 0 1-2 2H3M21 8h-3a2 2 0 0 1-2-2V3M3 16h3a2 2 0 0 1 2 2v3M16 21v-3a2 2 0 0 1 2-2h3',
 		alert: 'M12 9v4M12 17h.01M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z',
-		power: 'M18.36 6.64a9 9 0 1 1-12.73 0M12 2v10'
+		power: 'M18.36 6.64a9 9 0 1 1-12.73 0M12 2v10',
+		pen: 'M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5z',
+		video: 'M23 7l-7 5 7 5zM1 5h15v14H1z',
+		play: 'M6 4l14 8-14 8z',
+		pause: 'M6 4h4v16H6zM14 4h4v16h-4z'
 	} as const;
 	export type IconName = keyof typeof paths;
 </script>

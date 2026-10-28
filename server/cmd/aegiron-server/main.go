@@ -70,6 +70,7 @@ func run(log *slog.Logger) error {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
+	a.PurgeRecordings(ctx)
 	go func() {
 		t := time.NewTicker(time.Hour)
 		defer t.Stop()
@@ -79,6 +80,7 @@ func run(log *slog.Logger) error {
 				return
 			case <-t.C:
 				_ = st.PurgeExpiredSessions(ctx)
+				a.PurgeRecordings(ctx)
 			}
 		}
 	}()

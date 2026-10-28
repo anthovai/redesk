@@ -125,7 +125,11 @@ fn main() -> eframe::Result {
             .with_inner_size(size)
             .with_min_inner_size(MAIN_MIN)
             .with_icon(Arc::new(egui::IconData { rgba: ui::icon_rgba(64), width: 64, height: 64 }))
-            .with_visible(!hidden);
+            .with_visible(!hidden)
+            // The GL surface format is shared by all windows: it must allow transparency so the
+            // whiteboard overlay can be see-through. Every other window paints an opaque
+            // background and opts out explicitly.
+            .with_transparent(true);
         if let Some(pos) = geom.and_then(|g| g.pos) {
             viewport = viewport.with_position(pos);
         }

@@ -14,6 +14,7 @@
 		{ href: '/devices', label: 'อุปกรณ์ทั้งหมด', icon: 'monitor', admin: true },
 		{ href: '/groups', label: 'กลุ่มอุปกรณ์', icon: 'layers', admin: true },
 		{ href: '/sessions', label: 'เซสชัน', icon: 'activity', admin: true },
+		{ href: '/recordings', label: 'บันทึกเซสชัน', icon: 'video', admin: true },
 		{ href: '/audit', label: 'Audit log', icon: 'shield', admin: true },
 		{ href: '/users', label: 'ผู้ใช้', icon: 'users', admin: true },
 		{ href: '/settings', label: 'ตั้งค่าเซิร์ฟเวอร์', icon: 'settings', admin: true }

@@ -45,6 +45,9 @@ type Hub struct {
 	ClientIP func(*http.Request) string
 	// ViewerUserID returns the logged-in console user for a request, or 0.
 	ViewerUserID func(*http.Request) int64
+	// RecordingToken decides whether a new session must be recorded and, if so, returns the
+	// device's one-time upload token ("" = not recorded).
+	RecordingToken func(ctx context.Context, sid, deviceID string, userID int64, viewerIP string) string
 
 	mu     sync.Mutex
 	agents map[string]*agentConn
@@ -133,6 +136,7 @@ type agentMsg struct {
 var agentEvents = map[string]bool{
 	"auth_failed": true, "auth_ok": true, "denied": true, "locked": true,
 	"file_upload": true, "file_download": true, "wol_sent": true,
+	"recording_started": true, "recording_failed": true,
 }
 
 func (h *Hub) HandleAgent(w http.ResponseWriter, r *http.Request) {
@@ -319,6 +323,9 @@ func (h *Hub) agentEvent(ctx context.Context, a *agentConn, m agentMsg) {
 	}
 	h.mu.Unlock()
 	_ = h.store.AddAudit(ctx, actor, ip, "agent."+m.Kind, a.id, detail)
+	if m.Kind == "recording_started" {
+		_ = h.store.MarkRecordingStarted(ctx, m.SID, a.id)
+	}
 }
 
 func writeJSON(ctx context.Context, c *websocket.Conn, v any) error {

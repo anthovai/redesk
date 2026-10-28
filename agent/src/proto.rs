@@ -88,6 +88,20 @@ pub enum ViewerMsg {
     Get { id: u32, path: String },
     #[serde(rename = "cancel")]
     Cancel { id: u32 },
+    /// Whiteboard: `op` = "line" (append points `p` to stroke `id`, color `c`, width `w`) or
+    /// "clear". Only honoured when the agent advertised `info.whiteboard`.
+    #[serde(rename = "wb")]
+    Whiteboard {
+        op: String,
+        #[serde(default)]
+        id: u32,
+        #[serde(default)]
+        c: String,
+        #[serde(default)]
+        w: f32,
+        #[serde(default)]
+        p: Vec<f32>,
+    },
     /// Resend the whole screen (JPEG) or a keyframe (H.264), e.g. after a decoder error.
     #[serde(rename = "refresh", alias = "keyframe")]
     Refresh,

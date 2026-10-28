@@ -73,7 +73,14 @@ func (h *Hub) StartSession(ctx context.Context, deviceID string, userID int64, v
 	h.relays[rl.sid] = rl
 	h.mu.Unlock()
 
-	if !a.send(map[string]any{"t": "session", "sid": rl.sid, "token": rl.agentTok, "relay": "/ws/relay", "viewer": viewer}) {
+	msg := map[string]any{"t": "session", "sid": rl.sid, "token": rl.agentTok, "relay": "/ws/relay", "viewer": viewer}
+	if h.RecordingToken != nil {
+		if tok := h.RecordingToken(ctx, rl.sid, deviceID, userID, viewer.IP); tok != "" {
+			// Agents that predate recording ignore this and stream unrecorded.
+			msg["record"] = map[string]string{"token": tok, "upload": "/api/agent/recordings/" + rl.sid}
+		}
+	}
+	if !a.send(msg) {
 		h.endRelay(rl, "agent_busy")
 		return nil, ErrBusy
 	}

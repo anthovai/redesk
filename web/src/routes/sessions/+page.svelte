@@ -1,5 +1,6 @@
 <script lang="ts">
-	import { api, type ExternalSession, type RemoteSession } from '#lib/api.js';
+	import { api, type ExternalSession, type Recording, type RemoteSession } from '#lib/api.js';
+	import Icon from '#lib/Icon.svelte';
 	import { bytes, dateTime, duration, formatId } from '#lib/format.js';
 
 	let sessions = $state<RemoteSession[]>([]);
@@ -8,6 +9,8 @@
 	let error = $state('');
 	let tab = $state<'aegiron' | 'external'>('aegiron');
 	let external = $state<ExternalSession[]>([]);
+	/** Recordings by session id. */
+	let recorded = $state<Record<string, Recording>>({});
 
 	$effect(() => {
 		if (tab === 'external') api.get<{ sessions: ExternalSession[] }>('/api/external-sessions').then((r) => (external = r.sessions));
@@ -15,10 +18,12 @@
 
 	async function load() {
 		try {
-			const [s, a] = await Promise.all([
+			const [s, a, r] = await Promise.all([
 				api.get<{ sessions: RemoteSession[] }>('/api/sessions'),
-				api.get<{ sessions: { sid: string; state: string }[]; online_devices: number }>('/api/sessions/active')
+				api.get<{ sessions: { sid: string; state: string }[]; online_devices: number }>('/api/sessions/active'),
+				api.get<{ recordings: Recording[] }>('/api/recordings').catch(() => ({ recordings: [] as Recording[] }))
 			]);
+			recorded = Object.fromEntries(r.recordings.map((x) => [x.sid, x]));
 			sessions = s.sessions;
 			active = a.sessions;
 			onlineDevices = a.online_devices;
@@ -94,6 +99,7 @@
 				<th>ระยะเวลา</th>
 				<th class="text-right">ข้อมูล (ลง / ขึ้น)</th>
 				<th>เหตุผลที่จบ</th>
+				<th>บันทึก</th>
 			</tr>
 		</thead>
 		<tbody>
@@ -116,9 +122,16 @@
 					<td class="whitespace-nowrap">{duration(s.started_at, s.ended_at)}</td>
 					<td class="mono text-right whitespace-nowrap text-muted">{bytes(s.bytes_to_viewer)} / {bytes(s.bytes_to_agent)}</td>
 					<td class="text-xs text-muted">{s.end_reason}</td>
+					<td class="whitespace-nowrap">
+						{#if recorded[s.id]?.status === 'ready'}
+							<a class="inline-flex items-center gap-1 text-sm text-accent" href="/recordings/{recorded[s.id].id}"><Icon name="play" size={13} /> เล่น</a>
+						{:else if recorded[s.id]}
+							<span class="text-xs text-muted" title="เครื่องปลายทางยังไม่ได้อัปโหลด">รออัปโหลด</span>
+						{/if}
+					</td>
 				</tr>
 			{:else}
-				<tr><td colspan="7" class="py-10 text-center text-muted">ยังไม่มีเซสชัน</td></tr>
+				<tr><td colspan="8" class="py-10 text-center text-muted">ยังไม่มีเซสชัน</td></tr>
 			{/each}
 		</tbody>
 	</table>

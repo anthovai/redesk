@@ -9,6 +9,7 @@
 		['session.', 'เซสชัน'],
 		['device.', 'อุปกรณ์'],
 		['agent.', 'เหตุการณ์จาก agent'],
+		['recording.', 'บันทึกเซสชัน'],
 		['endpoint.', 'การเชื่อมต่อภายนอก'],
 		['gateway.', 'Gateway'],
 		['integration.', 'Integration'],

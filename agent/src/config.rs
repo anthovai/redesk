@@ -95,6 +95,9 @@ pub struct Config {
     /// argon2id PHC hash of the 4-8 digit PIN that guards Settings and sign-out in the app.
     #[serde(default)]
     pub unlock_pin: Option<String>,
+    /// Let viewers draw annotations on this screen (desktop app only).
+    #[serde(default = "yes")]
+    pub allow_whiteboard: bool,
 }
 
 fn yes() -> bool {
@@ -127,6 +130,7 @@ impl Config {
             account: None,
             lan_discovery: true,
             unlock_pin: None,
+            allow_whiteboard: true,
         })
     }
 

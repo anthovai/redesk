@@ -112,7 +112,15 @@ enum ServerMsg {
     #[serde(rename = "pong")]
     Pong,
     #[serde(rename = "session")]
-    Session { sid: String, token: String, relay: String, viewer: Viewer },
+    Session {
+        sid: String,
+        token: String,
+        relay: String,
+        viewer: Viewer,
+        /// Present when the organisation's policy says this session must be recorded.
+        #[serde(default)]
+        record: Option<crate::recording::RecordRequest>,
+    },
     /// Wake-on-LAN request: send magic packets for these MACs on our LAN.
     #[serde(rename = "wol")]
     Wol {
@@ -151,6 +159,8 @@ where
 
 /// Keeps the signaling connection alive forever, reconnecting with backoff.
 pub async fn run_forever(agent: Arc<Agent>) {
+    // No session is running yet, so any half-written recording was cut off by a crash.
+    crate::recording::recover(&agent.config_path);
     if agent.config.lock().unwrap().lan_discovery {
         tokio::spawn(crate::lan::listen(agent.clone(), crate::lan::DISCOVERY_PORT));
     }
@@ -236,6 +246,11 @@ async fn run_once(agent: &Arc<Agent>) -> Result<()> {
     }
     tracing::info!("registered with server as {id}");
     agent.set_server_state(ServerState::Online);
+    // Session recordings that could not be uploaded earlier (offline, restart): try now.
+    {
+        let agent = agent.clone();
+        tokio::task::spawn_blocking(move || crate::recording::upload_pending(&agent));
+    }
 
     let mut ping = tokio::time::interval(Duration::from_secs(20));
     let (out_tx, mut out_rx) = mpsc::channel::<String>(64);
@@ -248,11 +263,11 @@ async fn run_once(agent: &Arc<Agent>) -> Result<()> {
             m = tokio::time::timeout(Duration::from_secs(70), rx.next()) => {
                 let Some(m) = m.context("server silent for 70s")? else { return Ok(()) };
                 match parse(m?) {
-                    Some(ServerMsg::Session { sid, token, relay, viewer }) => {
+                    Some(ServerMsg::Session { sid, token, relay, viewer, record }) => {
                         let agent = agent.clone();
                         tokio::spawn(async move {
                             tracing::info!("session {sid} requested by {} from {}", viewer.email, viewer.ip);
-                            if let Err(e) = crate::session::run(agent.clone(), &sid, &token, &relay, viewer).await {
+                            if let Err(e) = crate::session::run(agent.clone(), &sid, &token, &relay, viewer, record).await {
                                 tracing::warn!("session {sid} ended: {e:#}");
                                 agent.send_server(json!({"t": "session_reject", "sid": sid, "reason": format!("{e}")}));
                             }
