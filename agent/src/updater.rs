@@ -68,6 +68,21 @@ struct Reply {
     url: String,
 }
 
+impl Release {
+    /// Sample for UI screenshots; its URL is never fetched.
+    pub fn demo() -> Self {
+        Release {
+            version: "0.4.0".into(),
+            notes: "H.264 video, LAN discovery, SSO sign-in".into(),
+            size: 14_200_000,
+            sha256: String::new(),
+            filename: "ReDesk-0.4.0.dmg".into(),
+            url: String::new(),
+            insecure: false,
+        }
+    }
+}
+
 /// Asks the server for a build newer than this one. `Ok(None)` = up to date.
 pub fn check(server: &str, insecure: bool) -> Result<Option<Release>> {
     let server = server.trim().trim_end_matches('/');

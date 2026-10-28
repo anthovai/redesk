@@ -8,7 +8,7 @@ The agent pins the server's Ed25519 public key at `init` time.
 
 ```
 server → agent  {"t":"challenge","nonce":S}
-agent  → server {"t":"register","id","pk","nonce":A,"sig","hostname","os","version","enroll_token"?}
+agent  → server {"t":"register","id","pk","nonce":A,"sig","hostname","os","version","enroll_token"?,"macs"?,"lan"?}
                 sig = Ed25519(agent_key, "redesk-register-v1\n" + id + "\n" + S + "\n" + A)
 server → agent  {"t":"registered","sig":Ed25519(server_key, "redesk-server-v1\n" + id + "\n" + A + "\n" + S)}
              or {"t":"error","code":"id_taken|enroll_required|disabled|bad_signature|...","message"}
@@ -18,8 +18,11 @@ server → agent  {"t":"registered","sig":Ed25519(server_key, "redesk-server-v1\
 - With `require_enroll` on, a new or reset device must present a valid enrollment token.
 - If the server signature fails verification, the agent aborts: *invalid public key from server*.
 - Keepalive: `{"t":"ping"}` / `{"t":"pong"}` every 20 s.
+- `macs` (up to 16, `aa:bb:cc:dd:ee:ff`) and `lan` (`[{ip, prefix}]`, up to 16) describe the device's network so the server can wake it later. Admins see them; other users only see `can_wake`.
+- Wake-on-LAN: `POST /api/devices/{id}/wake` picks an online agent on the same LAN (same public IP and/or subnet) and sends it `{"t":"wol","macs":[...],"target":"<id>"}`. The helper broadcasts the magic packet (UDP 9 and 7) and reports `wol_sent`. Errors: `online_already`, `no_mac`, `no_helper`, `helper_busy`, `rate_limited`.
+- LAN discovery (not through the server): a viewer broadcasts `redesk-discover v1` to UDP 21120; agents on the same subnet with `lan_discovery = true` answer `{id, hostname, os}`, rate-limited.
 - Session request: `{"t":"session","sid","token","relay":"/ws/relay","viewer":{"email","name","ip"}}`.
-- Agent → server audit events: `{"t":"event","sid","kind","detail"}` with `kind` in `auth_failed | auth_ok | denied | locked | file_upload | file_download`. They are stored as `agent.<kind>` and attributed to the viewer of that session.
+- Agent → server audit events: `{"t":"event","sid","kind","detail"}` with `kind` in `auth_failed | auth_ok | denied | locked | file_upload | file_download | wol_sent`. They are stored as `agent.<kind>` and attributed to the viewer of that session.
 
 ## 2. Relay (`/ws/relay?sid=&token=`)
 
@@ -83,3 +86,16 @@ app  → POST /api/agent/login {email, password, totp?, device}      (HTTPS, cer
 - `server_key`: the server's Ed25519 identity, trusted because it arrived over the server's own TLS. A signed-in device that already pins a different key refuses the sign-in.
 - `enroll_token`: single-use, 1 hour, owned by the user. Registering with it sets `devices.owner_id` and adds the device to that user's address book.
 - Opening the web viewer from the app: `POST /api/auth/handoff` (bearer) returns a code valid for 60 s and usable once; the browser opens `GET /api/auth/handoff/{code}?next=/connect/<id>`, which sets the console cookie and redirects. `next` must be a same-site path.
+
+### Organisation SSO (OpenID Connect)
+
+- Browser: `GET /api/oidc/login?next=` → identity provider (Authorization Code + PKCE, `state`, `nonce`, bound to the browser by a cookie) → `GET /api/oidc/callback`. The ID token is verified (signature, issuer, audience, expiry, nonce); `email_verified` and the allowed domains are enforced. TOTP is not asked again: the IdP is responsible for MFA.
+- App: `POST /api/oidc/auth {device}` → `{code, url, expires_in}`. The app opens `url` in the browser. That page shows the requesting device and IP before continuing to the IdP. The app polls `GET /api/oidc/auth-query?code=` every 2 s and gets `{pending:true}`, or the same payload as `/api/agent/login`. The poll code never appears in the browser URL.
+- Admin: `GET/PUT /api/oidc/settings`. The client secret is sealed with the vault and never returned.
+
+## 6. Agent updates
+
+- Admins upload builds: `POST /api/agent/releases` (multipart, up to 300 MB, stored by SHA-256), then enable or disable them.
+- Clients check with `GET /api/agent/update?os=&arch=&version=`, which returns the newest enabled release that is newer by semver.
+- Clients download from `GET /api/agent/releases/{id}/download`, served with `X-Checksum-SHA256`.
+- The app downloads only after the user asks, from the same server only. It keeps the file only if the size and SHA-256 match, and never installs it by itself.

@@ -22,7 +22,9 @@ use crate::config::{Account, ApproveMode, Config, Verification};
 use crate::local::{self, LocalState, WindowGeom};
 use crate::signal::Agent;
 use crate::status::{ApprovalRequest, ServerState, SessionInfo, UiHooks};
-use crate::{fingerprint, format_id, service};
+use crate::lan::LanPeer;
+use crate::updater::{self, Release};
+use crate::{fingerprint, format_id, lan, service};
 
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(30);
 const SIDEBAR_WIDTH: f32 = 340.0;
@@ -483,6 +485,8 @@ struct LoginForm {
     need_totp: bool,
     busy: bool,
     error: String,
+    /// Set while waiting for the browser SSO sign-in; storing true cancels the wait.
+    sso: Option<Arc<AtomicBool>>,
 }
 
 /// Device list tabs on the home view (like RustDesk's Recent / Favorites / Address book).
@@ -491,6 +495,21 @@ enum HomeTab {
     Recent,
     Favorites,
     Book,
+    /// Agents answering a broadcast on the local network.
+    Lan,
+}
+
+/// Agent self-update, driven from Settings. Nothing installs without the user.
+#[derive(Default)]
+enum UpdateState {
+    #[default]
+    Idle,
+    Checking,
+    UpToDate,
+    Available(Release),
+    Downloading(Release),
+    Downloaded(PathBuf),
+    Failed(String),
 }
 
 /// What a correct unlock PIN lets through.
@@ -527,6 +546,9 @@ struct DeviceRow {
 enum Job {
     Login { server: String, insecure: bool, result: Result<account::Login, String> },
     Book(Result<Vec<BookEntry>, (u16, String)>),
+    Lan(Vec<LanPeer>),
+    UpdateCheck(Result<Option<Release>, String>),
+    UpdateDownload(Result<PathBuf, String>),
 }
 
 /// Things outside the window that may ask it to show itself (tray, second launch).
@@ -568,6 +590,9 @@ pub struct App {
     book_loaded: bool,
     book_at: Option<Instant>,
     book_busy: bool,
+    lan: Vec<LanPeer>,
+    lan_busy: bool,
+    update: UpdateState,
     viewers: Vec<Arc<ViewerWindow>>,
     new_pw: String,
     new_pw2: String,
@@ -624,6 +649,9 @@ impl App {
             book_loaded: false,
             book_at: None,
             book_busy: false,
+            lan: Vec::new(),
+            lan_busy: false,
+            update: UpdateState::default(),
             viewers: Vec::new(),
             new_pw: String::new(),
             new_pw2: String::new(),
@@ -673,6 +701,19 @@ impl App {
         let (view, tab) = match view {
             "home-fav" => ("home", HomeTab::Favorites),
             "home-book" => ("home", HomeTab::Book),
+            "home-lan" => {
+                let peer = |id: &str, host: &str, ip: [u8; 4], os: &str| LanPeer { id: id.into(), hostname: host.into(), os: os.into(), addr: ip.into() };
+                self.lan = vec![
+                    peer("512340987", "ACC-PC01", [192, 168, 1, 21], "windows x86_64"),
+                    peer("734120556", "meeting-3f", [192, 168, 1, 40], "macos aarch64"),
+                ];
+                ("home", HomeTab::Lan)
+            }
+            "settings-update" => {
+                self.demo_scroll = Some(1450.0);
+                self.update = UpdateState::Available(Release::demo());
+                ("settings", HomeTab::Recent)
+            }
             "settings-pin" => {
                 self.demo_scroll = Some(640.0);
                 ("settings", HomeTab::Recent)
@@ -762,14 +803,72 @@ impl App {
         });
     }
 
-    fn start_login(&mut self, ctx: &egui::Context) {
-        let (server, insecure) = match &self.agent {
+    /// Server to sign in to: this device's, or the one typed on the welcome screen.
+    fn login_target(&self) -> (String, bool) {
+        match &self.agent {
             Some(a) => {
                 let c = a.config.lock().unwrap();
                 (c.server_url.clone(), c.allow_insecure_transport)
             }
             None => (self.setup.server.trim().trim_end_matches('/').to_string(), self.setup.insecure),
-        };
+        }
+    }
+
+    /// Organisation SSO: the browser signs in, the app polls for the resulting session.
+    fn start_sso(&mut self, ctx: &egui::Context) {
+        let (server, insecure) = self.login_target();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.login.sso = Some(cancel.clone());
+        self.login.busy = true;
+        self.login.error.clear();
+        let device = hostname::get().map(|h| h.to_string_lossy().into_owned()).unwrap_or_default();
+        self.spawn_job(ctx, move || {
+            let result = (|| {
+                let (code, url) = account::oidc_start(&server, insecure, &device)?;
+                open_url(&url).map_err(|e| anyhow::anyhow!("เปิดเบราว์เซอร์ไม่ได้: {e}"))?;
+                let deadline = Instant::now() + Duration::from_secs(300);
+                while Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_secs(2));
+                    if cancel.load(Ordering::Relaxed) {
+                        return Ok(None);
+                    }
+                    if let Some(sess) = account::oidc_poll(&server, insecure, &code)? {
+                        return Ok(Some(account::Login::Ok(sess)));
+                    }
+                }
+                anyhow::bail!("หมดเวลารอการเข้าสู่ระบบในเบราว์เซอร์")
+            })();
+            match result {
+                // Cancelled by the user: nothing to report.
+                Ok(None) => Job::Login { server, insecure, result: Err(String::new()) },
+                Ok(Some(login)) => Job::Login { server, insecure, result: Ok(login) },
+                Err(e) => Job::Login { server, insecure, result: Err(format!("{e:#}")) },
+            }
+        });
+    }
+
+    fn cancel_sso(&mut self) {
+        if let Some(c) = self.login.sso.take() {
+            c.store(true, Ordering::Relaxed);
+            self.login.busy = false;
+        }
+    }
+
+    fn discover_lan(&mut self, ctx: &egui::Context) {
+        if self.lan_busy {
+            return;
+        }
+        self.lan_busy = true;
+        self.spawn_job(ctx, || Job::Lan(lan::discover(Duration::from_millis(1500))));
+    }
+
+    fn check_update(&mut self, ctx: &egui::Context, server: String, insecure: bool) {
+        self.update = UpdateState::Checking;
+        self.spawn_job(ctx, move || Job::UpdateCheck(updater::check(&server, insecure).map_err(|e| format!("{e:#}"))));
+    }
+
+    fn start_login(&mut self, ctx: &egui::Context) {
+        let (server, insecure) = self.login_target();
         let (email, password, totp) = (self.login.email.clone(), self.login.password.clone(), self.login.totp.clone());
         self.login.busy = true;
         self.login.error.clear();
@@ -937,6 +1036,7 @@ impl App {
         match job {
             Job::Login { server, insecure, result } => {
                 self.login.busy = false;
+                self.login.sso = None;
                 match result {
                     Err(e) => self.login.error = e,
                     Ok(account::Login::NeedTotp) => {
@@ -957,6 +1057,23 @@ impl App {
                             self.open_remote(ctx, &id, &name);
                         }
                     }
+                }
+            }
+            Job::Lan(peers) => {
+                self.lan_busy = false;
+                self.lan = peers;
+            }
+            Job::UpdateCheck(r) => {
+                self.update = match r {
+                    Ok(Some(rel)) => UpdateState::Available(rel),
+                    Ok(None) => UpdateState::UpToDate,
+                    Err(e) => UpdateState::Failed(e),
+                }
+            }
+            Job::UpdateDownload(r) => {
+                self.update = match r {
+                    Ok(path) => UpdateState::Downloaded(path),
+                    Err(e) => UpdateState::Failed(e),
                 }
             }
             Job::Book(result) => {
@@ -1614,10 +1731,13 @@ impl App {
         section(ui, "ระบบ");
         let mut auto = self.autostart;
         let mut auto_changed = false;
+        let (mut lan_on, mut lan_changed) = (c.lan_discovery, false);
         let server_fp = B64.decode(&c.server_key).map(|k| fingerprint(&k)).unwrap_or_default();
         let device_fp = fingerprint(agent.identity.verifying_key().as_bytes());
         group(ui, &mut |ui| {
             auto_changed = switch_row(ui, "เปิด ReDesk เมื่อล็อกอิน", "เริ่มทำงานในถาดระบบ (tray) โดยไม่เปิดหน้าต่าง", &mut auto);
+            row_sep(ui);
+            lan_changed = switch_row(ui, "ให้เครื่องอื่นในเครือข่ายค้นพบ", "ตอบ ID และชื่อเครื่องแก่เครื่องในวงแลนเดียวกัน (UDP 21120)", &mut lan_on);
             row_sep(ui);
             ui.add_space(6.0);
             let console = c.server_url.clone();
@@ -1644,12 +1764,82 @@ impl App {
             });
             ui.add_space(6.0);
         });
+        if lan_changed {
+            self.save_config(|c| c.lan_discovery = lan_on);
+        }
+        self.update_section(ui, &c);
         if auto_changed {
             let res = if auto { service::install(&self.config_path) } else { service::uninstall() };
             match res {
                 Ok(()) => self.autostart = auto,
                 Err(e) => self.flash(format!("ตั้งค่าไม่สำเร็จ: {e}")),
             }
+        }
+    }
+
+    /// "อัปเดต": check the server for a newer agent, download it after the user asks, verify
+    /// it (size + SHA-256, in updater::download) and show it; installing stays a user action.
+    fn update_section(&mut self, ui: &mut Ui, c: &Config) {
+        let pal = Palette::of(ui);
+        ui.add_space(12.0);
+        ui.label(RichText::new("อัปเดต").font(semi(13.0)).color(pal.muted));
+        let mut action: Option<u8> = None; // 1 check, 2 download, 3 show file
+        Frame::new().stroke(Stroke::new(1.0, pal.line)).corner_radius(12).inner_margin(Margin::symmetric(16, 12)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let (text, color) = match &self.update {
+                    UpdateState::Idle => (format!("เวอร์ชันปัจจุบัน {}", env!("CARGO_PKG_VERSION")), pal.fg),
+                    UpdateState::Checking => ("กำลังตรวจหาอัปเดต…".into(), pal.muted),
+                    UpdateState::UpToDate => (format!("เป็นเวอร์ชันล่าสุดแล้ว ({})", env!("CARGO_PKG_VERSION")), pal.fg),
+                    UpdateState::Available(r) => (format!("มีเวอร์ชันใหม่ {} ({:.1} MB)", r.version, r.size as f64 / 1e6), pal.accent),
+                    UpdateState::Downloading(r) => (format!("กำลังดาวน์โหลด {}…", r.version), pal.muted),
+                    UpdateState::Downloaded(p) => (format!("ดาวน์โหลดและตรวจ SHA-256 แล้ว: {}", p.file_name().unwrap_or_default().to_string_lossy()), pal.fg),
+                    UpdateState::Failed(e) => (e.clone(), pal.danger),
+                };
+                ui.label(RichText::new(text).size(13.5).color(color));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| match &self.update {
+                    UpdateState::Available(_) => {
+                        if primary(ui, "ดาวน์โหลด", true).clicked() {
+                            action = Some(2);
+                        }
+                    }
+                    UpdateState::Downloaded(_) => {
+                        if secondary(ui, "แสดงไฟล์", None).clicked() {
+                            action = Some(3);
+                        }
+                    }
+                    UpdateState::Checking | UpdateState::Downloading(_) => {}
+                    _ => {
+                        if secondary(ui, "ตรวจหาอัปเดต", None).clicked() {
+                            action = Some(1);
+                        }
+                    }
+                });
+            });
+            if let UpdateState::Available(r) = &self.update
+                && !r.notes.trim().is_empty()
+            {
+                ui.label(RichText::new(r.notes.trim()).size(12.5).color(pal.muted));
+            }
+        });
+        let ctx = ui.ctx().clone();
+        match action {
+            Some(1) => self.check_update(&ctx, c.server_url.clone(), c.allow_insecure_transport),
+            Some(2) => {
+                if let UpdateState::Available(rel) = std::mem::take(&mut self.update) {
+                    let dir = dirs::download_dir().unwrap_or_else(std::env::temp_dir).join("ReDesk");
+                    self.update = UpdateState::Downloading(rel.clone());
+                    self.spawn_job(&ctx, move || Job::UpdateDownload(updater::download(&rel, &dir).map_err(|e| format!("{e:#}"))));
+                }
+            }
+            Some(3) => {
+                if let UpdateState::Downloaded(p) = &self.update
+                    && let Some(dir) = p.parent()
+                {
+                    let _ = open_url(&dir.to_string_lossy());
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1690,12 +1880,20 @@ impl App {
         let signed_in = self.account().is_some();
         ui.horizontal(|ui| {
             let mut tab = self.tab;
-            segmented(ui, &mut tab, &[(HomeTab::Recent, "ล่าสุด"), (HomeTab::Favorites, "รายการโปรด"), (HomeTab::Book, "สมุดที่อยู่")], true);
+            segmented(ui, &mut tab, &[(HomeTab::Recent, "ล่าสุด"), (HomeTab::Favorites, "รายการโปรด"), (HomeTab::Book, "สมุดที่อยู่"), (HomeTab::Lan, "ในเครือข่าย")], true);
+            if tab == HomeTab::Lan && self.tab != HomeTab::Lan {
+                let ctx = ui.ctx().clone();
+                self.discover_lan(&ctx);
+            }
             self.tab = tab;
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if self.tab == HomeTab::Book && signed_in && icon_button(ui, Icon::Refresh, "รีเฟรช").clicked() {
                     let ctx = ui.ctx().clone();
                     self.refresh_book(&ctx);
+                }
+                if self.tab == HomeTab::Lan && !self.lan_busy && icon_button(ui, Icon::Refresh, "ค้นหาอีกครั้ง").clicked() {
+                    let ctx = ui.ctx().clone();
+                    self.discover_lan(&ctx);
                 }
                 let edit = TextEdit::singleline(&mut self.search)
                     .hint_text("ค้นหาชื่อ, ID, แท็ก")
@@ -1711,6 +1909,23 @@ impl App {
         let rows: Vec<DeviceRow> = match self.tab {
             HomeTab::Recent => self.local.recent.iter().filter(|r| r.id != my_id).map(|r| self.known_row(&r.id, Some(r.last))).collect(),
             HomeTab::Favorites => self.local.favorites.iter().filter(|f| **f != my_id).map(|f| self.known_row(f, None)).collect(),
+            HomeTab::Lan => {
+                if self.lan_busy {
+                    ui.label(RichText::new("กำลังค้นหาเครื่องในเครือข่าย…").size(13.0).color(pal.muted));
+                    return;
+                }
+                self.lan
+                    .iter()
+                    .filter(|p| p.id != my_id)
+                    .map(|p| DeviceRow {
+                        id: p.id.clone(),
+                        title: if p.hostname.is_empty() { format_id(&p.id) } else { p.hostname.clone() },
+                        detail: format!("{} · {} · {}", format_id(&p.id), p.addr, p.os),
+                        online: Some(true),
+                        tags: Vec::new(),
+                    })
+                    .collect()
+            }
             HomeTab::Book => {
                 if !signed_in {
                     Frame::new().fill(pal.side).corner_radius(12).inner_margin(Margin::symmetric(18, 16)).show(ui, |ui| {
@@ -1756,6 +1971,7 @@ impl App {
                 HomeTab::Recent => "ยังไม่มีประวัติการเชื่อมต่อ — เครื่องที่คุณเคยควบคุมจะแสดงที่นี่",
                 HomeTab::Favorites => "ยังไม่มีรายการโปรด — กดรูปดาวที่เครื่องในรายการเพื่อเพิ่ม",
                 HomeTab::Book => "ยังไม่มีเครื่องในสมุดที่อยู่ — เพิ่มได้จากคอนโซล ReDesk",
+                HomeTab::Lan => "ไม่พบเครื่อง ReDesk อื่นในเครือข่ายเดียวกัน",
             };
             ui.label(RichText::new(msg).size(13.0).color(pal.muted));
             return;
@@ -1883,6 +2099,24 @@ impl App {
             .corner_radius(8)
             .min_size(vec2(ui.available_width(), 42.0));
         submit |= ui.vertical_centered(|ui| ui.add_enabled(ready, b)).inner.clicked();
+        if !self.login.need_totp {
+            ui.add_space(4.0);
+            ui.vertical_centered(|ui| {
+                if self.login.sso.is_some() {
+                    ui.label(RichText::new("ดำเนินการเข้าสู่ระบบต่อในเบราว์เซอร์…").size(13.0).color(pal.muted));
+                    if ui.add(Button::new(RichText::new("ยกเลิก").size(13.0).color(pal.accent)).frame(false)).clicked() {
+                        self.cancel_sso();
+                    }
+                } else {
+                    let has_server = self.agent.is_some() || !self.setup.server.trim().is_empty();
+                    let b = Button::new(RichText::new("เข้าสู่ระบบด้วย SSO ขององค์กร").size(13.5).color(pal.accent)).frame(false);
+                    if ui.add_enabled(!self.login.busy && has_server, b).clicked() {
+                        let ctx = ui.ctx().clone();
+                        self.start_sso(&ctx);
+                    }
+                }
+            });
+        }
         submit && ready
     }
 
@@ -1975,6 +2209,7 @@ impl App {
             submit = self.login_fields(ui);
         });
         if close {
+            self.cancel_sso();
             self.login_modal = false;
             self.after_login = None;
         } else if submit {
