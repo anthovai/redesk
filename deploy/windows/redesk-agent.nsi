@@ -33,6 +33,8 @@ Unicode true
 
 !define UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\ReDesk"
 !define RUN_KEY "Software\Microsoft\Windows\CurrentVersion\Run"
+; redesk://connect/<id> links open the app (per user, like RustDesk's rustdesk:// scheme).
+!define URL_KEY "Software\Classes\redesk"
 
 Name "ReDesk"
 OutFile "${OUTFILE}"
@@ -232,6 +234,11 @@ Section "ReDesk" SecMain
   ; Start in the tray at logon (per user: screen capture needs the user's desktop session).
   WriteRegStr HKCU "${RUN_KEY}" "ReDesk" '"$INSTDIR\redesk.exe" --background'
 
+  WriteRegStr HKCU "${URL_KEY}" "" "URL:ReDesk"
+  WriteRegStr HKCU "${URL_KEY}" "URL Protocol" ""
+  WriteRegStr HKCU "${URL_KEY}\DefaultIcon" "" '"$INSTDIR\redesk.exe",0'
+  WriteRegStr HKCU "${URL_KEY}\shell\open\command" "" '"$INSTDIR\redesk.exe" "%1"'
+
   CreateShortcut "$SMPROGRAMS\ReDesk.lnk" "$INSTDIR\redesk.exe" "" "$INSTDIR\redesk.ico"
   CreateShortcut "$DESKTOP\ReDesk.lnk" "$INSTDIR\redesk.exe" "" "$INSTDIR\redesk.ico"
 
@@ -259,6 +266,7 @@ Section "Uninstall"
   Pop $0
   Sleep 800
   DeleteRegValue HKCU "${RUN_KEY}" "ReDesk"
+  DeleteRegKey HKCU "${URL_KEY}"
   Delete "$SMPROGRAMS\ReDesk.lnk"
   Delete "$DESKTOP\ReDesk.lnk"
   Delete "$INSTDIR\redesk.exe"

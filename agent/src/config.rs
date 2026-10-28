@@ -89,6 +89,9 @@ pub struct Config {
     pub max_width: u32,
     #[serde(default)]
     pub account: Option<Account>,
+    /// argon2id PHC hash of the 4-8 digit PIN that guards Settings and sign-out in the app.
+    #[serde(default)]
+    pub unlock_pin: Option<String>,
 }
 
 fn yes() -> bool {
@@ -119,6 +122,7 @@ impl Config {
             jpeg_quality: 70,
             max_width: 1920,
             account: None,
+            unlock_pin: None,
         })
     }
 

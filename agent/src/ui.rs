@@ -2,13 +2,14 @@
 //! this machine's ID and one-time password on the left, controlling another machine and the
 //! live sessions on the right, a status bar along the bottom.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::f32::consts::TAU;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
+use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use eframe::egui::{
     self, Align, Align2, Button, Color32, CornerRadius, FontFamily, FontId, Frame, Layout, Margin, Pos2, Rect, Response,
@@ -18,12 +19,16 @@ use tokio::sync::mpsc;
 
 use crate::account::{self, BookEntry};
 use crate::config::{Account, ApproveMode, Config, Verification};
+use crate::local::{self, LocalState, WindowGeom};
 use crate::signal::Agent;
 use crate::status::{ApprovalRequest, ServerState, SessionInfo, UiHooks};
 use crate::{fingerprint, format_id, service};
 
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(30);
 const SIDEBAR_WIDTH: f32 = 340.0;
+const VIEWER_SIZE: [f32; 2] = [1280.0, 800.0];
+const PIN_MAX_TRIES: u32 = 5;
+const PIN_LOCKOUT: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------------------------
 // Look and feel
@@ -210,6 +215,9 @@ enum Icon {
     Back,
     Monitor,
     Shield,
+    Star,
+    StarFilled,
+    Search,
 }
 
 fn arc(c: Pos2, r: f32, from: f32, to: f32) -> Vec<Pos2> {
@@ -267,6 +275,29 @@ fn paint_icon(ui: &Ui, rect: Rect, icon: Icon, color: Color32) {
                 st,
             ));
             p.add(Shape::line(vec![at(5.5, 8.0), at(7.4, 9.9), at(10.8, 6.3)], st));
+        }
+        Icon::Star | Icon::StarFilled => {
+            let c = at(8.0, 8.6);
+            let pts: Vec<Pos2> = (0..10)
+                .map(|k| {
+                    let a = -0.25 * TAU + k as f32 * TAU / 10.0;
+                    let r = if k % 2 == 0 { 6.6 } else { 2.8 } * s;
+                    c + vec2(a.cos(), a.sin()) * r
+                })
+                .collect();
+            if matches!(icon, Icon::StarFilled) {
+                // The star is concave: fill it as triangles around the centre.
+                for k in 0..10 {
+                    p.add(Shape::convex_polygon(vec![c, pts[k], pts[(k + 1) % 10]], color, Stroke::NONE));
+                }
+            }
+            let mut outline = pts.clone();
+            outline.push(pts[0]);
+            p.add(Shape::line(outline, Stroke::new(1.2 * s.max(1.0), color)));
+        }
+        Icon::Search => {
+            p.circle_stroke(at(6.8, 6.8), 4.3 * s, st);
+            p.line_segment([at(10.0, 10.0), at(14.0, 14.0)], st);
         }
     }
 }
@@ -382,6 +413,45 @@ fn open_url(url: &str) -> std::io::Result<()> {
     cmd.arg(url).spawn().map(|_| ())
 }
 
+/// "5 นาทีที่แล้ว" for a unix time.
+fn ago(unix: u64) -> String {
+    let s = local::unix_now().saturating_sub(unix);
+    match s {
+        0..60 => "เมื่อสักครู่".into(),
+        60..3600 => format!("{} นาทีที่แล้ว", s / 60),
+        3600..86400 => format!("{} ชั่วโมงที่แล้ว", s / 3600),
+        86400..2_592_000 => format!("{} วันที่แล้ว", s / 86400),
+        2_592_000..31_536_000 => format!("{} เดือนที่แล้ว", s / 2_592_000),
+        _ => "นานกว่า 1 ปี".into(),
+    }
+}
+
+/// 4-8 digits, like RustDesk's unlock PIN.
+fn pin_problem(pin: &str) -> Option<&'static str> {
+    if !(4..=8).contains(&pin.len()) || !pin.bytes().all(|b| b.is_ascii_digit()) {
+        Some("PIN ต้องเป็นตัวเลข 4–8 หลัก")
+    } else {
+        None
+    }
+}
+
+fn verify_pin(hash: &str, pin: &str) -> bool {
+    !pin.is_empty() && PasswordHash::new(hash).is_ok_and(|h| Argon2::default().verify_password(pin.as_bytes(), &h).is_ok())
+}
+
+/// Square, frameless star toggle (local favorites).
+fn star_button(ui: &mut Ui, on: bool) -> Response {
+    let pal = Palette::of(ui);
+    let (rect, resp) = ui.allocate_exact_size(vec2(32.0, 32.0), Sense::click());
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, 8.0, if ui.visuals().dark_mode { pal.field } else { pal.line });
+    }
+    let (icon, color) = if on { (Icon::StarFilled, pal.warn) } else { (Icon::Star, if resp.hovered() { pal.fg } else { pal.muted }) };
+    paint_icon(ui, Rect::from_center_size(rect.center(), vec2(17.0, 17.0)), icon, color);
+    let tip = if on { "เอาออกจากรายการโปรด" } else { "เพิ่มในรายการโปรด" };
+    resp.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 // ---------------------------------------------------------------------------------------------
 // App
 
@@ -412,6 +482,44 @@ struct LoginForm {
     error: String,
 }
 
+/// Device list tabs on the home view (like RustDesk's Recent / Favorites / Address book).
+#[derive(Clone, Copy, PartialEq)]
+enum HomeTab {
+    Recent,
+    Favorites,
+    Book,
+}
+
+/// What a correct unlock PIN lets through.
+enum PinAction {
+    OpenSettings,
+    SignOut,
+    /// Replace the PIN with this argon2 hash.
+    Change(String),
+    Remove,
+}
+
+#[derive(Default)]
+struct PinState {
+    prompt: Option<PinAction>,
+    input: String,
+    error: String,
+    fails: u32,
+    locked_until: Option<Instant>,
+    new_pin: String,
+    new_pin2: String,
+}
+
+/// One row of the device list.
+struct DeviceRow {
+    id: String,
+    title: String,
+    detail: String,
+    /// Known only for devices in the address book.
+    online: Option<bool>,
+    tags: Vec<String>,
+}
+
 /// Results of network calls made on background threads.
 enum Job {
     Login { server: String, insecure: bool, result: Result<account::Login, String> },
@@ -422,10 +530,15 @@ enum Job {
 #[derive(Clone, Default)]
 pub struct ShowSignal(pub Arc<AtomicBool>);
 
+/// Device IDs from `redesk://` links (command line or a second launch), waiting to be opened.
+#[derive(Clone, Default)]
+pub struct OpenRequests(pub Arc<Mutex<VecDeque<String>>>);
+
 #[derive(Clone)]
 pub struct Options {
     pub config_path: PathBuf,
     pub show: ShowSignal,
+    pub open: OpenRequests,
     pub quit: Arc<AtomicBool>,
     pub has_tray: bool,
     /// Start the network runtime (false for screenshot/demo mode).
@@ -463,6 +576,23 @@ pub struct App {
     start_runtime: bool,
     screenshot: Option<(PathBuf, u32)>,
     started: Instant,
+    open: OpenRequests,
+    /// Deep link waiting for the user to confirm.
+    link_prompt: Option<String>,
+    /// Connection to open once sign-in succeeds.
+    after_login: Option<(String, String)>,
+    local: LocalState,
+    /// None in demo mode: never touch the user's real file.
+    local_path: Option<PathBuf>,
+    local_dirty: Option<Instant>,
+    tab: HomeTab,
+    search: String,
+    pin: PinState,
+    /// Initial size of each open viewer window (a changing builder would resize it).
+    viewer_init: HashMap<egui::ViewportId, [f32; 2]>,
+    viewer_size_seen: Arc<Mutex<Option<[f32; 2]>>>,
+    /// Demo screenshots of the lower part of a view.
+    demo_scroll: Option<f32>,
 }
 
 impl App {
@@ -470,6 +600,9 @@ impl App {
         style(&cc.egui_ctx);
         let (approvals_tx, approvals_rx) = mpsc::unbounded_channel();
         let (jobs_tx, jobs_rx) = std::sync::mpsc::channel();
+        let local_path = opts.start_runtime.then(|| LocalState::path_for(&opts.config_path));
+        let local = local_path.as_deref().map(LocalState::load).unwrap_or_default();
+        let tab = if local.recent.is_empty() { HomeTab::Book } else { HomeTab::Recent };
         let mut app = Self {
             agent: None,
             config_path: opts.config_path,
@@ -499,6 +632,18 @@ impl App {
             start_runtime: opts.start_runtime,
             screenshot: opts.screenshot.map(|p| (p, 0)),
             started: Instant::now(),
+            open: opts.open,
+            link_prompt: None,
+            after_login: None,
+            local,
+            local_path,
+            local_dirty: None,
+            tab,
+            search: String::new(),
+            pin: PinState::default(),
+            viewer_init: HashMap::new(),
+            viewer_size_seen: Arc::default(),
+            demo_scroll: None,
         };
         if let Some(a) = agent {
             app.attach(&cc.egui_ctx, a);
@@ -521,10 +666,21 @@ impl App {
     /// Demo state for screenshots; never used in normal runs.
     pub fn demo(&mut self, view: &str) {
         let Some(agent) = &self.agent else { return };
+        // home | home-fav | home-book: the same data, another device-list tab.
+        let (view, tab) = match view {
+            "home-fav" => ("home", HomeTab::Favorites),
+            "home-book" => ("home", HomeTab::Book),
+            "settings-pin" => {
+                self.demo_scroll = Some(640.0);
+                ("settings", HomeTab::Recent)
+            }
+            v => (v, HomeTab::Recent),
+        };
+        self.tab = tab;
         *agent.temp_password.lock().unwrap() = "k7mq3xpd".into();
         let mut st = agent.status.lock().unwrap();
         st.server = ServerState::Online;
-        if view == "home" || view == "approval" {
+        if view == "home" || view == "approval" || view == "pin" || view == "link" {
             st.sessions.push(SessionInfo {
                 sid: "demo".into(),
                 email: "somchai@kgarden.co.th".into(),
@@ -535,14 +691,32 @@ impl App {
             });
         }
         drop(st);
-        if view == "home" {
+        let now = local::unix_now();
+        self.local.recent = vec![
+            local::Recent { id: "512340987".into(), name: "บัญชี-PC01".into(), last: now - 300, count: 12 },
+            local::Recent { id: "604118275".into(), name: String::new(), last: now - 3 * 3600, count: 1 },
+            local::Recent { id: "734120556".into(), name: "เครื่องประชุม ชั้น 3".into(), last: now - 2 * 86400, count: 3 },
+        ];
+        self.local.favorites = vec!["512340987".into(), "281907433".into()];
+        if view == "settings" || view == "pin" {
+            agent.config.lock().unwrap().unlock_pin = crate::hash_password("1234").ok();
+        }
+        if view == "pin" {
+            self.pin.prompt = Some(PinAction::OpenSettings);
+            self.pin.input = "12".into();
+        }
+        if view == "link" {
+            self.open.0.lock().unwrap().push_back("734120556".into());
+        }
+        if view == "home" || view == "pin" || view == "link" {
             agent.config.lock().unwrap().account =
                 Some(Account { email: "it@kgarden.co.th".into(), name: "ฝ่ายไอที".into(), token: String::new() });
             let dev = |h: &str, online: bool| Some(account::BookDevice { hostname: h.into(), alias: String::new(), os: "windows x86_64".into(), online });
+            let tags = |t: &[&str]| t.iter().map(|s| s.to_string()).collect();
             self.book = vec![
-                BookEntry { device_id: "512340987".into(), alias: "บัญชี-PC01".into(), favorite: true, device: dev("ACC-PC01", true) },
-                BookEntry { device_id: "734120556".into(), alias: "เครื่องประชุม ชั้น 3".into(), favorite: false, device: dev("MEET-3F", true) },
-                BookEntry { device_id: "281907433".into(), alias: String::new(), favorite: false, device: dev("SRV-FILES", false) },
+                BookEntry { device_id: "512340987".into(), alias: "บัญชี-PC01".into(), favorite: true, tags: tags(&["บัญชี"]), device: dev("ACC-PC01", true) },
+                BookEntry { device_id: "734120556".into(), alias: "เครื่องประชุม ชั้น 3".into(), favorite: false, tags: tags(&["ประชุม"]), device: dev("MEET-3F", true) },
+                BookEntry { device_id: "281907433".into(), alias: String::new(), favorite: false, tags: tags(&["server"]), device: dev("SRV-FILES", false) },
             ];
             self.book_loaded = true;
             self.book_at = Some(Instant::now());
@@ -622,8 +796,9 @@ impl App {
         }
         let Some((server, acc)) = self.account() else {
             self.flash("เข้าสู่ระบบก่อน เพื่อเชื่อมต่อเครื่องอื่น");
-            self.login = LoginForm::default();
+            self.login = LoginForm { email: self.login.email.clone(), ..Default::default() };
             self.login_modal = true;
+            self.after_login = Some((id.to_string(), name.to_string()));
             return;
         };
         let insecure = agent.config.lock().unwrap().allow_insecure_transport;
@@ -633,6 +808,113 @@ impl App {
         let rctx = ctx.clone();
         let viewer = Viewer::connect(target, Arc::new(move || rctx.request_repaint_of(viewport)));
         self.viewers.push(ViewerWindow::new(viewer, id.to_string(), viewport));
+        // A bare formatted ID is not a name worth remembering.
+        let name = if name == format_id(id) { "" } else { name };
+        self.local.record(id, name, local::unix_now());
+        self.mark_local();
+    }
+
+    fn mark_local(&mut self) {
+        if self.local_dirty.is_none() {
+            self.local_dirty = Some(Instant::now());
+        }
+    }
+
+    /// Writes local.toml at most about once a second (window drags change it every frame).
+    fn flush_local(&mut self, force: bool) {
+        let Some(at) = self.local_dirty else { return };
+        if !force && at.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.local_dirty = None;
+        if let Some(path) = &self.local_path
+            && let Err(e) = self.local.save(path)
+        {
+            tracing::warn!("cannot save {}: {e:#}", path.display());
+        }
+    }
+
+    /// Window geometry to remember: skipped while minimized, maximized or full screen.
+    fn track_geometry(&mut self, ctx: &egui::Context) {
+        let geom = ctx.input(|i| {
+            let v = i.viewport();
+            if v.minimized == Some(true) || v.maximized == Some(true) || v.fullscreen == Some(true) {
+                return None;
+            }
+            let inner = v.inner_rect?;
+            Some(WindowGeom { pos: v.outer_rect.map(|r| [r.min.x, r.min.y]), size: [inner.width(), inner.height()] })
+        });
+        if let Some(g) = geom
+            && self.local.main_window != Some(g)
+        {
+            self.local.main_window = Some(g);
+            self.mark_local();
+        }
+        let seen = self.viewer_size_seen.lock().unwrap().take();
+        if let Some(s) = seen
+            && self.local.viewer_size != Some(s)
+        {
+            self.local.viewer_size = Some(s);
+            self.mark_local();
+        }
+    }
+
+    fn has_pin(&self) -> bool {
+        self.agent.as_ref().is_some_and(|a| a.config.lock().unwrap().unlock_pin.is_some())
+    }
+
+    /// Runs `action` now, or after the unlock PIN when one is set.
+    fn guarded(&mut self, ctx: &egui::Context, action: PinAction) {
+        if self.has_pin() {
+            self.pin.input.clear();
+            self.pin.error.clear();
+            self.pin.prompt = Some(action);
+        } else {
+            self.run_pin_action(ctx, action);
+        }
+    }
+
+    fn run_pin_action(&mut self, ctx: &egui::Context, action: PinAction) {
+        match action {
+            PinAction::OpenSettings => self.view = View::Settings,
+            PinAction::SignOut => self.sign_out(ctx),
+            PinAction::Change(hash) => {
+                self.pin.new_pin.clear();
+                self.pin.new_pin2.clear();
+                self.save_config(|c| c.unlock_pin = Some(hash));
+            }
+            PinAction::Remove => self.save_config(|c| c.unlock_pin = None),
+        }
+    }
+
+    fn pin_locked_for(&self) -> Option<Duration> {
+        self.pin.locked_until.and_then(|t| t.checked_duration_since(Instant::now())).filter(|d| !d.is_zero())
+    }
+
+    fn submit_pin(&mut self, ctx: &egui::Context) {
+        if self.pin_locked_for().is_some() {
+            return;
+        }
+        let hash = self.agent.as_ref().and_then(|a| a.config.lock().unwrap().unlock_pin.clone());
+        let ok = hash.is_none_or(|h| verify_pin(&h, &self.pin.input));
+        self.pin.input.clear();
+        if ok {
+            self.pin.fails = 0;
+            self.pin.locked_until = None;
+            self.pin.error.clear();
+            if let Some(action) = self.pin.prompt.take() {
+                self.run_pin_action(ctx, action);
+            }
+            return;
+        }
+        // After the first lockout every further wrong PIN locks again, until a correct one.
+        self.pin.fails += 1;
+        if self.pin.fails >= PIN_MAX_TRIES {
+            self.pin.locked_until = Some(Instant::now() + PIN_LOCKOUT);
+            self.pin.error = "ใส่ PIN ผิดหลายครั้งเกินไป".into();
+        } else {
+            self.pin.error = format!("PIN ไม่ถูกต้อง (ลองได้อีก {} ครั้ง)", PIN_MAX_TRIES - self.pin.fails);
+        }
     }
 
     fn sign_out(&mut self, ctx: &egui::Context) {
@@ -668,6 +950,9 @@ impl App {
                         self.login_modal = false;
                         self.book_loaded = false;
                         self.refresh_book(ctx);
+                        if let Some((id, name)) = self.after_login.take() {
+                            self.open_remote(ctx, &id, &name);
+                        }
                     }
                 }
             }
@@ -726,11 +1011,14 @@ impl App {
             }
         }
         self.viewers.retain(|w| !w.closed.load(Ordering::Relaxed));
+        let live: Vec<_> = self.viewers.iter().map(|w| w.viewport).collect();
+        self.viewer_init.retain(|v, _| live.contains(v));
         for w in &self.viewers {
             let title = format!("{} — ReDesk", w.viewer.state.lock().unwrap().device_name);
+            let size = *self.viewer_init.entry(w.viewport).or_insert(self.local.viewer_size.unwrap_or(VIEWER_SIZE));
             let builder = egui::ViewportBuilder::default()
                 .with_title(title)
-                .with_inner_size([1280.0, 800.0])
+                .with_inner_size(size)
                 .with_min_inner_size([640.0, 420.0])
                 .with_icon(Arc::new(egui::IconData { rgba: icon_rgba(64), width: 64, height: 64 }));
             // REDESK_UI_VIEWER_POS="x,y" places the window (automated screenshots).
@@ -741,8 +1029,22 @@ impl App {
                 Some(pos) => builder.with_position(pos),
                 None => builder,
             };
-            let win = w.clone();
-            ctx.show_viewport_deferred(w.viewport, builder, move |ui, _| win.show(ui));
+            let (win, seen) = (w.clone(), self.viewer_size_seen.clone());
+            ctx.show_viewport_deferred(w.viewport, builder, move |ui, _| {
+                let size = ui.input(|i| {
+                    let v = i.viewport();
+                    // The focused window only: several open viewers must not fight over one value.
+                    let normal = v.focused == Some(true)
+                        && v.minimized != Some(true)
+                        && v.maximized != Some(true)
+                        && v.fullscreen != Some(true);
+                    v.inner_rect.filter(|_| normal).map(|r| [r.width(), r.height()])
+                });
+                if size.is_some() {
+                    *seen.lock().unwrap() = size;
+                }
+                win.show(ui)
+            });
         }
     }
 
@@ -797,6 +1099,16 @@ impl eframe::App for App {
         if self.show.0.swap(false, Ordering::Relaxed) {
             Self::bring_to_front(ctx);
         }
+        let link = self.open.0.lock().unwrap().pop_back();
+        if let Some(id) = link {
+            self.open.0.lock().unwrap().clear(); // a burst of links: only the newest counts
+            self.link_prompt = Some(id);
+            Self::bring_to_front(ctx);
+        }
+        if self.local_path.is_some() {
+            self.track_geometry(ctx);
+            self.flush_local(false);
+        }
         if ctx.input(|i| i.viewport().close_requested()) && !self.quit.load(Ordering::Relaxed) && self.has_tray {
             // Closing the window keeps the agent reachable from the tray.
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
@@ -831,6 +1143,10 @@ impl eframe::App for App {
         ctx.request_repaint_after(Duration::from_secs(1));
     }
 
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.flush_local(true);
+    }
+
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let pal = Palette::of(ui);
         match self.agent.clone() {
@@ -851,7 +1167,11 @@ impl eframe::App for App {
                     .frame(Frame::new().fill(pal.side).inner_margin(Margin { left: 28, right: 24, top: 24, bottom: 18 }))
                     .show(ui, |ui| self.sidebar(ui, &agent));
                 egui::CentralPanel::default().frame(Frame::new().fill(pal.bg).inner_margin(Margin::symmetric(36, 28))).show(ui, |ui| {
-                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match self.view {
+                    let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
+                    if let Some(y) = self.demo_scroll {
+                        scroll = scroll.vertical_scroll_offset(y);
+                    }
+                    scroll.show(ui, |ui| match self.view {
                         View::Home => self.home(ui, &agent),
                         View::Settings => self.settings(ui, &agent),
                     });
@@ -860,6 +1180,13 @@ impl eframe::App for App {
         }
         if self.login_modal {
             self.login_modal(ui);
+        }
+        if self.agent.is_some() {
+            if self.pin.prompt.is_some() {
+                self.pin_modal(ui);
+            } else if self.link_prompt.is_some() && !self.login_modal {
+                self.link_modal(ui);
+            }
         }
         self.show_viewers(ui.ctx());
         self.approval_modal(ui);
@@ -969,7 +1296,7 @@ impl App {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if ui.add(Button::new(RichText::new("ออกจากระบบ").size(12.5).color(pal.muted)).frame(false)).clicked() {
                                 let ctx = ui.ctx().clone();
-                                self.sign_out(&ctx);
+                                self.guarded(&ctx, PinAction::SignOut);
                             }
                         });
                     });
@@ -1001,7 +1328,12 @@ impl App {
             );
             paint_icon(ui, Rect::from_min_size(resp.rect.left_center() + vec2(12.0, -8.0), vec2(16.0, 16.0)), icon, pal.muted);
             if resp.clicked() {
-                self.view = if self.view == View::Home { View::Settings } else { View::Home };
+                if self.view == View::Home {
+                    let ctx = ui.ctx().clone();
+                    self.guarded(&ctx, PinAction::OpenSettings);
+                } else {
+                    self.view = View::Home;
+                }
             }
         });
     }
@@ -1048,7 +1380,7 @@ impl App {
         });
         if go && digits.len() == 9 {
             let ctx = ui.ctx().clone();
-            let name = self.book.iter().find(|e| e.device_id == digits).map(|e| e.title()).unwrap_or_else(|| format_id(&digits));
+            let name = self.device_title(&digits);
             self.open_remote(&ctx, &digits, &name);
         }
 
@@ -1218,6 +1550,60 @@ impl App {
             }
         }
 
+        section(ui, "ล็อกการตั้งค่า");
+        let has_pin = c.unlock_pin.is_some();
+        let (mut set_pin, mut remove_pin) = (false, false);
+        let (p1, p2) = (&mut self.pin.new_pin, &mut self.pin.new_pin2);
+        group(ui, &mut |ui| {
+            ui.add_space(10.0);
+            ui.scope(|ui| {
+                ui.spacing_mut().interact_size.y = 0.0; // compact status chip
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("PIN ปลดล็อก").color(pal.fg));
+                    if has_pin {
+                        Frame::new().fill(pal.accent_soft).corner_radius(6).inner_margin(Margin::symmetric(8, 1)).show(ui, |ui| {
+                            ui.label(RichText::new("เปิดใช้อยู่").size(12.0).color(pal.accent));
+                        });
+                    }
+                });
+            });
+            ui.label(RichText::new("ต้องใส่ PIN ก่อนเปิดหน้าตั้งค่าหรือออกจากระบบ กันคนอื่นแก้การตั้งค่าเครื่องนี้").size(12.5).color(pal.muted));
+            ui.horizontal(|ui| {
+                let w = ((ui.available_width() - if has_pin { 230.0 } else { 120.0 }) / 2.0).max(96.0);
+                fn field<'a>(hint: &str, v: &'a mut String, w: f32) -> TextEdit<'a> {
+                    TextEdit::singleline(v).password(true).char_limit(8).hint_text(hint).margin(Margin::symmetric(10, 8)).desired_width(w)
+                }
+                ui.add(field(if has_pin { "PIN ใหม่" } else { "PIN 4–8 หลัก" }, p1, w));
+                ui.add(field("ยืนยัน PIN", p2, w));
+                set_pin = secondary(ui, if has_pin { "เปลี่ยน" } else { "ตั้ง PIN" }, None).clicked();
+                if has_pin {
+                    remove_pin = secondary(ui, "ลบ PIN", Some(pal.danger)).clicked();
+                }
+            });
+            ui.add_space(8.0);
+        });
+        if set_pin {
+            if let Some(problem) = pin_problem(&self.pin.new_pin) {
+                self.flash(problem);
+            } else if self.pin.new_pin != self.pin.new_pin2 {
+                self.flash("PIN ทั้งสองช่องไม่ตรงกัน");
+            } else if let Ok(hash) = crate::hash_password(&self.pin.new_pin) {
+                if has_pin {
+                    // Changing an existing PIN asks for the current one first.
+                    let ctx = ui.ctx().clone();
+                    self.guarded(&ctx, PinAction::Change(hash));
+                } else {
+                    self.pin.new_pin.clear();
+                    self.pin.new_pin2.clear();
+                    self.save_config(|c| c.unlock_pin = Some(hash));
+                }
+            }
+        }
+        if remove_pin {
+            let ctx = ui.ctx().clone();
+            self.guarded(&ctx, PinAction::Remove);
+        }
+
         section(ui, "ระบบ");
         let mut auto = self.autostart;
         let mut auto_changed = false;
@@ -1260,81 +1646,196 @@ impl App {
         }
     }
 
+    fn book_entry(&self, id: &str) -> Option<&BookEntry> {
+        self.book.iter().find(|e| e.device_id == id)
+    }
+
+    /// Best known name: address book, then the name remembered from the last connection.
+    fn device_title(&self, id: &str) -> String {
+        self.book_entry(id).map(|e| e.title()).or_else(|| self.local.name_of(id).map(str::to_string)).unwrap_or_else(|| format_id(id))
+    }
+
+    fn known_row(&self, id: &str, when: Option<u64>) -> DeviceRow {
+        let entry = self.book_entry(id);
+        let online = entry.map(|e| e.online());
+        let title = self.device_title(id);
+        let mut parts = Vec::new();
+        // An unnamed device already shows its ID as the title.
+        if title != format_id(id) {
+            parts.push(format_id(id));
+        }
+        if let Some(on) = online {
+            parts.push((if on { "ออนไลน์" } else { "ออฟไลน์" }).to_string());
+        }
+        if let Some(t) = when {
+            parts.push(ago(t));
+        }
+        if parts.is_empty() {
+            parts.push("ไม่อยู่ในสมุดที่อยู่".into());
+        }
+        DeviceRow { id: id.to_string(), title, detail: parts.join(" · "), online, tags: entry.map(|e| e.tags.clone()).unwrap_or_default() }
+    }
+
+    /// Recent / favorites / address book, with search and a favorite star on every row.
     fn address_book(&mut self, ui: &mut Ui, agent: &Agent) {
         let pal = Palette::of(ui);
         let my_id = agent.config.lock().unwrap().id.clone();
+        let signed_in = self.account().is_some();
         ui.horizontal(|ui| {
-            ui.label(RichText::new("สมุดที่อยู่").font(semi(16.0)).color(pal.fg));
-            if self.account().is_some() {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if icon_button(ui, Icon::Refresh, "รีเฟรช").clicked() {
-                        let ctx = ui.ctx().clone();
-                        self.refresh_book(&ctx);
-                    }
-                });
-            }
-        });
-        if self.account().is_none() {
-            Frame::new().fill(pal.side).corner_radius(12).inner_margin(Margin::symmetric(18, 16)).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 2.0;
-                        ui.label(RichText::new("เข้าสู่ระบบเพื่อดูเครื่องของคุณ").color(pal.fg));
-                        ui.label(RichText::new("เครื่องในสมุดที่อยู่และสถานะออนไลน์จะแสดงที่นี่").size(12.5).color(pal.muted));
-                    });
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if primary(ui, "เข้าสู่ระบบ", true).clicked() {
-                            self.login = LoginForm { email: self.login.email.clone(), ..Default::default() };
-                            self.login_modal = true;
-                        }
-                    });
-                });
+            let mut tab = self.tab;
+            segmented(ui, &mut tab, &[(HomeTab::Recent, "ล่าสุด"), (HomeTab::Favorites, "รายการโปรด"), (HomeTab::Book, "สมุดที่อยู่")], true);
+            self.tab = tab;
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if self.tab == HomeTab::Book && signed_in && icon_button(ui, Icon::Refresh, "รีเฟรช").clicked() {
+                    let ctx = ui.ctx().clone();
+                    self.refresh_book(&ctx);
+                }
+                let edit = TextEdit::singleline(&mut self.search)
+                    .hint_text("ค้นหาชื่อ, ID, แท็ก")
+                    .margin(Margin { left: 30, right: 8, top: 8, bottom: 8 })
+                    .desired_width(ui.available_width().clamp(110.0, 220.0));
+                let r = ui.add(edit);
+                let icon = Rect::from_center_size(r.rect.left_center() + vec2(16.0, 0.0), vec2(14.0, 14.0));
+                paint_icon(ui, icon, Icon::Search, pal.muted);
             });
+        });
+        ui.add_space(4.0);
+
+        let rows: Vec<DeviceRow> = match self.tab {
+            HomeTab::Recent => self.local.recent.iter().filter(|r| r.id != my_id).map(|r| self.known_row(&r.id, Some(r.last))).collect(),
+            HomeTab::Favorites => self.local.favorites.iter().filter(|f| **f != my_id).map(|f| self.known_row(f, None)).collect(),
+            HomeTab::Book => {
+                if !signed_in {
+                    Frame::new().fill(pal.side).corner_radius(12).inner_margin(Margin::symmetric(18, 16)).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 2.0;
+                                ui.label(RichText::new("เข้าสู่ระบบเพื่อดูเครื่องของคุณ").color(pal.fg));
+                                ui.label(RichText::new("เครื่องในสมุดที่อยู่และสถานะออนไลน์จะแสดงที่นี่").size(12.5).color(pal.muted));
+                            });
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if primary(ui, "เข้าสู่ระบบ", true).clicked() {
+                                    self.login = LoginForm { email: self.login.email.clone(), ..Default::default() };
+                                    self.login_modal = true;
+                                }
+                            });
+                        });
+                    });
+                    return;
+                }
+                if !self.book_loaded {
+                    ui.label(RichText::new("กำลังโหลด…").size(13.0).color(pal.muted));
+                    return;
+                }
+                self.book
+                    .iter()
+                    .filter(|e| e.device_id != my_id)
+                    .map(|e| {
+                        let status = if e.online() { "ออนไลน์" } else { "ออฟไลน์" };
+                        DeviceRow {
+                            id: e.device_id.clone(),
+                            title: e.title(),
+                            detail: format!("{} · {status}", format_id(&e.device_id)),
+                            online: Some(e.online()),
+                            tags: e.tags.clone(),
+                        }
+                    })
+                    .collect()
+            }
+        };
+        if rows.is_empty() {
+            let msg = match self.tab {
+                HomeTab::Recent => "ยังไม่มีประวัติการเชื่อมต่อ — เครื่องที่คุณเคยควบคุมจะแสดงที่นี่",
+                HomeTab::Favorites => "ยังไม่มีรายการโปรด — กดรูปดาวที่เครื่องในรายการเพื่อเพิ่ม",
+                HomeTab::Book => "ยังไม่มีเครื่องในสมุดที่อยู่ — เพิ่มได้จากคอนโซล ReDesk",
+            };
+            ui.label(RichText::new(msg).size(13.0).color(pal.muted));
             return;
         }
-        if !self.book_loaded {
-            ui.label(RichText::new("กำลังโหลด…").size(13.0).color(pal.muted));
+        let q = self.search.trim().to_lowercase();
+        let q_id: String = q.chars().filter(|c| *c != ' ').collect();
+        let matches = |r: &DeviceRow| {
+            q.is_empty()
+                || r.title.to_lowercase().contains(&q)
+                || (!q_id.is_empty() && q_id.bytes().all(|b| b.is_ascii_digit()) && r.id.contains(&q_id))
+                || r.tags.iter().any(|t| t.to_lowercase().contains(&q))
+        };
+        let rows: Vec<DeviceRow> = rows.into_iter().filter(|r| matches(r)).collect();
+        if rows.is_empty() {
+            ui.label(RichText::new(format!("ไม่พบเครื่องที่ตรงกับ “{}”", self.search.trim())).size(13.0).color(pal.muted));
             return;
         }
-        let entries: Vec<BookEntry> = self.book.iter().filter(|e| e.device_id != my_id).cloned().collect();
-        if entries.is_empty() {
-            ui.label(RichText::new("ยังไม่มีเครื่องในสมุดที่อยู่ — เพิ่มได้จากคอนโซล ReDesk").size(13.0).color(pal.muted));
-            return;
-        }
+
+        let mut connect: Option<(String, String)> = None;
+        let mut star: Option<String> = None;
         Frame::new().stroke(Stroke::new(1.0, pal.line)).corner_radius(12).inner_margin(Margin::symmetric(14, 4)).show(ui, |ui| {
             ui.set_width(ui.available_width());
-            for (n, e) in entries.iter().enumerate() {
+            for (n, r) in rows.iter().enumerate() {
                 if n > 0 {
-                    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
-                    ui.painter().rect_filled(r, 0.0, pal.line);
+                    let (sep, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+                    ui.painter().rect_filled(sep, 0.0, pal.line);
                 }
                 ui.horizontal(|ui| {
                     ui.set_min_height(50.0);
-                    let (r, _) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
-                    paint_icon(ui, r, Icon::Monitor, if e.online() { pal.accent } else { pal.muted });
-                    ui.painter().circle_filled(r.right_bottom() - vec2(2.0, 2.0), 4.0, if e.online() { pal.ok } else { pal.line });
-                    ui.vertical(|ui| {
-                        ui.add_space(6.0);
-                        ui.spacing_mut().item_spacing.y = 0.0;
-                        ui.label(RichText::new(e.title()).font(semi(14.0)).color(pal.fg));
-                        let status = if e.online() { "ออนไลน์" } else { "ออฟไลน์" };
-                        ui.label(RichText::new(format!("{} · {status}", format_id(&e.device_id))).size(12.5).color(pal.muted));
-                    });
+                    let online = r.online == Some(true);
+                    let (ic, _) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
+                    paint_icon(ui, ic, Icon::Monitor, if online { pal.accent } else { pal.muted });
+                    if let Some(on) = r.online {
+                        ui.painter().circle_filled(ic.right_bottom() - vec2(2.0, 2.0), 4.0, if on { pal.ok } else { pal.line });
+                    }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let b = Button::new(RichText::new("เชื่อมต่อ").font(semi(13.5)).color(if e.online() { pal.accent } else { pal.muted }))
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        if star_button(ui, self.local.is_favorite(&r.id)).clicked() {
+                            star = Some(r.id.clone());
+                        }
+                        let offline = r.online == Some(false);
+                        let b = Button::new(RichText::new("เชื่อมต่อ").font(semi(13.5)).color(if offline { pal.muted } else { pal.accent }))
                             .fill(pal.bg)
                             .stroke(Stroke::new(1.0, pal.line))
                             .corner_radius(8)
                             .min_size(vec2(0.0, 32.0));
-                        if ui.add_enabled(e.online(), b).clicked() {
-                            let ctx = ui.ctx().clone();
-                            self.open_remote(&ctx, &e.device_id, &e.title());
+                        if ui.add_enabled(!offline, b).clicked() {
+                            connect = Some((r.id.clone(), r.title.clone()));
                         }
+                        // Name and details take the rest of the row, left aligned.
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            ui.vertical(|ui| {
+                                ui.add_space(6.0);
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                ui.spacing_mut().interact_size.y = 0.0; // compact tag chips
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 6.0;
+                                    ui.add(egui::Label::new(RichText::new(&r.title).font(semi(14.0)).color(pal.fg)).truncate());
+                                    for t in r.tags.iter().take(3) {
+                                        Frame::new().fill(pal.accent_soft).corner_radius(6).inner_margin(Margin::symmetric(6, 0)).show(ui, |ui| {
+                                            ui.label(RichText::new(t).size(11.5).color(pal.accent));
+                                        });
+                                    }
+                                });
+                                ui.add(egui::Label::new(RichText::new(&r.detail).size(12.5).color(pal.muted)).truncate());
+                            });
+                        });
                     });
                 });
             }
         });
+        if let Some(id) = star {
+            self.local.toggle_favorite(&id);
+            self.mark_local();
+        }
+        if let Some((id, name)) = connect {
+            let ctx = ui.ctx().clone();
+            self.open_remote(&ctx, &id, &name);
+        }
+        if self.tab == HomeTab::Recent && self.search.trim().is_empty() {
+            ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                if ui.add(Button::new(RichText::new("ล้างประวัติ").size(12.5).color(pal.muted)).frame(false)).clicked() {
+                    self.local.recent.clear();
+                    self.mark_local();
+                }
+            });
+        }
     }
 
     /// Email / password / 2FA fields. Returns true when the form should be submitted.
@@ -1468,9 +1969,127 @@ impl App {
         });
         if close {
             self.login_modal = false;
+            self.after_login = None;
         } else if submit {
             let ctx = ui.ctx().clone();
             self.start_login(&ctx);
+        }
+    }
+
+    fn pin_modal(&mut self, ui: &mut Ui) {
+        let pal = Palette::of(ui);
+        let what = match self.pin.prompt {
+            Some(PinAction::OpenSettings) => "ใส่ PIN เพื่อเปิดหน้าตั้งค่า",
+            Some(PinAction::SignOut) => "ใส่ PIN เพื่อออกจากระบบ",
+            Some(PinAction::Change(_)) => "ใส่ PIN ปัจจุบัน เพื่อเปลี่ยนเป็น PIN ใหม่",
+            Some(PinAction::Remove) => "ใส่ PIN ปัจจุบัน เพื่อลบ PIN",
+            None => return,
+        };
+        let locked = self.pin_locked_for();
+        let (mut submit, mut close) = (false, false);
+        egui::Modal::new(egui::Id::unique("unlock-pin")).backdrop_color(Color32::from_black_alpha(110)).show(ui.ctx(), |ui| {
+            ui.set_width(320.0);
+            ui.horizontal(|ui| {
+                let (r, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
+                paint_icon(ui, r, Icon::Shield, pal.accent);
+                ui.label(RichText::new("ปลดล็อก").font(semi(18.0)).color(pal.fg));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.add(Button::new(RichText::new("ยกเลิก").size(13.0).color(pal.muted)).frame(false)).clicked() {
+                        close = true;
+                    }
+                });
+            });
+            ui.label(RichText::new(what).size(13.0).color(pal.muted));
+            ui.add_space(6.0);
+            let r = ui.add_enabled(
+                locked.is_none(),
+                TextEdit::singleline(&mut self.pin.input)
+                    .password(true)
+                    .char_limit(8)
+                    .hint_text("PIN")
+                    .font(mono(20.0))
+                    .align(Align2::CENTER_CENTER)
+                    .margin(Margin::symmetric(10, 8))
+                    .desired_width(f32::INFINITY),
+            );
+            if locked.is_none() && !r.has_focus() && !r.lost_focus() {
+                r.request_focus();
+            }
+            submit = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            self.pin.input.retain(|c| c.is_ascii_digit());
+            if let Some(left) = locked {
+                ui.label(RichText::new(format!("ใส่ PIN ผิดหลายครั้งเกินไป ลองใหม่ได้ใน {} วินาที", left.as_secs() + 1)).size(13.0).color(pal.danger));
+                ui.ctx().request_repaint_after(Duration::from_millis(500));
+            } else if !self.pin.error.is_empty() {
+                ui.label(RichText::new(&self.pin.error).size(13.0).color(pal.danger));
+            }
+            ui.add_space(6.0);
+            let ready = locked.is_none() && self.pin.input.len() >= 4;
+            let b = Button::new(RichText::new("ยืนยัน").font(semi(15.0)).color(pal.on_accent))
+                .fill(pal.accent)
+                .stroke(Stroke::NONE)
+                .corner_radius(8)
+                .min_size(vec2(ui.available_width(), 42.0));
+            submit |= ui.vertical_centered(|ui| ui.add_enabled(ready, b)).inner.clicked();
+            submit &= ready;
+        });
+        if close {
+            self.pin.prompt = None;
+            self.pin.input.clear();
+            self.pin.error.clear();
+        } else if submit {
+            let ctx = ui.ctx().clone();
+            self.submit_pin(&ctx);
+        }
+    }
+
+    /// Confirms a `redesk://` link before connecting: a web page must not be able to make this
+    /// app announce the user to an arbitrary device without a click.
+    fn link_modal(&mut self, ui: &mut Ui) {
+        let Some(id) = self.link_prompt.clone() else { return };
+        let pal = Palette::of(ui);
+        let title = self.device_title(&id);
+        let mut answer = None;
+        egui::Modal::new(egui::Id::unique("open-link")).backdrop_color(Color32::from_black_alpha(110)).show(ui.ctx(), |ui| {
+            ui.set_width(340.0);
+            ui.vertical_centered(|ui| {
+                ui.add_space(4.0);
+                let (r, _) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::hover());
+                paint_icon(ui, r, Icon::Monitor, pal.accent);
+                ui.label(RichText::new("เปิดการเชื่อมต่อจากลิงก์").size(13.0).color(pal.muted));
+                ui.label(RichText::new(&title).font(semi(18.0)).color(pal.fg));
+                if title != format_id(&id) {
+                    ui.label(RichText::new(format_id(&id)).font(mono(14.0)).color(pal.muted));
+                }
+                ui.add_space(4.0);
+                ui.label(RichText::new("เครื่องปลายทางจะเห็นชื่อและอีเมลของคุณ เชื่อมต่อเฉพาะเครื่องที่คุณตั้งใจเท่านั้น").size(12.5).color(pal.muted));
+            });
+            ui.add_space(10.0);
+            ui.columns(2, |cols| {
+                let cancel = Button::new(RichText::new("ยกเลิก").font(semi(14.5)).color(pal.fg))
+                    .fill(pal.bg)
+                    .stroke(Stroke::new(1.0, pal.line))
+                    .corner_radius(8)
+                    .min_size(vec2(cols[0].available_width(), 42.0));
+                if cols[0].vertical_centered(|ui| ui.add(cancel)).inner.clicked() {
+                    answer = Some(false);
+                }
+                let go = Button::new(RichText::new("เชื่อมต่อ").font(semi(14.5)).color(pal.on_accent))
+                    .fill(pal.accent)
+                    .stroke(Stroke::NONE)
+                    .corner_radius(8)
+                    .min_size(vec2(cols[1].available_width(), 42.0));
+                if cols[1].vertical_centered(|ui| ui.add(go)).inner.clicked() {
+                    answer = Some(true);
+                }
+            });
+        });
+        if let Some(yes) = answer {
+            self.link_prompt = None;
+            if yes {
+                let ctx = ui.ctx().clone();
+                self.open_remote(&ctx, &id, &title);
+            }
         }
     }
 
@@ -1596,7 +2215,6 @@ pub struct ViewerWindow {
     pub reconnect: AtomicBool,
 }
 
-use std::sync::Mutex;
 
 impl ViewerWindow {
     pub fn new(viewer: Arc<Viewer>, device_id: String, viewport: egui::ViewportId) -> Arc<Self> {
