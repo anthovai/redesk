@@ -1,0 +1,87 @@
+@import 'tailwindcss';
+
+/* Design tokens. Utilities like bg-surface / text-muted read these variables,
+   so dark mode only has to swap the values below. */
+@theme {
+	--font-sans: -apple-system, BlinkMacSystemFont, 'Sukhumvit Set', 'Noto Sans Thai', 'Leelawadee UI',
+		'Segoe UI', Roboto, sans-serif;
+	--font-mono: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+
+	--color-canvas: #f6f7f9;
+	--color-surface: #ffffff;
+	--color-raised: #f1f3f6;
+	--color-line: #e3e6eb;
+	--color-fg: #15191f;
+	--color-muted: #5d6673;
+	--color-accent: #0f766e;
+	--color-accent-fg: #ffffff;
+	--color-accent-soft: #e6f4f2;
+	--color-danger: #c2410c;
+	--color-danger-soft: #fdf0e9;
+	--color-ok: #15803d;
+}
+
+@media (prefers-color-scheme: dark) {
+	:root {
+		--color-canvas: #0d1015;
+		--color-surface: #151920;
+		--color-raised: #1c222b;
+		--color-line: #2a313c;
+		--color-fg: #e7eaee;
+		--color-muted: #949dab;
+		--color-accent: #2dd4bf;
+		--color-accent-fg: #062320;
+		--color-accent-soft: #12302d;
+		--color-danger: #fb923c;
+		--color-danger-soft: #34200f;
+		--color-ok: #4ade80;
+	}
+}
+
+html,
+body {
+	background: var(--color-canvas);
+	color: var(--color-fg);
+}
+
+@layer components {
+	.btn {
+		@apply inline-flex items-center justify-center gap-1.5 rounded-lg border border-line bg-surface px-3 py-1.5 text-sm font-medium text-fg transition-colors hover:bg-raised disabled:cursor-not-allowed disabled:opacity-50;
+	}
+	.btn-primary {
+		@apply border-transparent bg-accent text-accent-fg hover:bg-accent hover:brightness-110;
+	}
+	.btn-danger {
+		@apply border-transparent bg-danger-soft text-danger hover:brightness-95;
+	}
+	.btn-ghost {
+		@apply border-transparent bg-transparent hover:bg-raised;
+	}
+	.input {
+		@apply w-full rounded-lg border border-line bg-surface px-3 py-2 text-sm text-fg outline-none placeholder:text-muted focus:border-accent focus:ring-2 focus:ring-accent/25;
+	}
+	.label {
+		@apply mb-1 block text-xs font-medium text-muted;
+	}
+	.card {
+		@apply rounded-xl border border-line bg-surface;
+	}
+	.table {
+		@apply w-full text-left text-sm;
+	}
+	.table th {
+		@apply border-b border-line px-3 py-2 text-xs font-medium text-muted;
+	}
+	.table td {
+		@apply border-b border-line px-3 py-2.5 align-middle;
+	}
+	.table tr:last-child td {
+		@apply border-b-0;
+	}
+	.badge {
+		@apply inline-flex items-center gap-1 rounded-full bg-raised px-2 py-0.5 text-xs text-muted;
+	}
+	.mono {
+		@apply font-mono tabular-nums;
+	}
+}

@@ -1,0 +1,8 @@
+server/bin/
+server/data/
+agent/target/
+web/node_modules/
+web/build/
+web/.svelte-kit/
+.env
+dist/

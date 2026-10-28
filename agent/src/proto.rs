@@ -1,0 +1,76 @@
+//! Plaintext message framing inside the encrypted channel.
+//!
+//! Every decrypted message starts with a type byte:
+//!   0x01  JSON control message (UTF-8)
+//!   0x02  video rectangle: x, y, frame_w, frame_h (u16 BE) followed by a JPEG
+//!   0x03  file chunk: transfer id (u32 BE) followed by raw bytes
+
+use serde::Deserialize;
+
+pub const MSG_JSON: u8 = 0x01;
+pub const MSG_FRAME: u8 = 0x02;
+pub const MSG_FILE: u8 = 0x03;
+
+pub fn file_chunk(id: u32, data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(5 + data.len());
+    out.push(MSG_FILE);
+    out.extend_from_slice(&id.to_be_bytes());
+    out.extend_from_slice(data);
+    out
+}
+
+pub fn json(v: &serde_json::Value) -> Vec<u8> {
+    let mut out = vec![MSG_JSON];
+    out.extend_from_slice(v.to_string().as_bytes());
+    out
+}
+
+pub fn frame_header(x: u16, y: u16, frame_w: u16, frame_h: u16) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64 * 1024);
+    out.push(MSG_FRAME);
+    for v in [x, y, frame_w, frame_h] {
+        out.extend_from_slice(&v.to_be_bytes());
+    }
+    out
+}
+
+/// Messages the viewer may send after the handshake.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "t")]
+pub enum ViewerMsg {
+    #[serde(rename = "auth")]
+    Auth { password: Option<String> },
+    /// Pointer move; x, y are normalised to [0, 1] across the displayed frame.
+    #[serde(rename = "mm")]
+    MouseMove { x: f64, y: f64 },
+    /// Mouse button (0 left, 1 middle, 2 right) press/release.
+    #[serde(rename = "mb")]
+    MouseButton { b: u8, down: bool, x: f64, y: f64 },
+    #[serde(rename = "wh")]
+    Wheel { dx: i32, dy: i32 },
+    /// Key press/release using browser KeyboardEvent.code / .key.
+    #[serde(rename = "key")]
+    Key { code: String, key: String, down: bool },
+    #[serde(rename = "text")]
+    Text { s: String },
+    #[serde(rename = "clip")]
+    Clipboard { s: String },
+    #[serde(rename = "cfg")]
+    Config { fps: Option<u32>, quality: Option<u8>, max_width: Option<u32>, display: Option<usize> },
+    /// List a directory ("" = home).
+    #[serde(rename = "ls")]
+    List { path: String },
+    /// Start an upload into `dir` ("" = ~/Downloads/ReDesk); chunks follow as MSG_FILE.
+    #[serde(rename = "put")]
+    Put { id: u32, dir: String, name: String, size: u64 },
+    #[serde(rename = "put_end")]
+    PutEnd { id: u32 },
+    #[serde(rename = "get")]
+    Get { id: u32, path: String },
+    #[serde(rename = "cancel")]
+    Cancel { id: u32 },
+    #[serde(rename = "refresh")]
+    Refresh,
+    #[serde(rename = "bye")]
+    Bye,
+}

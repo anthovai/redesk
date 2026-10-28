@@ -1,0 +1,43 @@
+# Production-ish stack. Put a TLS reverse proxy (Caddy, nginx) in front of :21114,
+# or set REDESK_TLS_CERT / REDESK_TLS_KEY. Agents refuse plain ws:// to non-local hosts.
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: redesk
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: redesk
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U redesk"]
+      interval: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # Protocol engine for the in-browser RDP / VNC / SSH gateway. It must be able to reach
+  # the target machines; credentials are injected by redesk-server and never reach browsers.
+  guacd:
+    image: guacamole/guacd:1.5.5
+    volumes: [recordings:/recordings]   # session recordings (REDESK_GATEWAY_RECORDING_PATH)
+    restart: unless-stopped
+
+  server:
+    build: { context: ., dockerfile: server/Dockerfile }
+    depends_on: { db: { condition: service_healthy }, guacd: { condition: service_started } }
+    environment:
+      REDESK_DATABASE_URL: postgres://redesk:${POSTGRES_PASSWORD}@db:5432/redesk?sslmode=disable
+      REDESK_ADMIN_EMAIL: ${REDESK_ADMIN_EMAIL:-admin@redesk.local}
+      REDESK_ADMIN_PASSWORD: ${REDESK_ADMIN_PASSWORD:-}
+      REDESK_TRUST_PROXY: ${REDESK_TRUST_PROXY:-true}
+      REDESK_COOKIE_SECURE: ${REDESK_COOKIE_SECURE:-true}
+      REDESK_GUACD_ADDR: guacd:4822
+      REDESK_GATEWAY_RECORDING_PATH: ${REDESK_GATEWAY_RECORDING_PATH:-/recordings}
+      REDESK_VAULT_KEY: ${REDESK_VAULT_KEY:-}
+    volumes: [serverdata:/data]   # server identity key + vault.key — back up separately from the database
+    ports: ["21114:21114"]
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  serverdata:
+  recordings:
