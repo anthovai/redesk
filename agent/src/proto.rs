@@ -4,12 +4,17 @@
 //!   0x01  JSON control message (UTF-8)
 //!   0x02  video rectangle: x, y, frame_w, frame_h (u16 BE) followed by a JPEG
 //!   0x03  file chunk: transfer id (u32 BE) followed by raw bytes
+//!   0x04  video frame: codec (u8, 1 = H.264), flags (u8, bit 0 = keyframe), width, height
+//!         (u16 BE) followed by the encoded access unit (H.264: Annex B)
 
 use serde::Deserialize;
 
 pub const MSG_JSON: u8 = 0x01;
 pub const MSG_FRAME: u8 = 0x02;
 pub const MSG_FILE: u8 = 0x03;
+pub const MSG_VIDEO: u8 = 0x04;
+
+pub const VIDEO_KEYFRAME: u8 = 0x01;
 
 pub fn file_chunk(id: u32, data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(5 + data.len());
@@ -34,12 +39,26 @@ pub fn frame_header(x: u16, y: u16, frame_w: u16, frame_h: u16) -> Vec<u8> {
     out
 }
 
+pub fn video(codec: u8, keyframe: bool, w: u16, h: u16, data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(7 + data.len());
+    out.extend_from_slice(&[MSG_VIDEO, codec, if keyframe { VIDEO_KEYFRAME } else { 0 }]);
+    out.extend_from_slice(&w.to_be_bytes());
+    out.extend_from_slice(&h.to_be_bytes());
+    out.extend_from_slice(data);
+    out
+}
+
 /// Messages the viewer may send after the handshake.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "t")]
 pub enum ViewerMsg {
     #[serde(rename = "auth")]
-    Auth { password: Option<String> },
+    Auth {
+        password: Option<String>,
+        /// Video codecs the viewer can decode, e.g. ["h264", "jpeg"]; absent = JPEG only.
+        #[serde(default)]
+        codecs: Vec<String>,
+    },
     /// Pointer move; x, y are normalised to [0, 1] across the displayed frame.
     #[serde(rename = "mm")]
     MouseMove { x: f64, y: f64 },
@@ -69,7 +88,8 @@ pub enum ViewerMsg {
     Get { id: u32, path: String },
     #[serde(rename = "cancel")]
     Cancel { id: u32 },
-    #[serde(rename = "refresh")]
+    /// Resend the whole screen (JPEG) or a keyframe (H.264), e.g. after a decoder error.
+    #[serde(rename = "refresh", alias = "keyframe")]
     Refresh,
     #[serde(rename = "bye")]
     Bye,

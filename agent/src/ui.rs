@@ -1625,7 +1625,7 @@ impl ViewerWindow {
         let mut w = self.ui.lock().unwrap();
 
         // Pull new screen regions into the GPU texture and pick up state for this frame.
-        let (phase, error, name, fp, info, fps, kbps, clip, transfers, fb_size) = {
+        let (phase, error, name, fp, info, fps, kbps, clip, transfers, fb_size, cursor, codec) = {
             let mut st = self.viewer.state.lock().unwrap();
             if st.fb.w > 0 {
                 let opts = egui::TextureOptions::LINEAR;
@@ -1660,6 +1660,8 @@ impl ViewerWindow {
                 st.remote_clipboard.take(),
                 st.transfers.clone(),
                 (st.fb.w, st.fb.h),
+                st.cursor,
+                st.codec.clone(),
             )
         };
         let connected = phase == Phase::Connected;
@@ -1707,7 +1709,7 @@ impl ViewerWindow {
                     }
                     ui.add_space(8.0);
                     Frame::new().fill(pal.field).corner_radius(6).inner_margin(Margin::symmetric(8, 3)).show(ui, |ui| {
-                        ui.label(RichText::new(format!("{fps} fps · {kbps} kbps")).font(mono(11.5)).color(pal.muted));
+                        ui.label(RichText::new(format!("{} · {fps} fps · {kbps} kbps", codec.to_uppercase())).font(mono(11.5)).color(pal.muted));
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
@@ -1773,6 +1775,10 @@ impl ViewerWindow {
                     if resp.hovered() {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
                     }
+                }
+                // The remote pointer (captures do not include it), unless ours is on top of it.
+                if let Some((cx, cy)) = cursor.filter(|_| !resp.hovered()) {
+                    paint_pointer(ui.painter(), pos2(rect.left() + cx * rect.width(), rect.top() + cy * rect.height()));
                 }
             } else if connected {
                 ui.centered_and_justified(|ui| ui.label(RichText::new("กำลังรอภาพหน้าจอ…").color(Color32::from_gray(170))));
@@ -2060,4 +2066,14 @@ fn forward_input(v: &Viewer, ui: &Ui, rect: Rect, remote_mac: bool) {
     if let Some((x, y)) = moved {
         v.send(serde_json::json!({"t": "mm", "x": x, "y": y}));
     }
+}
+
+/// Arrow pointer with its tip at `tip`, drawn over the remote screen.
+fn paint_pointer(p: &egui::Painter, tip: egui::Pos2) {
+    let pts = [(0.0, 0.0), (0.0, 16.0), (4.2, 12.3), (7.0, 18.5), (9.6, 17.4), (6.9, 11.3), (12.0, 11.3)];
+    let at = |i: &[usize]| i.iter().map(|&i| tip + vec2(pts[i].0, pts[i].1)).collect::<Vec<_>>();
+    // Head and tail are filled separately: convex_polygon needs convex input.
+    p.add(egui::Shape::convex_polygon(at(&[0, 1, 2, 5, 6]), Color32::BLACK, Stroke::NONE));
+    p.add(egui::Shape::convex_polygon(at(&[2, 3, 4, 5]), Color32::BLACK, Stroke::NONE));
+    p.add(egui::Shape::closed_line(at(&[0, 1, 2, 3, 4, 5, 6]), Stroke::new(1.2, Color32::WHITE)));
 }

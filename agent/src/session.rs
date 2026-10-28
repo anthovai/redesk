@@ -15,6 +15,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::capture::{self, Params};
+use crate::codec::Codec;
 use crate::config::{ApproveMode, Verification};
 use crate::crypto::{self, Channel};
 use crate::files;
@@ -67,11 +68,13 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
     send_json(&mut tx, &mut ch, json!({"t": "auth_required", "password": need_password, "click": need_click})).await?;
 
     let mut attempts = 0;
+    let mut codec;
     loop {
-        let Incoming::Msg(ViewerMsg::Auth { password }) = read_viewer(&mut rx, &mut ch, Duration::from_secs(120)).await? else {
+        let Incoming::Msg(ViewerMsg::Auth { password, codecs }) = read_viewer(&mut rx, &mut ch, Duration::from_secs(120)).await? else {
             bail!("expected auth message")
         };
         attempts += 1;
+        codec = Codec::negotiate(&codecs);
 
         if need_password {
             if let Some(wait) = locked_for(&agent) {
@@ -136,10 +139,11 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
         "clipboard": cfg.allow_clipboard,
         "files": cfg.allow_file_transfer,
         "max_fps": cfg.max_fps,
+        "codec": codec.name(),
     }))
     .await?;
 
-    let params = Params { display: 0, fps: cfg.max_fps, quality: cfg.jpeg_quality, max_width: cfg.max_width };
+    let params = Params { display: 0, fps: cfg.max_fps, quality: cfg.jpeg_quality, max_width: cfg.max_width, codec };
     let (params_tx, params_rx) = watch::channel(params);
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(2);
     let stop = Arc::new(AtomicBool::new(false));

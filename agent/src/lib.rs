@@ -2,6 +2,7 @@
 
 pub mod account;
 pub mod capture;
+pub mod codec;
 pub mod config;
 pub mod crypto;
 pub mod files;

@@ -15,6 +15,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
+use crate::codec::H264Decoder;
 use crate::crypto::{Channel, ViewerKeys};
 use crate::{account, fingerprint, proto};
 
@@ -55,6 +56,9 @@ pub struct Info {
     pub files: bool,
 }
 
+/// Video codecs this viewer decodes, best first.
+const CODECS: [&str; 2] = ["h264", "jpeg"];
+
 /// Remote screen; `dirty` lists rectangles (x, y, w, h) not yet uploaded to the GPU.
 #[derive(Default)]
 pub struct Framebuffer {
@@ -80,6 +84,20 @@ impl Framebuffer {
         }
         if !self.resized {
             self.dirty.push([x, y, w, h]);
+        }
+    }
+
+    /// Replaces the whole picture (a decoded video frame).
+    fn set(&mut self, w: usize, h: usize, rgba: &[u8]) {
+        if self.w != w || self.h != h {
+            tracing::info!("viewer: remote screen {w}x{h}");
+            *self = Framebuffer { w, h, rgba: Vec::new(), dirty: Vec::new(), resized: true };
+        }
+        self.rgba.clear();
+        self.rgba.extend_from_slice(rgba);
+        if !self.resized {
+            self.dirty.clear();
+            self.dirty.push([0, 0, w, h]);
         }
     }
 }
@@ -112,6 +130,10 @@ pub struct State {
     pub fps: u32,
     pub kbps: u32,
     pub remote_clipboard: Option<String>,
+    /// Remote pointer, normalised to the screen; None while it is on another display.
+    pub cursor: Option<(f32, f32)>,
+    /// Codec the agent chose ("h264" or "jpeg").
+    pub codec: String,
     pub transfers: Vec<Transfer>,
 }
 
@@ -152,6 +174,8 @@ impl Viewer {
                 fps: 0,
                 kbps: 0,
                 remote_clipboard: None,
+                cursor: None,
+                codec: String::new(),
                 transfers: Vec::new(),
             }),
             tx,
@@ -205,6 +229,8 @@ impl Viewer {
                 fps: 15,
                 kbps: 1840,
                 remote_clipboard: None,
+                cursor: None,
+                codec: String::new(),
                 transfers: vec![Transfer { id: 1, name: "รายงานประจำเดือน.xlsx".into(), size: 100, sent: 64, status: TransferStatus::Active }],
             }),
             tx,
@@ -218,7 +244,7 @@ impl Viewer {
 
     pub fn submit_password(&self, pw: &str) {
         self.state.lock().unwrap().error = None;
-        self.send(json!({"t": "auth", "password": pw}));
+        self.send(json!({"t": "auth", "password": pw, "codecs": CODECS}));
     }
 
     pub fn upload(&self, path: PathBuf) {
@@ -326,6 +352,7 @@ async fn run(v: &Arc<Viewer>, t: Target, mut cmds: mpsc::UnboundedReceiver<Cmd>)
     let (up_tx, mut up_rx) = mpsc::channel::<Vec<u8>>(8);
     let mut next_transfer = 1u32;
     let (mut frames, mut bytes, mut stats_at) = (0u32, 0usize, Instant::now());
+    let mut h264: Option<H264Decoder> = None;
 
     loop {
         tokio::select! {
@@ -354,6 +381,24 @@ async fn run(v: &Arc<Viewer>, t: Target, mut cmds: mpsc::UnboundedReceiver<Cmd>)
                         let img = image::load_from_memory_with_format(&plain[9..], image::ImageFormat::Jpeg)?.to_rgba8();
                         v.update(|st| st.fb.blit(x, y, fw, fh, &img));
                         frames += 1;
+                    }
+                    Some(&proto::MSG_VIDEO) if plain.len() > 7 => {
+                        if h264.is_none() {
+                            h264 = Some(H264Decoder::new()?);
+                        }
+                        match h264.as_mut().unwrap().decode(&plain[7..]) {
+                            Ok(Some((w, h, rgba))) => {
+                                v.update(|st| st.fb.set(w, h, rgba));
+                                frames += 1;
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                // Start over from the next keyframe rather than show a smeared picture.
+                                tracing::warn!("viewer: {e:#}; requesting a keyframe");
+                                h264 = None;
+                                tx.send(Message::Binary(ch.seal(&proto::json(&json!({"t": "keyframe"})))?.into())).await?;
+                            }
+                        }
                     }
                     Some(&proto::MSG_JSON) => {
                         let m: Value = serde_json::from_slice(&plain[1..])?;
@@ -397,7 +442,7 @@ fn control(v: &Viewer, m: &Value) -> Option<Value> {
                 st.phase = Phase::Password;
             } else {
                 st.phase = Phase::Approval;
-                reply = Some(json!({"t": "auth", "password": null}));
+                reply = Some(json!({"t": "auth", "password": null, "codecs": CODECS}));
             }
         }
         "auth_pending" => st.phase = Phase::Approval,
@@ -418,7 +463,14 @@ fn control(v: &Viewer, m: &Value) -> Option<Value> {
             (false, "denied") => st.error = Some("ผู้ใช้ที่เครื่องปลายทางปฏิเสธการเชื่อมต่อ".into()),
             _ => {}
         },
-        "info" => st.info = serde_json::from_value(m.clone()).ok(),
+        "info" => {
+            st.info = serde_json::from_value(m.clone()).ok();
+            st.codec = m["codec"].as_str().unwrap_or("jpeg").to_owned();
+        }
+        "cursor" => {
+            let (x, y) = (m["x"].as_f64().unwrap_or(-1.0) as f32, m["y"].as_f64().unwrap_or(-1.0) as f32);
+            st.cursor = m["visible"].as_bool().unwrap_or(false).then_some((x, y));
+        }
         "clip" => st.remote_clipboard = m["s"].as_str().map(str::to_owned),
         "put_done" => set_transfer(st, m, TransferStatus::Done(m["path"].as_str().unwrap_or("").to_owned())),
         "fs_error" => set_transfer(st, m, TransferStatus::Failed(m["message"].as_str().unwrap_or("").to_owned())),

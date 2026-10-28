@@ -8,6 +8,7 @@
 
 	const viewer = new RemoteViewer(page.params.id ?? '');
 	let canvas = $state<HTMLCanvasElement>();
+	let pointerOver = $state(false);
 	let stage = $state<HTMLElement>();
 	let password = $state('');
 	let quality = $state<'high' | 'balanced' | 'low'>('balanced');
@@ -164,7 +165,7 @@
 
 		{#if viewer.phase === 'connected'}
 			<div class="flex flex-1 flex-wrap items-center justify-end gap-1.5">
-				<span class="badge mono mr-2">{viewer.stats.fps} fps · {viewer.stats.kbps} kbps</span>
+				<span class="badge mono mr-2">{viewer.info?.codec?.toUpperCase() ?? 'JPEG'} · {viewer.stats.fps} fps · {viewer.stats.kbps} kbps</span>
 				{#if viewer.info && viewer.info.displays.length > 1}
 					<select class="input w-auto py-1" value={viewer.info.display} onchange={(e) => viewer.configure({ display: +e.currentTarget.value })}>
 						{#each viewer.info.displays as d (d.index)}
@@ -220,6 +221,8 @@
 			class="max-h-full max-w-full outline-none {viewer.phase === 'connected' ? '' : 'opacity-30'} {live ? 'cursor-default' : ''}"
 			style="image-rendering: auto;"
 			onpointermove={onPointerMove}
+			onpointerenter={() => (pointerOver = true)}
+			onpointerleave={() => (pointerOver = false)}
 			onpointerdown={(e) => onPointerButton(e, true)}
 			onpointerup={(e) => onPointerButton(e, false)}
 			oncontextmenu={(e) => e.preventDefault()}
@@ -229,6 +232,20 @@
 				releaseAll();
 			}}
 		></canvas>
+
+		{#if viewer.cursor && canvas && !pointerOver}
+			<!-- Remote pointer: screen captures do not include it. -->
+			<svg
+				class="pointer-events-none absolute"
+				style="left: {canvas.offsetLeft + viewer.cursor.x * canvas.clientWidth}px; top: {canvas.offsetTop + viewer.cursor.y * canvas.clientHeight}px"
+				width="14"
+				height="20"
+				viewBox="-1 -1 14 20"
+				aria-hidden="true"
+			>
+				<path d="M0 0V16L4.2 12.3L7 18.5L9.6 17.4L6.9 11.3H12Z" fill="#000" stroke="#fff" stroke-width="1.2" stroke-linejoin="round" />
+			</svg>
+		{/if}
 
 		{#if viewer.phase === 'connected' && viewer.frame.w === 0}
 			<p class="absolute text-sm text-white/70">กำลังรอภาพหน้าจอ…</p>

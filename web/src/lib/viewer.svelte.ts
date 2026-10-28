@@ -23,6 +23,7 @@ export interface AgentInfo {
 	clipboard: boolean;
 	files?: boolean;
 	max_fps: number;
+	codec?: string;
 }
 
 export interface RemoteEntry {
@@ -48,6 +49,21 @@ const MAX_BUFFERED = 4 * 1024 * 1024;
 const MSG_JSON = 0x01;
 const MSG_FRAME = 0x02;
 const MSG_FILE = 0x03;
+const MSG_VIDEO = 0x04;
+const VIDEO_H264 = 1;
+
+// Constrained Baseline (what OpenH264 emits); Annex B, so no avcC description is needed.
+const H264_CONFIG: VideoDecoderConfig = { codec: 'avc1.42E033', optimizeForLatency: true, hardwareAcceleration: 'no-preference' };
+
+/** Codecs to offer the agent, best first. JPEG always works. */
+async function supportedCodecs(): Promise<string[]> {
+	try {
+		if (typeof VideoDecoder !== 'undefined' && (await VideoDecoder.isConfigSupported(H264_CONFIG)).supported) return ['h264', 'jpeg'];
+	} catch {
+		// fall through to JPEG
+	}
+	return ['jpeg'];
+}
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
@@ -83,6 +99,8 @@ export class RemoteViewer {
 	frame = $state({ w: 0, h: 0 });
 	stats = $state({ fps: 0, kbps: 0 });
 	remoteClipboard = $state<string | null>(null);
+	/** Remote pointer normalised to the screen; null while it is elsewhere. */
+	cursor = $state<{ x: number; y: number } | null>(null);
 	files = $state<{ path: string; parent: string | null; sep: string; entries: RemoteEntry[]; error: string; loading: boolean }>({
 		path: '',
 		parent: null,
@@ -107,6 +125,10 @@ export class RemoteViewer {
 	private bytesIn = 0;
 	private statsTimer: ReturnType<typeof setInterval> | null = null;
 	private nextTransfer = 1;
+	private codecs: Promise<string[]> = supportedCodecs();
+	private decoder: VideoDecoder | null = null;
+	private needKeyframe = true;
+	private videoTs = 0;
 	private downloads = new Map<number, Uint8Array<ArrayBuffer>[]>();
 
 	constructor(public deviceId: string) {}
@@ -169,6 +191,7 @@ export class RemoteViewer {
 		if (!this.ch) return;
 		const plain = await this.ch.open(data);
 		if (plain[0] === MSG_JSON) this.onControl(JSON.parse(dec.decode(plain.subarray(1))));
+		else if (plain[0] === MSG_VIDEO) this.decodeVideo(plain);
 		else if (plain[0] === MSG_FRAME) await this.drawFrame(plain);
 		else if (plain[0] === MSG_FILE) this.onFileChunk(plain);
 	}
@@ -181,7 +204,7 @@ export class RemoteViewer {
 					this.phase = 'auth';
 				} else {
 					this.phase = 'approval';
-					this.send({ t: 'auth', password: null });
+					this.codecs.then((codecs) => this.send({ t: 'auth', password: null, codecs }));
 				}
 				break;
 			case 'auth_pending':
@@ -224,6 +247,9 @@ export class RemoteViewer {
 			case 'get_end':
 				this.finishDownload(m.id);
 				break;
+			case 'cursor':
+				this.cursor = m.visible ? { x: m.x, y: m.y } : null;
+				break;
 			case 'clip':
 				this.remoteClipboard = m.s;
 				navigator.clipboard?.writeText(m.s).catch(() => {});
@@ -237,17 +263,49 @@ export class RemoteViewer {
 		const y = v.getUint16(3);
 		const fw = v.getUint16(5);
 		const fh = v.getUint16(7);
-		const canvas = this.canvas;
-		if (!canvas || !this.ctx) return;
+		if (!this.canvas || !this.ctx) return;
+		this.resize(fw, fh);
+		const bmp = await createImageBitmap(new Blob([p.subarray(9)], { type: 'image/jpeg' }));
+		this.ctx.drawImage(bmp, x, y);
+		bmp.close();
+		this.frames++;
+	}
+
+	private resize(fw: number, fh: number) {
+		const canvas = this.canvas!;
 		if (canvas.width !== fw || canvas.height !== fh) {
 			canvas.width = fw;
 			canvas.height = fh;
 			this.frame = { w: fw, h: fh };
 		}
-		const bmp = await createImageBitmap(new Blob([p.subarray(9)], { type: 'image/jpeg' }));
-		this.ctx.drawImage(bmp, x, y);
-		bmp.close();
-		this.frames++;
+	}
+
+	/** H.264 via WebCodecs. Deltas before the first keyframe are dropped; errors restart from one. */
+	private decodeVideo(p: Uint8Array<ArrayBuffer>) {
+		if (p[1] !== VIDEO_H264 || !this.canvas || !this.ctx) return;
+		const key = (p[2] & 1) === 1;
+		if (this.needKeyframe && !key) return;
+		if (!this.decoder || this.decoder.state === 'closed') {
+			const ctx = this.ctx;
+			this.decoder = new VideoDecoder({
+				output: (frame) => {
+					this.resize(frame.displayWidth, frame.displayHeight);
+					ctx.drawImage(frame, 0, 0);
+					frame.close();
+					this.frames++;
+				},
+				error: (e) => {
+					console.warn('h264 decoder error, requesting keyframe', e);
+					this.decoder = null;
+					this.needKeyframe = true;
+					this.send({ t: 'keyframe' });
+				}
+			});
+			this.decoder.configure(H264_CONFIG);
+		}
+		this.needKeyframe = false;
+		this.videoTs += 33_333;
+		this.decoder.decode(new EncodedVideoChunk({ type: key ? 'key' : 'delta', timestamp: this.videoTs, data: p.subarray(7) }));
 	}
 
 	private startStats() {
@@ -262,6 +320,9 @@ export class RemoteViewer {
 	private stopStats() {
 		if (this.statsTimer) clearInterval(this.statsTimer);
 		this.statsTimer = null;
+		// Stats stop exactly when the session ends; release the hardware decoder with them.
+		if (this.decoder && this.decoder.state !== 'closed') this.decoder.close();
+		this.decoder = null;
 	}
 
 	/** Encrypts and sends in call order (the nonce counter depends on it). */
@@ -358,7 +419,7 @@ export class RemoteViewer {
 	submitPassword(password: string) {
 		this.authBusy = true;
 		this.error = null;
-		this.send({ t: 'auth', password });
+		this.codecs.then((codecs) => this.send({ t: 'auth', password, codecs }));
 	}
 
 	// --- input (coordinates normalised to the displayed frame) ---

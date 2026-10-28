@@ -1,4 +1,5 @@
-//! Screen capture: grabs a display, downsamples, and emits JPEG-encoded dirty rectangles.
+//! Screen capture: grabs a display, downsamples, and emits either H.264 frames or
+//! JPEG-encoded dirty rectangles, plus the remote pointer position.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,6 +10,7 @@ use image::codecs::jpeg::JpegEncoder;
 use tokio::sync::{mpsc, watch};
 use xcap::Monitor;
 
+use crate::codec::{Codec, H264Encoder};
 use crate::proto;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -17,6 +19,7 @@ pub struct Params {
     pub fps: u32,
     pub quality: u8,
     pub max_width: u32,
+    pub codec: Codec,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -66,15 +69,21 @@ struct Frame {
 }
 
 /// Box-filter downsample by an integer factor so that width <= max_width; drops alpha.
-fn downsample(img: &image::RgbaImage, max_width: u32) -> Frame {
+/// `even` trims a trailing odd row/column, as 4:2:0 video needs even dimensions.
+fn downsample(img: &image::RgbaImage, max_width: u32, even: bool) -> Frame {
     let (sw, sh) = (img.width() as usize, img.height() as usize);
     let f = (sw as u32).div_ceil(max_width.max(320)).max(1) as usize;
-    let (w, h) = (sw / f, sh / f);
+    let (mut w, mut h) = (sw / f, sh / f);
+    if even {
+        (w, h) = (w & !1, h & !1);
+    }
     let src = img.as_raw();
     let mut rgb = vec![0u8; w * h * 3];
     if f == 1 {
-        for (i, px) in src.chunks_exact(4).take(w * h).enumerate() {
-            rgb[i * 3..i * 3 + 3].copy_from_slice(&px[..3]);
+        for y in 0..h {
+            for (x, px) in src[y * sw * 4..].chunks_exact(4).take(w).enumerate() {
+                rgb[(y * w + x) * 3..(y * w + x) * 3 + 3].copy_from_slice(&px[..3]);
+            }
         }
         return Frame { w, h, rgb };
     }
@@ -134,11 +143,42 @@ fn encode_rect(f: &Frame, (x, y, w, h): (usize, usize, usize, usize), quality: u
     out
 }
 
+/// Tracks the local pointer so the viewer can draw it; screen captures do not include it.
+struct Pointer {
+    enigo: Option<enigo::Enigo>,
+    last: Option<(i32, i32)>,
+}
+
+impl Pointer {
+    fn new() -> Self {
+        let settings = enigo::Settings { open_prompt_to_get_permissions: false, ..Default::default() };
+        Self { enigo: enigo::Enigo::new(&settings).ok(), last: None }
+    }
+
+    /// JSON message with the position normalised to the display, if it moved.
+    fn poll(&mut self, g: Geometry) -> Option<Vec<u8>> {
+        use enigo::Mouse;
+        let pos = self.enigo.as_ref()?.location().ok()?;
+        if self.last == Some(pos) || g.width == 0 || g.height == 0 {
+            return None;
+        }
+        self.last = Some(pos);
+        let x = (pos.0 - g.x) as f64 / g.width as f64;
+        let y = (pos.1 - g.y) as f64 / g.height as f64;
+        let inside = (0.0..1.0).contains(&x) && (0.0..1.0).contains(&y);
+        Some(proto::json(&serde_json::json!({"t": "cursor", "x": x, "y": y, "visible": inside})))
+    }
+}
+
 /// Runs on a dedicated thread until `stop` is set or the receiver goes away.
 /// `blocking_send` on a tiny channel paces capture to what the network can carry.
+/// `force_full` asks for a full JPEG frame or an H.264 keyframe.
 pub fn run(params: watch::Receiver<Params>, out: mpsc::Sender<Vec<u8>>, stop: Arc<AtomicBool>, force_full: Arc<AtomicBool>) {
     let mut prev: Option<Frame> = None;
     let mut last_params = *params.borrow();
+    let mut h264: Option<H264Encoder> = None;
+    let mut h264_failed = false;
+    let mut pointer = Pointer::new();
     let mut warned = false;
     while !stop.load(Ordering::Relaxed) {
         let started = Instant::now();
@@ -146,12 +186,24 @@ pub fn run(params: watch::Receiver<Params>, out: mpsc::Sender<Vec<u8>>, stop: Ar
         if p != last_params {
             last_params = p;
             prev = None;
+            h264 = None;
         }
         let monitors = Monitor::all().unwrap_or_default();
         let Some(m) = monitors.get(p.display).or(monitors.first()) else {
             std::thread::sleep(Duration::from_secs(1));
             continue;
         };
+        let geometry = Geometry {
+            x: m.x().unwrap_or(0),
+            y: m.y().unwrap_or(0),
+            width: m.width().unwrap_or(0),
+            height: m.height().unwrap_or(0),
+        };
+        if let Some(msg) = pointer.poll(geometry) {
+            if out.blocking_send(msg).is_err() {
+                return;
+            }
+        }
         let img = match m.capture_image() {
             Ok(i) => i,
             Err(e) => {
@@ -163,15 +215,29 @@ pub fn run(params: watch::Receiver<Params>, out: mpsc::Sender<Vec<u8>>, stop: Ar
                 continue;
             }
         };
-        let cur = downsample(&img, p.max_width);
+        let video = p.codec == Codec::H264 && !h264_failed;
+        let cur = downsample(&img, p.max_width, video);
         let full = force_full.swap(false, Ordering::Relaxed);
         let rect = match &prev {
             Some(pf) if !full && pf.w == cur.w && pf.h == cur.h => dirty_rect(pf, &cur),
             _ => Some((0, 0, cur.w, cur.h)),
         };
         if let Some(r) = rect {
-            if out.blocking_send(encode_rect(&cur, r, p.quality)).is_err() {
-                return;
+            let msg = if video {
+                encode_video(&mut h264, &cur, p, full || prev.is_none()).unwrap_or_else(|e| {
+                    // The viewer decodes JPEG rectangles too, so degrade instead of going dark.
+                    tracing::error!("{e:#}; falling back to JPEG");
+                    h264_failed = true;
+                    h264 = None;
+                    Some(encode_rect(&cur, (0, 0, cur.w, cur.h), p.quality))
+                })
+            } else {
+                Some(encode_rect(&cur, r, p.quality))
+            };
+            if let Some(msg) = msg {
+                if out.blocking_send(msg).is_err() {
+                    return;
+                }
             }
             prev = Some(cur);
         }
@@ -180,6 +246,16 @@ pub fn run(params: watch::Receiver<Params>, out: mpsc::Sender<Vec<u8>>, stop: Ar
             std::thread::sleep(rest);
         }
     }
+}
+
+/// Encodes a whole frame as H.264, (re)creating the encoder when the size changes.
+/// Ok(None) means the encoder dropped the frame.
+fn encode_video(enc: &mut Option<H264Encoder>, f: &Frame, p: Params, keyframe: bool) -> anyhow::Result<Option<Vec<u8>>> {
+    if enc.as_ref().is_none_or(|e| e.w != f.w || e.h != f.h) {
+        *enc = Some(H264Encoder::new(f.w, f.h, p.fps, p.quality)?);
+    }
+    let e = enc.as_mut().unwrap();
+    Ok(e.encode(&f.rgb, keyframe)?.map(|(data, key)| proto::video(Codec::H264.id(), key, f.w as u16, f.h as u16, &data)))
 }
 
 #[cfg(test)]

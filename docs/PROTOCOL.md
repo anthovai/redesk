@@ -48,14 +48,23 @@ Every later message is binary ciphertext. A dropped, reordered, or replayed mess
 
 ## 4. Messages inside the encrypted channel
 
-Byte 0 is the type: `0x01` JSON, `0x02` video rectangle (`x, y, frame_w, frame_h` as u16 BE, followed by a JPEG), `0x03` file chunk (transfer id as u32 BE, followed by up to 64 KiB of data).
+Byte 0 is the type: `0x01` JSON, `0x02` video rectangle (`x, y, frame_w, frame_h` as u16 BE, followed by a JPEG), `0x03` file chunk (transfer id as u32 BE, followed by up to 64 KiB of data), `0x04` video frame (codec u8 `1` = H.264, flags u8 with bit 0 = keyframe, `width, height` as u16 BE, followed by one Annex B access unit).
 
 | Direction | Message |
 |---|---|
-| agent→viewer | `auth_required {password, click}`, `auth_pending`, `auth_result {ok, reason?, attempts_left?, retry_after?}`, `info {hostname, os, displays[], input, clipboard, files}`, `clip {s}` |
-| viewer→agent | `auth {password}`, `mm {x,y}`, `mb {b,down,x,y}`, `wh {dx,dy}`, `key {code,key,down}`, `text {s}`, `clip {s}`, `cfg {fps,quality,max_width,display}`, `refresh`, `bye` |
+| agent→viewer | `auth_required {password, click}`, `auth_pending`, `auth_result {ok, reason?, attempts_left?, retry_after?}`, `info {hostname, os, displays[], input, clipboard, files, codec}`, `cursor {x,y,visible}`, `clip {s}` |
+| viewer→agent | `auth {password, codecs[]}`, `mm {x,y}`, `mb {b,down,x,y}`, `wh {dx,dy}`, `key {code,key,down}`, `text {s}`, `clip {s}`, `cfg {fps,quality,max_width,display}`, `refresh` (alias `keyframe`), `bye` |
 | files viewer→agent | `ls {path}` (`""` = home), `put {id,dir,name,size}` followed by `0x03` chunks and then `put_end {id}`, `get {id,path}`, `cancel {id}` |
 | files agent→viewer | `ls {path,parent,sep,entries[{name,dir,size,mtime}]}`, `put_ok {id,path}`, `put_done {id,path}`, `get_start {id,name,size}` followed by `0x03` chunks and then `get_end {id}`, `fs_error {op,id?,message}` |
+
+### Video codecs
+
+The viewer lists the codecs it can decode in `auth.codecs`, best first (`["h264","jpeg"]`). The agent picks H.264 when offered, otherwise JPEG, and reports the choice in `info.codec`.
+
+- **H.264** (OpenH264, Constrained Baseline, screen-content mode, rate control from resolution × fps × quality): whole frames as `0x04`, sent only when the screen changed. A keyframe goes out at start, after `cfg` changes, on `refresh`/`keyframe`, and every ~10 s of activity. Browsers decode with WebCodecs (`avc1.42E033`) and the native app with OpenH264. A viewer drops deltas until its first keyframe and sends `keyframe` after a decoder error. If the agent's encoder fails, it falls back to JPEG rectangles in the same session, so every viewer must accept both.
+- **JPEG** (fallback): only the changed bounding rectangle as `0x02`.
+
+Screen captures do not include the pointer, so the agent sends `cursor` (normalised to the streamed display, `visible=false` when it is on another display) whenever the pointer moves. Viewers draw it while their own pointer is not over the remote screen.
 
 Uploads keep only the file name (any path the viewer sends is dropped), never overwrite an existing file (`name (1).ext`), must match the announced size, and are deleted if the session ends before `put_end`. Downloads are read on a separate task and share the session's back-pressured outbound queue with video.
 
