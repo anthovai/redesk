@@ -4,6 +4,7 @@
 	import { page } from '$app/state';
 	import { formatId } from '#lib/format.js';
 	import FilePanel from '#lib/FilePanel.svelte';
+	import { walkEntry } from '#lib/filetree.js';
 	import Icon from '#lib/Icon.svelte';
 	import { PEN_WIDTH, RemoteViewer } from '#lib/viewer.svelte.js';
 
@@ -233,13 +234,24 @@
 	function onDrop(ev: DragEvent) {
 		ev.preventDefault();
 		dragging = false;
-		if (!viewer.info?.files) return;
-		const files = [...(ev.dataTransfer?.files ?? [])];
-		if (!files.length) return;
+		if (!viewer.info?.files || !ev.dataTransfer) return;
+		// Entries must be taken synchronously: the DataTransfer is emptied after this handler.
+		const items = [...ev.dataTransfer.items].filter((i) => i.kind === 'file');
+		const entries = items.map((i) => i.webkitGetAsEntry?.() ?? null);
+		const files = items.map((i) => i.getAsFile());
+		const dirs = entries.filter((e): e is FileSystemDirectoryEntry => !!e?.isDirectory);
+		const plain = files.filter((f, i): f is File => !!f && !entries[i]?.isDirectory);
+		if (!dirs.length && !plain.length) return;
 		// Into the folder open in the file panel, otherwise ~/Downloads/Aegiron on the remote machine.
-		for (const f of files) viewer.upload(f, viewer.files.path);
+		const dir = viewer.files.path;
+		for (const f of plain) viewer.upload(f, dir);
+		if (dirs.length && !viewer.fs2) {
+			flash('เครื่องปลายทางใช้ Aegiron รุ่นเก่า ส่งได้ทีละไฟล์เท่านั้น ยังไม่รองรับโฟลเดอร์');
+		} else {
+			for (const d of dirs) walkEntry(d).then((tree) => viewer.uploadTree(tree, dir), () => flash(`อ่านโฟลเดอร์ ${d.name} ไม่ได้`));
+			flash(dirs.length ? `กำลังส่ง ${dirs.length} โฟลเดอร์ ${plain.length ? `และ ${plain.length} ไฟล์` : ''}` : `กำลังส่ง ${plain.length} ไฟล์`);
+		}
 		showFiles = true;
-		flash(`กำลังส่ง ${files.length} ไฟล์`);
 	}
 
 	function onWindowPointerDown(ev: PointerEvent) {
@@ -642,7 +654,7 @@
 			<div class="pointer-events-none absolute inset-3 grid place-items-center rounded-xl border-2 border-dashed border-accent bg-black/60 text-white">
 				<div class="text-center">
 					<Icon name="upload" size={32} class="mx-auto mb-2" />
-					<p class="font-medium">วางไฟล์เพื่อส่งไปยังเครื่องปลายทาง</p>
+					<p class="font-medium">{viewer.fs2 ? 'วางไฟล์หรือโฟลเดอร์เพื่อส่งไปยังเครื่องปลายทาง' : 'วางไฟล์เพื่อส่งไปยังเครื่องปลายทาง'}</p>
 					<p class="mono mt-1 text-xs text-white/70">{viewer.files.path || '~/Downloads/Aegiron'}</p>
 				</div>
 			</div>

@@ -1,6 +1,7 @@
 //! One remote-control session: relay connect, E2E handshake, authentication, streaming.
 
 use std::io::IsTerminal;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -68,12 +69,14 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
 
     let mut attempts = 0;
     let mut codec;
+    let mut viewer_features;
     loop {
-        let Incoming::Msg(ViewerMsg::Auth { password, codecs }) = read_viewer(&mut rx, &mut ch, Duration::from_secs(120)).await? else {
+        let Incoming::Msg(ViewerMsg::Auth { password, codecs, features }) = read_viewer(&mut rx, &mut ch, Duration::from_secs(120)).await? else {
             bail!("expected auth message")
         };
         attempts += 1;
         codec = Codec::negotiate(&codecs);
+        viewer_features = features;
 
         if need_password {
             if let Some(wait) = locked_for(&agent) {
@@ -173,6 +176,7 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
         "codec": codec.name(),
         "recording": recording,
         "whiteboard": whiteboard,
+        "features": files::FEATURES,
     }))
     .await?;
 
@@ -187,9 +191,13 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
         std::thread::spawn(move || capture::run(params_rx, out_tx, stop, force_full));
     }
     let last_clip = Arc::new(Mutex::new(String::new()));
+    // Clipboard file lists need both permissions and a viewer that asked for them.
+    let clip_files = cfg.allow_clipboard && cfg.allow_file_transfer && viewer_features.iter().any(|f| f == "clipfiles");
+    let last_files: Arc<Mutex<Vec<PathBuf>>> = Arc::default();
     if cfg.allow_clipboard {
         let (out_tx, stop, last_clip) = (out_tx.clone(), stop.clone(), last_clip.clone());
-        std::thread::spawn(move || watch_clipboard(out_tx, stop, last_clip));
+        let last_files = clip_files.then(|| last_files.clone());
+        std::thread::spawn(move || watch_clipboard(out_tx, stop, last_clip, last_files));
     }
     let mut files = files::Files::new();
     let input_tx = cfg.allow_input.then(|| input::spawn(capture::geometry(0).unwrap_or_default()));
@@ -261,8 +269,8 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
                         let reply = files.list(&path);
                         send_json(&mut tx, &mut ch, reply).await?;
                     }
-                    ViewerMsg::Put { id, dir, name, size } if cfg.allow_file_transfer => {
-                        let reply = files.put(id, &dir, &name, size);
+                    ViewerMsg::Put { id, dir, name, size, rel } if cfg.allow_file_transfer => {
+                        let reply = files.put(id, &dir, &name, size, rel.as_deref());
                         send_json(&mut tx, &mut ch, reply).await?;
                     }
                     ViewerMsg::PutEnd { id } if cfg.allow_file_transfer => {
@@ -278,7 +286,48 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
                         agent.report(sid, "file_download", json!({"path": path}));
                         files.get(id, path, out_tx.clone());
                     }
+                    ViewerMsg::GetDir { id, path } if cfg.allow_file_transfer => {
+                        tracing::info!("session {sid}: sending folder {path}");
+                        agent.report(sid, "file_download", json!({"path": path, "dir": true}));
+                        files.get_dir(id, path, out_tx.clone());
+                    }
+                    ViewerMsg::Mkdir { id, dir, name } if cfg.allow_file_transfer => {
+                        let reply = files.mkdir(id, &dir, &name);
+                        send_json(&mut tx, &mut ch, reply).await?;
+                    }
+                    ViewerMsg::Remove { id, path } if cfg.allow_file_transfer => {
+                        let (reply, ok) = files.rm(id, &path);
+                        if ok {
+                            tracing::info!("session {sid}: deleted {path}");
+                            agent.report(sid, "file_delete", json!({"path": path}));
+                        }
+                        send_json(&mut tx, &mut ch, reply).await?;
+                    }
+                    ViewerMsg::Rename { id, path, name } if cfg.allow_file_transfer => {
+                        let (reply, new) = files.mv(id, &path, &name);
+                        if let Some(new) = new {
+                            tracing::info!("session {sid}: renamed {path} to {new}");
+                            agent.report(sid, "file_rename", json!({"path": path, "to": new}));
+                        }
+                        send_json(&mut tx, &mut ch, reply).await?;
+                    }
+                    ViewerMsg::ClipFiles { id, paths } if clip_files => {
+                        let (out_tx, last_files, last_clip) = (out_tx.clone(), last_files.clone(), last_clip.clone());
+                        tokio::task::spawn_blocking(move || {
+                            let reply = set_clipboard_files(id, &paths, &last_files, &last_clip);
+                            let _ = out_tx.blocking_send(proto::json(&reply));
+                        });
+                    }
                     ViewerMsg::Cancel { id } => files.cancel(id),
+                    ViewerMsg::ClipFiles { id, .. } => {
+                        send_json(&mut tx, &mut ch, json!({"t": "fs_error", "op": "clip_files", "id": id, "message": "clipboard file transfer is disabled on this device"})).await?;
+                    }
+                    ViewerMsg::GetDir { id, .. } => {
+                        send_json(&mut tx, &mut ch, json!({"t": "fs_error", "op": "get_dir", "id": id, "message": "file transfer is disabled on this device"})).await?;
+                    }
+                    ViewerMsg::Mkdir { id, .. } | ViewerMsg::Remove { id, .. } | ViewerMsg::Rename { id, .. } => {
+                        send_json(&mut tx, &mut ch, json!({"t": "fs_error", "id": id, "message": "file transfer is disabled on this device"})).await?;
+                    }
                     ViewerMsg::List { .. } | ViewerMsg::Put { .. } | ViewerMsg::Get { .. } => {
                         send_json(&mut tx, &mut ch, json!({"t": "fs_error", "message": "file transfer is disabled on this device"})).await?;
                     }
@@ -502,14 +551,70 @@ async fn gui_confirm(question: &str) -> Option<bool> {
     }
 }
 
-fn watch_clipboard(out: mpsc::Sender<Vec<u8>>, stop: Arc<AtomicBool>, last: Arc<Mutex<String>>) {
+/// Files currently on the clipboard, canonicalised so lists we set ourselves compare equal.
+fn clipboard_files(cb: &mut arboard::Clipboard) -> Vec<PathBuf> {
+    cb.get().file_list().unwrap_or_default().into_iter().take(MAX_CLIP_FILES).map(|p| p.canonicalize().unwrap_or(p)).collect()
+}
+
+const MAX_CLIP_FILES: usize = 100;
+
+/// Puts agent files on the clipboard for a viewer that pasted files (`clip_files`).
+fn set_clipboard_files(id: Option<u32>, paths: &[String], last_files: &Mutex<Vec<PathBuf>>, last_clip: &Mutex<String>) -> serde_json::Value {
+    let fail = |m: String| json!({"t": "fs_error", "op": "clip_files", "id": id, "message": m});
+    let mut list = Vec::new();
+    for p in paths.iter().take(MAX_CLIP_FILES) {
+        let p = PathBuf::from(p);
+        match p.canonicalize() {
+            Ok(c) if p.is_absolute() => list.push(c),
+            _ => return fail(format!("{} not found", p.display())),
+        }
+    }
+    if list.is_empty() {
+        return fail("no files".into());
+    }
+    let mut cb = match arboard::Clipboard::new() {
+        Ok(cb) => cb,
+        Err(e) => return fail(e.to_string()),
+    };
+    // Remember what we set so the watcher does not send it straight back.
+    *last_files.lock().unwrap() = list.clone();
+    if let Err(e) = cb.set().file_list(&list) {
+        return fail(e.to_string());
+    }
+    *last_files.lock().unwrap() = clipboard_files(&mut cb);
+    *last_clip.lock().unwrap() = cb.get_text().unwrap_or_default();
+    json!({"t": "fs_ok", "op": "clip_files", "id": id})
+}
+
+fn watch_clipboard(out: mpsc::Sender<Vec<u8>>, stop: Arc<AtomicBool>, last: Arc<Mutex<String>>, last_files: Option<Arc<Mutex<Vec<PathBuf>>>>) {
     let Ok(mut cb) = arboard::Clipboard::new() else { return };
     // Don't push whatever was already on the clipboard before the session started.
     if let Ok(t) = cb.get_text() {
         *last.lock().unwrap() = t;
     }
+    if let Some(lf) = &last_files {
+        *lf.lock().unwrap() = clipboard_files(&mut cb);
+    }
     while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(800));
+        if let Some(lf) = &last_files {
+            let files = clipboard_files(&mut cb);
+            let changed = {
+                let mut l = lf.lock().unwrap();
+                let changed = *l != files;
+                *l = files.clone();
+                changed
+            };
+            if changed && !files.is_empty() && !files.iter().all(|p| files::is_viewer_clip_copy(p)) {
+                // Copied files also put their names on the clipboard as text: don't send that.
+                *last.lock().unwrap() = cb.get_text().unwrap_or_default();
+                let entries: Vec<_> = files.iter().map(|p| files::clip_entry(p)).collect();
+                if out.blocking_send(proto::json(&json!({"t": "clip_files", "files": entries}))).is_err() {
+                    return;
+                }
+                continue;
+            }
+        }
         let Ok(t) = cb.get_text() else { continue };
         let changed = {
             let mut l = last.lock().unwrap();

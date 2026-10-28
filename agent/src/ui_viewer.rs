@@ -6,7 +6,7 @@ use super::*;
 
 use egui::{Order, Popup, RectAlign, Shadow};
 
-use crate::viewer::{Info, Phase, TransferStatus};
+use crate::viewer::{ClipEntry, Info, Paste, Phase, RemoteDir, Transfer, TransferStatus};
 
 const QUALITY: [(&str, u8, u32); 3] = [("คมชัด", 85, 2560), ("สมดุล", 70, 1920), ("ประหยัดเน็ต", 45, 1280)];
 
@@ -69,6 +69,17 @@ struct WinUi {
     demo_menu: Option<String>,
     demo_done: bool,
     pen: Pen,
+    /// Remote file panel on the right.
+    show_files: bool,
+    show_hidden: bool,
+    /// Name being typed for a new folder.
+    new_folder: Option<String>,
+    /// (remote path, new name) while renaming an entry.
+    renaming: Option<(String, String)>,
+    /// Remote path waiting for delete confirmation.
+    confirm_delete: Option<String>,
+    /// A paste was seen on key-down, so the matching key-up is not a second paste.
+    paste_seen: bool,
 }
 
 pub struct ViewerWindow {
@@ -125,7 +136,7 @@ impl ViewerWindow {
         self.demo_state(&ctx, w);
 
         // Pull new screen regions into the GPU texture and pick up state for this frame.
-        let (phase, error, name, fp, info, fps, kbps, clip, transfers, fb_size, cursor, codec, path) = {
+        let (phase, error, name, fp, info, fps, kbps, clip, transfers, fb_size, cursor, codec, path, browser, clip_offer, notice) = {
             let mut st = self.viewer.state.lock().unwrap();
             if st.fb.w > 0 {
                 let opts = egui::TextureOptions::LINEAR;
@@ -163,6 +174,9 @@ impl ViewerWindow {
                 st.cursor,
                 st.codec.clone(),
                 st.path,
+                st.browser.clone(),
+                st.clip_offer.clone(),
+                st.notice.take(),
             )
         };
         let connected = phase == Phase::Connected;
@@ -174,17 +188,35 @@ impl ViewerWindow {
         {
             Self::flash(w, "ได้รับคลิปบอร์ดจากเครื่องปลายทาง");
         }
+        if let Some(n) = notice {
+            Self::flash(w, n);
+        }
+        let fs2 = info.as_ref().is_some_and(Info::fs2);
         let dropped: Vec<PathBuf> = ui.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
         if !dropped.is_empty() {
             if connected && info.as_ref().is_some_and(|i| i.files) {
-                let n = dropped.len();
-                for p in dropped {
-                    self.viewer.upload(p);
+                // Into the folder shown in the file panel, else the agent's Downloads/Aegiron.
+                let dest = if w.show_files && !browser.path.is_empty() { browser.path.clone() } else { String::new() };
+                let (dirs, files): (Vec<_>, Vec<_>) = dropped.into_iter().partition(|p| p.is_dir());
+                let n = files.len() + if fs2 { dirs.len() } else { 0 };
+                for p in files.into_iter().chain(dirs.iter().filter(|_| fs2).cloned()) {
+                    self.viewer.upload(p, dest.clone());
                 }
-                Self::flash(w, format!("กำลังส่ง {n} ไฟล์ไปที่ Downloads/Aegiron ของเครื่องปลายทาง"));
+                let place = if dest.is_empty() { "Downloads/Aegiron ของเครื่องปลายทาง".to_string() } else { dest.clone() };
+                if !dirs.is_empty() && !fs2 {
+                    Self::flash(w, "เครื่องปลายทางใช้ Aegiron รุ่นเก่า ส่งได้เฉพาะไฟล์ ไม่รองรับโฟลเดอร์");
+                } else if n > 0 {
+                    Self::flash(w, format!("กำลังส่ง {n} รายการไปที่ {place}"));
+                }
             } else {
                 Self::flash(w, "เครื่องปลายทางไม่อนุญาตให้รับไฟล์");
             }
+        }
+        if !(connected && info.as_ref().is_some_and(|i| i.files)) {
+            w.show_files = false;
+        }
+        if w.show_files {
+            self.files_panel(ui, w, &browser, fs2);
         }
 
         // Remote screen: the whole window.
@@ -211,13 +243,14 @@ impl ViewerWindow {
                 };
                 ui.painter().image(tex.id(), rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
                 let resp = ui.allocate_rect(rect.intersect(area), Sense::click_and_drag());
+                let typing = w.new_folder.is_some() || w.renaming.is_some();
                 let drawing = connected && w.pen.on && info.as_ref().is_some_and(|i| i.whiteboard);
                 if drawing {
                     self.draw(&mut w.pen, &resp, rect);
                     w.held = 0;
-                } else if connected && info.as_ref().is_some_and(|i| i.input) && ui.input(|i| i.viewport().focused != Some(false)) {
+                } else if connected && info.as_ref().is_some_and(|i| i.input) && ui.input(|i| i.viewport().focused != Some(false)) && !typing {
                     let keys = KeyMap { remote_mac, raw: w.raw_keys };
-                    forward_input(&self.viewer, ui, rect, area, keys, &mut w.held);
+                    forward_input(&self.viewer, ui, rect, area, keys, &mut w.held, &mut w.paste_seen);
                     if resp.hovered() {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
                     }
@@ -251,6 +284,9 @@ impl ViewerWindow {
             self.dialog(&ctx, w, &phase, error.as_deref(), &name);
         }
         self.transfers(&ctx, &transfers);
+        if connected && let Some(offer) = &clip_offer {
+            self.clip_offer(&ctx, offer);
+        }
 
         if let Some((msg, at)) = &w.toast {
             if at.elapsed() > Duration::from_secs(3) {
@@ -404,8 +440,14 @@ impl ViewerWindow {
             }
             menu_separator(ui);
             let files = f.info.is_some_and(|i| i.files);
-            if menu_row(ui, Lead::Glyph(Glyph::Folder), "ส่งไฟล์", "", files).on_hover_text("ลากไฟล์มาวางบนหน้าต่างนี้").clicked() {
-                Self::flash(w, "ลากไฟล์มาวางบนหน้าต่างนี้ ไฟล์จะไปอยู่ที่ Downloads/Aegiron ของเครื่องปลายทาง");
+            if menu_row(ui, Lead::Tick(w.show_files), "ไฟล์บนเครื่องปลายทาง", "", files)
+                .on_hover_text("ดู ดาวน์โหลด และจัดการไฟล์ หรือลากไฟล์/โฟลเดอร์มาวางบนหน้าต่างนี้เพื่อส่ง")
+                .clicked()
+            {
+                w.show_files = !w.show_files;
+                if w.show_files && self.viewer.state.lock().unwrap().browser.path.is_empty() {
+                    self.viewer.list_dir("");
+                }
             }
             let clip = f.info.is_some_and(|i| i.clipboard);
             if menu_row(ui, Lead::Glyph(Glyph::Clipboard), "ส่งคลิปบอร์ดไปเครื่องปลายทาง", "", clip).clicked() {
@@ -625,14 +667,14 @@ impl ViewerWindow {
             });
     }
 
-    fn transfers(&self, ctx: &egui::Context, transfers: &[crate::viewer::Transfer]) {
+    fn transfers(&self, ctx: &egui::Context, transfers: &[Transfer]) {
         let shown: Vec<_> = transfers.iter().rev().take(4).collect();
         if shown.is_empty() {
             return;
         }
+        let finished = transfers.iter().any(|t| t.status != TransferStatus::Active);
         egui::Area::new(egui::Id::unique(("transfers", self.viewport)))
             .order(Order::Middle)
-            .interactable(false)
             .anchor(Align2::LEFT_BOTTOM, [12.0, -12.0])
             .show(ctx, |ui| {
                 let pal = Palette::of(ui);
@@ -643,44 +685,84 @@ impl ViewerWindow {
                     .shadow(Shadow { offset: [0, 3], blur: 14, spread: 0, color: Color32::from_black_alpha(60) })
                     .inner_margin(Margin::symmetric(14, 12))
                     .show(ui, |ui| {
-                        ui.set_width(290.0);
+                        ui.set_width(300.0);
                         ui.spacing_mut().item_spacing.y = 4.0;
                         ui.spacing_mut().interact_size.y = 18.0;
                         ui.horizontal(|ui| {
                             let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
                             glyph(ui, r, Glyph::Folder, pal.accent);
-                            ui.label(RichText::new("ส่งไฟล์ไปเครื่องปลายทาง").font(semi(13.5)).color(pal.fg));
+                            ui.label(RichText::new("การโอนไฟล์").font(semi(13.5)).color(pal.fg));
+                            if finished {
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    let clear = ui.add(Button::new(RichText::new("ล้างที่เสร็จแล้ว").size(12.0).color(pal.muted)).frame(false));
+                                    if clear.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                        self.viewer.clear_finished();
+                                    }
+                                });
+                            }
                         });
                         for t in shown {
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new(&t.name).size(12.5).color(pal.fg));
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    let (text, color) = match &t.status {
-                                        TransferStatus::Active => {
-                                            let pct = if t.size > 0 { t.sent * 100 / t.size } else { 0 };
-                                            (format!("{pct}%"), pal.muted)
-                                        }
-                                        TransferStatus::Done(_) => ("ส่งแล้ว".into(), pal.ok),
-                                        TransferStatus::Failed(_) => ("ไม่สำเร็จ".into(), pal.danger),
-                                    };
-                                    ui.label(RichText::new(text).size(12.0).color(color));
-                                });
-                            });
-                            match &t.status {
-                                TransferStatus::Active => {
-                                    let frac = if t.size > 0 { t.sent as f32 / t.size as f32 } else { 0.0 };
-                                    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 4.0), Sense::hover());
-                                    ui.painter().rect_filled(r, 2.0, pal.field);
-                                    ui.painter().rect_filled(Rect::from_min_size(r.min, vec2(r.width() * frac, 4.0)), 2.0, pal.accent);
-                                }
-                                TransferStatus::Failed(e) => {
-                                    ui.label(RichText::new(e).size(11.5).color(pal.danger));
-                                }
-                                TransferStatus::Done(_) => {}
-                            }
+                            self.transfer_row(ui, t, pal);
                         }
                     });
             });
+    }
+
+    fn transfer_row(&self, ui: &mut Ui, t: &Transfer, pal: Palette) {
+        let pct = |done: u64, size: u64| (done.min(size) * 100).checked_div(size).unwrap_or(0);
+        ui.horizontal(|ui| {
+            let (r, _) = ui.allocate_exact_size(vec2(13.0, 13.0), Sense::hover());
+            glyph(ui, r, if t.up { Glyph::Upload } else { Glyph::Download }, pal.muted);
+            let name = if t.folder { format!("{}/", t.name) } else { t.name.clone() };
+            ui.add(egui::Label::new(RichText::new(name).size(12.5).color(pal.fg)).truncate());
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let (text, color) = match &t.status {
+                    TransferStatus::Active => (format!("{}%", pct(t.sent, t.size)), pal.muted),
+                    TransferStatus::Done(_) if t.failed > 0 => (format!("ข้าม {} ไฟล์", t.failed), pal.warn),
+                    TransferStatus::Done(_) => ("เสร็จแล้ว".into(), pal.ok),
+                    TransferStatus::Failed(_) => ("ไม่สำเร็จ".into(), pal.danger),
+                };
+                if t.status == TransferStatus::Active {
+                    let (r, resp) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::click());
+                    glyph(ui, r.shrink(2.0), Glyph::Close, if resp.hovered() { pal.danger } else { pal.muted });
+                    if resp.on_hover_text("ยกเลิก").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        self.viewer.cancel(t.id);
+                    }
+                }
+                ui.label(RichText::new(text).size(12.0).color(color));
+            });
+        });
+        let bar = |ui: &mut Ui, frac: f32, h: f32| {
+            let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
+            ui.painter().rect_filled(r, h / 2.0, pal.field);
+            ui.painter().rect_filled(Rect::from_min_size(r.min, vec2(r.width() * frac.clamp(0.0, 1.0), h)), h / 2.0, pal.accent);
+        };
+        match &t.status {
+            TransferStatus::Active => {
+                bar(ui, if t.size > 0 { t.sent as f32 / t.size as f32 } else { 0.0 }, 4.0);
+                if t.folder {
+                    // Per-file progress under the total.
+                    let done = format!("{} / {} ไฟล์", t.files_done, t.files);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(done).size(11.5).color(pal.muted));
+                        if !t.current.is_empty() {
+                            ui.add(egui::Label::new(RichText::new(&t.current).size(11.5).color(pal.muted)).truncate());
+                        }
+                    });
+                    if t.cur_size > 0 {
+                        bar(ui, t.cur_sent as f32 / t.cur_size as f32, 2.0);
+                    }
+                }
+            }
+            TransferStatus::Failed(e) => {
+                ui.add(egui::Label::new(RichText::new(e).size(11.5).color(pal.danger)).truncate());
+            }
+            TransferStatus::Done(path) => {
+                if !t.up && !path.is_empty() {
+                    ui.add(egui::Label::new(RichText::new(path).size(11.0).color(pal.muted)).truncate()).on_hover_text(path);
+                }
+            }
+        }
     }
 
     // -----------------------------------------------------------------------------------------
@@ -831,6 +913,32 @@ impl ViewerWindow {
                     st.error = Some("รหัสผ่านไม่ถูกต้อง (เหลือ 2 ครั้ง)".into());
                 }
                 "connecting" => st.phase = Phase::Approval,
+                "files" => {
+                    w.show_files = true;
+                    let e = |name: &str, dir: bool, size: u64| crate::viewer::RemoteEntry { name: name.into(), dir, size };
+                    st.browser = RemoteDir {
+                        path: "C:\\Users\\บัญชี\\Documents".into(),
+                        parent: Some("C:\\Users\\บัญชี".into()),
+                        sep: "\\".into(),
+                        entries: vec![e("งบประมาณ 2569", true, 0), e("รูปภาพ", true, 0), e("รายงานประจำเดือน.xlsx", false, 482_133), e("สัญญา.pdf", false, 2_301_442)],
+                        ..Default::default()
+                    };
+                    st.transfers = vec![crate::viewer::Transfer {
+                        id: 2,
+                        name: "ภาพถ่าย".into(),
+                        up: true,
+                        folder: true,
+                        size: 84 << 20,
+                        sent: 51 << 20,
+                        files: 120,
+                        files_done: 71,
+                        current: "2025/ทริป/IMG_0412.jpg".into(),
+                        cur_size: 3 << 20,
+                        cur_sent: 1 << 20,
+                        ..Default::default()
+                    }];
+                    st.clip_offer = Some(vec![crate::viewer::ClipEntry { name: "งบประมาณ 2569".into(), path: String::new(), dir: true, size: 0 }]);
+                }
                 "closed" => {
                     st.phase = Phase::Closed;
                     st.error = Some("เครื่องปลายทางปิดการเชื่อมต่อ".into());
@@ -1042,6 +1150,13 @@ enum Glyph {
     Info,
     Warn,
     Pen,
+    Download,
+    Upload,
+    Trash,
+    Pencil,
+    FolderPlus,
+    Up,
+    File,
 }
 
 fn glyph(ui: &Ui, rect: Rect, g: Glyph, color: Color32) {
@@ -1127,6 +1242,40 @@ fn glyph(ui: &Ui, rect: Rect, g: Glyph, color: Color32) {
             p.add(Shape::closed_line(vec![at(10.8, 2.2), at(13.8, 5.2), at(5.5, 13.5), at(1.8, 14.2), at(2.5, 10.5)], st));
             line(&[(9.0, 4.0), (12.0, 7.0)]);
         }
+        Glyph::Download | Glyph::Upload => {
+            if g == Glyph::Download {
+                line(&[(8.0, 1.5), (8.0, 10.5)]);
+                line(&[(4.2, 6.8), (8.0, 10.6), (11.8, 6.8)]);
+            } else {
+                line(&[(8.0, 10.5), (8.0, 1.5)]);
+                line(&[(4.2, 5.2), (8.0, 1.4), (11.8, 5.2)]);
+            }
+            line(&[(2.0, 11.0), (2.0, 14.2), (14.0, 14.2), (14.0, 11.0)]);
+        }
+        Glyph::Trash => {
+            line(&[(2.0, 3.8), (14.0, 3.8)]);
+            line(&[(6.0, 3.8), (6.0, 1.8), (10.0, 1.8), (10.0, 3.8)]);
+            line(&[(3.5, 3.8), (4.5, 14.5), (11.5, 14.5), (12.5, 3.8)]);
+            line(&[(6.6, 6.5), (6.9, 11.8)]);
+            line(&[(9.4, 6.5), (9.1, 11.8)]);
+        }
+        Glyph::Pencil => {
+            line(&[(2.0, 14.0), (2.5, 10.8), (11.2, 2.1), (13.9, 4.8), (5.2, 13.5), (2.0, 14.0)]);
+            line(&[(9.4, 3.9), (12.1, 6.6)]);
+        }
+        Glyph::FolderPlus => {
+            line(&[(1.5, 13.5), (1.5, 2.8), (6.0, 2.8), (7.6, 4.6), (14.5, 4.6), (14.5, 13.5), (1.5, 13.5)]);
+            line(&[(8.0, 6.8), (8.0, 11.6)]);
+            line(&[(5.6, 9.2), (10.4, 9.2)]);
+        }
+        Glyph::Up => {
+            line(&[(8.0, 14.0), (8.0, 2.5)]);
+            line(&[(3.5, 7.0), (8.0, 2.4), (12.5, 7.0)]);
+        }
+        Glyph::File => {
+            line(&[(3.0, 1.5), (9.5, 1.5), (13.0, 5.0), (13.0, 14.5), (3.0, 14.5), (3.0, 1.5)]);
+            line(&[(9.5, 1.5), (9.5, 5.0), (13.0, 5.0)]);
+        }
         Glyph::Info | Glyph::Warn => {
             p.circle_stroke(at(8.0, 8.0), 6.6 * s, st);
             if g == Glyph::Info {
@@ -1153,15 +1302,16 @@ struct KeyMap {
 
 /// Presses modifiers, taps `key`, releases in reverse order.
 fn send_combo(v: &Viewer, mods: &[(&str, &str)], key: (&str, &str)) {
-    let k = |code: &str, name: &str, down: bool| v.send(serde_json::json!({"t": "key", "code": code, "key": name, "down": down}));
-    for (c, n) in mods {
-        k(c, n, true);
-    }
-    k(key.0, key.1, true);
-    k(key.0, key.1, false);
-    for (c, n) in mods.iter().rev() {
-        k(c, n, false);
-    }
+    combo_events(mods, key).into_iter().for_each(|e| v.send(e));
+}
+
+fn combo_events(mods: &[(&str, &str)], key: (&str, &str)) -> Vec<serde_json::Value> {
+    let k = |code: &str, name: &str, down: bool| serde_json::json!({"t": "key", "code": code, "key": name, "down": down});
+    let mut out: Vec<_> = mods.iter().map(|(c, n)| k(c, n, true)).collect();
+    out.push(k(key.0, key.1, true));
+    out.push(k(key.0, key.1, false));
+    out.extend(mods.iter().rev().map(|(c, n)| k(c, n, false)));
+    out
 }
 
 /// Modifiers held on this keyboard, translated for the remote OS
@@ -1236,7 +1386,7 @@ fn shortcut_key(k: egui::Key) -> Option<(String, String)> {
 /// drawn, `visible` the part of the window showing it. Pointer events over the toolbar, its
 /// menus or other overlays stay local (hit-tested against egui's layers from the last frame),
 /// and nothing is forwarded while a menu is open.
-fn forward_input(v: &Viewer, ui: &Ui, rect: Rect, visible: Rect, keys: KeyMap, held: &mut u8) {
+fn forward_input(v: &Viewer, ui: &Ui, rect: Rect, visible: Rect, keys: KeyMap, held: &mut u8, paste_seen: &mut bool) {
     let ctx = ui.ctx();
     let menu_open = Popup::is_any_open(ctx);
     let ours = ui.layer_id();
@@ -1295,9 +1445,29 @@ fn forward_input(v: &Viewer, ui: &Ui, rect: Rect, visible: Rect, keys: KeyMap, h
             egui::Event::Copy => send_combo(v, &remote_mods(ui.input(|i| i.modifiers), keys), ("KeyC", "c")),
             egui::Event::Cut => send_combo(v, &remote_mods(ui.input(|i| i.modifiers), keys), ("KeyX", "x")),
             egui::Event::Paste(text) => {
-                // Paste what is on this machine's clipboard: hand it over first, then press paste remotely.
-                v.send(serde_json::json!({"t": "clip", "s": text}));
-                send_combo(v, &remote_mods(ui.input(|i| i.modifiers), keys), ("KeyV", "v"));
+                // Paste what is on this machine's clipboard: files are uploaded and put on the
+                // remote clipboard first; text is handed over; then paste is pressed remotely.
+                *paste_seen = true;
+                let combo = combo_events(&remote_mods(ui.input(|i| i.modifiers), keys), ("KeyV", "v"));
+                match v.paste_files(combo.clone()) {
+                    Paste::Text => {
+                        v.send(serde_json::json!({"t": "clip", "s": text}));
+                        combo.into_iter().for_each(|e| v.send(e));
+                    }
+                    Paste::KeysOnly => combo.into_iter().for_each(|e| v.send(e)),
+                    Paste::Files => {}
+                }
+            }
+            // Cmd/Ctrl+V with no text on the clipboard (e.g. files copied in Explorer) produces
+            // no Paste event, only this key-up.
+            egui::Event::Key { key: egui::Key::V, pressed: false, modifiers, .. } if modifiers.command_only() => {
+                if std::mem::take(paste_seen) {
+                    continue;
+                }
+                let combo = combo_events(&remote_mods(modifiers, keys), ("KeyV", "v"));
+                if v.paste_files(combo.clone()) == Paste::KeysOnly {
+                    combo.into_iter().for_each(|e| v.send(e));
+                }
             }
             egui::Event::Key { key, pressed: true, modifiers, .. } => {
                 let mods = remote_mods(modifiers, keys);
@@ -1342,4 +1512,248 @@ fn paint_pointer(p: &egui::Painter, tip: egui::Pos2) {
     p.add(egui::Shape::convex_polygon(at(&[0, 1, 2, 5, 6]), Color32::BLACK, Stroke::NONE));
     p.add(egui::Shape::convex_polygon(at(&[2, 3, 4, 5]), Color32::BLACK, Stroke::NONE));
     p.add(egui::Shape::closed_line(at(&[0, 1, 2, 3, 4, 5, 6]), Stroke::new(1.2, Color32::WHITE)));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Remote file panel and clipboard offers
+
+impl ViewerWindow {
+    /// Right-hand panel: browse the remote machine, download, and (with "fs2") manage files.
+    fn files_panel(&self, ui: &mut Ui, w: &mut WinUi, b: &RemoteDir, fs2: bool) {
+        let pal = Palette::of(ui);
+        egui::Panel::right(egui::Id::unique(("files-panel", self.viewport)))
+            .exact_size(340.0)
+            .resizable(false)
+            .show_separator_line(true)
+            .frame(Frame::new().fill(pal.bg).inner_margin(Margin::symmetric(12, 10)))
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+                    glyph(ui, r, Glyph::Folder, pal.accent);
+                    ui.label(RichText::new("ไฟล์บนเครื่องปลายทาง").font(semi(14.0)).color(pal.fg));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if small_glyph_button(ui, Glyph::Close, "ปิด").clicked() {
+                            w.show_files = false;
+                        }
+                    });
+                });
+                ui.horizontal(|ui| {
+                    if let Some(parent) = &b.parent
+                        && small_glyph_button(ui, Glyph::Up, "โฟลเดอร์แม่").clicked()
+                    {
+                        self.viewer.list_dir(parent);
+                    }
+                    if small_glyph_button(ui, Glyph::Refresh, "รีเฟรช").clicked() {
+                        self.viewer.list_dir(&b.path);
+                    }
+                    if fs2 && small_glyph_button(ui, Glyph::FolderPlus, "โฟลเดอร์ใหม่").clicked() {
+                        w.new_folder = Some(String::new());
+                        w.renaming = None;
+                    }
+                    let path = if b.path.is_empty() { "…".to_string() } else { b.path.clone() };
+                    ui.add(egui::Label::new(RichText::new(&path).font(mono(11.5)).color(pal.muted)).truncate()).on_hover_text(&path);
+                });
+                if let Some(name) = w.new_folder.as_mut() {
+                    let mut done = None;
+                    ui.horizontal(|ui| {
+                        let edit = ui.add(egui::TextEdit::singleline(name).hint_text("ชื่อโฟลเดอร์ใหม่").desired_width(170.0));
+                        edit.request_focus();
+                        let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if ui.button("สร้าง").clicked() || enter {
+                            done = Some(true);
+                        }
+                        if ui.button("ยกเลิก").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                            done = Some(false);
+                        }
+                    });
+                    match done {
+                        Some(true) if !name.trim().is_empty() => {
+                            self.viewer.fs_op(serde_json::json!({"t": "mkdir", "dir": b.path, "name": name.trim()}));
+                            w.new_folder = None;
+                        }
+                        Some(false) => w.new_folder = None,
+                        _ => {}
+                    }
+                }
+                if let Some(e) = &b.error {
+                    ui.label(RichText::new(e).size(12.0).color(pal.danger));
+                }
+                if b.loading && b.entries.is_empty() {
+                    ui.label(RichText::new("กำลังโหลด…").size(12.5).color(pal.muted));
+                }
+
+                let footer = 52.0;
+                egui::ScrollArea::vertical().max_height((ui.available_height() - footer).max(60.0)).auto_shrink([false, false]).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    let hidden = w.show_hidden;
+                    for e in b.entries.iter().filter(|e| hidden || !e.name.starts_with('.')) {
+                        self.file_row(ui, w, b, e, fs2, pal);
+                    }
+                });
+
+                ui.separator();
+                ui.checkbox(&mut w.show_hidden, RichText::new("แสดงไฟล์ซ่อน").size(12.0));
+                let hint = if fs2 {
+                    "ลากไฟล์หรือโฟลเดอร์มาวางเพื่อส่งมาที่โฟลเดอร์นี้ · ดาวน์โหลดไปที่ Downloads/Aegiron"
+                } else {
+                    "ลากไฟล์มาวางเพื่อส่งมาที่โฟลเดอร์นี้ · ดาวน์โหลดไปที่ Downloads/Aegiron"
+                };
+                ui.label(RichText::new(hint).size(11.5).color(pal.muted));
+            });
+    }
+
+    fn file_row(&self, ui: &mut Ui, w: &mut WinUi, b: &RemoteDir, e: &crate::viewer::RemoteEntry, fs2: bool, pal: Palette) {
+        let path = if b.path.ends_with(&b.sep) { format!("{}{}", b.path, e.name) } else { format!("{}{}{}", b.path, b.sep, e.name) };
+
+        // Rename in place.
+        if let Some((target, name)) = w.renaming.as_mut().filter(|(p, _)| *p == path) {
+            let mut done = None;
+            ui.horizontal(|ui| {
+                let edit = ui.add(egui::TextEdit::singleline(name).desired_width(190.0));
+                edit.request_focus();
+                if ui.button("ตกลง").clicked() || (edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                    done = Some(true);
+                }
+                if ui.button("ยกเลิก").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    done = Some(false);
+                }
+            });
+            match done {
+                Some(true) if !name.trim().is_empty() && name.trim() != e.name => {
+                    self.viewer.fs_op(serde_json::json!({"t": "mv", "path": target, "name": name.trim()}));
+                    w.renaming = None;
+                }
+                Some(_) => w.renaming = None,
+                None => {}
+            }
+            return;
+        }
+        // Delete confirmation.
+        if w.confirm_delete.as_deref() == Some(path.as_str()) {
+            ui.horizontal(|ui| {
+                let what = if e.dir { "ลบโฟลเดอร์และทุกอย่างข้างใน" } else { "ลบ" };
+                ui.add(egui::Label::new(RichText::new(format!("{what} “{}”?", e.name)).size(12.5).color(pal.danger)).truncate());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button("ยกเลิก").clicked() {
+                        w.confirm_delete = None;
+                    }
+                    if ui.add(Button::new(RichText::new("ลบ").color(Color32::WHITE)).fill(pal.danger)).clicked() {
+                        self.viewer.fs_op(serde_json::json!({"t": "rm", "path": path}));
+                        w.confirm_delete = None;
+                    }
+                });
+            });
+            return;
+        }
+
+        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::click());
+        let hovered = ui.rect_contains_pointer(rect);
+        if hovered {
+            ui.painter().rect_filled(rect, 5.0, pal.field);
+        }
+        let icon = Rect::from_center_size(pos2(rect.left() + 12.0, rect.center().y), vec2(14.0, 14.0));
+        glyph(ui, icon, if e.dir { Glyph::Folder } else { Glyph::File }, if e.dir { pal.accent } else { pal.muted });
+        // Action buttons on hover, the size otherwise.
+        let mut right = rect.right() - 4.0;
+        let mut clicked_action = false;
+        if hovered {
+            let mut button = |g: Glyph, tip: &str| {
+                let r = Rect::from_center_size(pos2(right - 11.0, rect.center().y), vec2(22.0, 22.0));
+                right -= 24.0;
+                let id = ui.scope_id().with(("fa", &path, tip));
+                let resp = ui.interact(r, id, Sense::click());
+                if resp.hovered() {
+                    ui.painter().rect_filled(r, 4.0, pal.line);
+                }
+                glyph(ui, r.shrink(4.0), g, if g == Glyph::Trash && resp.hovered() { pal.danger } else { pal.fg });
+                resp.on_hover_text(tip).clicked()
+            };
+            if fs2 && button(Glyph::Trash, "ลบ") {
+                w.confirm_delete = Some(path.clone());
+                clicked_action = true;
+            }
+            if fs2 && button(Glyph::Pencil, "เปลี่ยนชื่อ") {
+                w.renaming = Some((path.clone(), e.name.clone()));
+                w.new_folder = None;
+                clicked_action = true;
+            }
+            if (!e.dir || fs2) && button(Glyph::Download, if e.dir { "ดาวน์โหลดทั้งโฟลเดอร์" } else { "ดาวน์โหลด" }) {
+                self.viewer.download(path.clone(), e.dir);
+                clicked_action = true;
+            }
+        } else if !e.dir {
+            let size = human_size(e.size);
+            let g = ui.painter().layout_no_wrap(size, mono(11.0), pal.muted);
+            right -= g.size().x + 6.0;
+            ui.painter().galley(pos2(right + 6.0, rect.center().y - g.size().y / 2.0), g, pal.muted);
+        }
+        let name_w = (right - rect.left() - 30.0).max(20.0);
+        let g = one_line(ui, &e.name, FontId::proportional(13.0), pal.fg, name_w);
+        ui.painter().galley(pos2(rect.left() + 26.0, rect.center().y - g.size().y / 2.0), g, pal.fg);
+        if e.dir && !clicked_action && resp.clicked() {
+            self.viewer.list_dir(&path);
+        }
+        if e.dir && hovered {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+    }
+
+    /// Files copied on the remote machine that are too big to fetch without asking.
+    fn clip_offer(&self, ctx: &egui::Context, offer: &[ClipEntry]) {
+        egui::Area::new(egui::Id::unique(("clip-offer", self.viewport)))
+            .order(Order::Foreground)
+            .anchor(Align2::RIGHT_BOTTOM, [-12.0, -12.0])
+            .show(ctx, |ui| {
+                let pal = Palette::of(ui);
+                Frame::new()
+                    .fill(pal.bg)
+                    .corner_radius(10)
+                    .stroke(Stroke::new(1.0, pal.line))
+                    .shadow(Shadow { offset: [0, 3], blur: 14, spread: 0, color: Color32::from_black_alpha(60) })
+                    .inner_margin(Margin::symmetric(14, 12))
+                    .show(ui, |ui| {
+                        ui.set_width(280.0);
+                        ui.spacing_mut().item_spacing.y = 6.0;
+                        ui.horizontal(|ui| {
+                            let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+                            glyph(ui, r, Glyph::Clipboard, pal.accent);
+                            ui.label(RichText::new(format!("เครื่องปลายทางคัดลอก {} รายการ", offer.len())).font(semi(13.5)).color(pal.fg));
+                        });
+                        let names: Vec<_> = offer.iter().take(3).map(|e| if e.dir { format!("{}/", e.name) } else { e.name.clone() }).collect();
+                        let more = if offer.len() > 3 { format!(" และอีก {}", offer.len() - 3) } else { String::new() };
+                        ui.add(egui::Label::new(RichText::new(format!("{}{more}", names.join(", "))).size(12.0).color(pal.muted)).truncate());
+                        ui.label(RichText::new("รับไฟล์มาไว้ที่ Downloads/Aegiron แล้ววางในเครื่องนี้ได้").size(12.0).color(pal.muted));
+                        ui.horizontal(|ui| {
+                            if dialog_button(ui, "รับไฟล์", true, true).clicked() {
+                                self.viewer.accept_clip_offer();
+                            }
+                            if dialog_button(ui, "ไม่รับ", false, true).clicked() {
+                                self.viewer.state.lock().unwrap().clip_offer = None;
+                            }
+                        });
+                    });
+            });
+    }
+}
+
+fn small_glyph_button(ui: &mut Ui, g: Glyph, tip: &str) -> Response {
+    let pal = Palette::of(ui);
+    let (r, resp) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::click());
+    if resp.hovered() {
+        ui.painter().rect_filled(r, 5.0, pal.field);
+    }
+    glyph(ui, r.shrink(5.0), g, if resp.hovered() { pal.fg } else { pal.muted });
+    resp.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn human_size(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = n as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 { format!("{n} B") } else { format!("{v:.1} {}", UNITS[u]) }
 }

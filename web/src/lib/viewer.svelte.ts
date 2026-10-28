@@ -3,6 +3,7 @@
 import { api, ApiError, type SessionTicket } from './api';
 import { b64decode, b64encode, completeHandshake, newViewerKeys, type Channel, type ViewerKeys } from './crypto';
 import { fingerprint } from './format';
+import { sanitizeRel, ZIP_LIMIT, ZipWriter, type LocalTree } from './filetree';
 
 export type Phase = 'requesting' | 'waiting' | 'handshake' | 'auth' | 'approval' | 'connected' | 'closed';
 
@@ -28,6 +29,8 @@ export interface AgentInfo {
 	recording?: boolean;
 	/** The controlled machine shows annotations drawn by the viewer. */
 	whiteboard?: boolean;
+	/** Optional capabilities (agents from 0.6), e.g. "fs2" for folders and file management. */
+	features?: string[];
 }
 
 /** A whiteboard stroke, normalised to the remote screen. */
@@ -54,6 +57,23 @@ export interface Transfer {
 	done: number;
 	status: 'active' | 'done' | 'error';
 	message?: string;
+	/** Folder transfers: file counts and the file being sent right now. */
+	folder?: boolean;
+	files?: number;
+	filesDone?: number;
+	filesFailed?: number;
+	current?: string;
+	curSize?: number;
+	curDone?: number;
+}
+
+interface FolderDownload {
+	zip: ZipWriter;
+	root: string;
+	/** The file being received has a usable path (otherwise its chunks are dropped). */
+	valid: boolean;
+	/** A file is in progress (counted as done when the next one starts). */
+	started: boolean;
 }
 
 const CHUNK = 64 * 1024;
@@ -143,6 +163,17 @@ export class RemoteViewer {
 	private needKeyframe = true;
 	private videoTs = 0;
 	private downloads = new Map<number, Uint8Array<ArrayBuffer>[]>();
+	private folderDownloads = new Map<number, FolderDownload>();
+	/** Replies (`fs_ok` / `fs_error`) awaited by id. */
+	private replies = new Map<number, (m: any) => void>();
+	/** Per-file upload id -> its folder transfer id. */
+	private subOf = new Map<number, number>();
+	/** Folder uploads that have sent everything and wait for the last `put_done`. */
+	private folderSent = new Set<number>();
+	/** Ids whose replies are ignored (empty sub-folders). */
+	private quiet = new Set<number>();
+	/** File operations started from the panel (rm / mv / mkdir). */
+	private ops = new Set<number>();
 
 	constructor(public deviceId: string) {}
 
@@ -247,11 +278,37 @@ export class RemoteViewer {
 			case 'ls':
 				this.files = { path: m.path, parent: m.parent, sep: m.sep, entries: m.entries, error: '', loading: false };
 				break;
+			case 'fs_ok':
+				if (this.takeReply(m) || this.quiet.delete(m.id)) break;
+				this.ops.delete(m.id);
+				if (this.files.path) this.listDir(this.files.path);
+				break;
 			case 'fs_error':
-				if (m.id != null) this.updateTransfer(m.id, { status: 'error', message: m.message });
-				else this.files = { ...this.files, error: m.message, loading: false };
+				if (this.takeReply(m) || this.quiet.delete(m.id)) break;
+				if (m.id != null && this.subOf.has(m.id)) {
+					this.subFinished(m.id, false);
+				} else if (m.id != null && this.transfers.some((t) => t.id === m.id)) {
+					this.updateTransfer(m.id, { status: 'error', message: m.message });
+					this.folderDownloads.delete(m.id);
+				} else {
+					this.ops.delete(m.id);
+					this.files = { ...this.files, error: m.message, loading: false };
+				}
+				break;
+			case 'dir_start':
+				this.onDirStart(m);
+				break;
+			case 'dir_file':
+				this.onDirFile(m);
+				break;
+			case 'dir_skip':
+				this.onDirSkip(m);
 				break;
 			case 'put_done':
+				if (this.subOf.has(m.id)) {
+					this.subFinished(m.id, true);
+					break;
+				}
 				this.updateTransfer(m.id, { status: 'done' });
 				if (this.files.path) this.listDir(this.files.path);
 				break;
@@ -260,7 +317,8 @@ export class RemoteViewer {
 				this.updateTransfer(m.id, { size: m.size, name: m.name });
 				break;
 			case 'get_end':
-				this.finishDownload(m.id);
+				if (this.folderDownloads.has(m.id)) this.finishFolderDownload(m.id);
+				else this.finishDownload(m.id);
 				break;
 			case 'cursor':
 				this.cursor = m.visible ? { x: m.x, y: m.y } : null;
@@ -398,10 +456,208 @@ export class RemoteViewer {
 		this.send({ t: 'get', id, path });
 	}
 
-	cancelTransfer(id: number) {
-		this.updateTransfer(id, { status: 'error', message: 'ยกเลิกแล้ว' });
+	cancelTransfer(id: number, message = 'ยกเลิกแล้ว') {
+		this.updateTransfer(id, { status: 'error', message });
 		this.downloads.delete(id);
+		this.folderDownloads.delete(id);
+		this.folderSent.delete(id);
 		this.send({ t: 'cancel', id });
+	}
+
+	// --- folders and file management (agent feature "fs2") ---
+
+	/** Folder transfer, delete, rename and new folder are available. */
+	get fs2(): boolean {
+		return !!this.info?.files && !!this.info?.features?.includes('fs2');
+	}
+
+	private takeReply(m: any): boolean {
+		const r = m.id != null ? this.replies.get(m.id) : undefined;
+		if (!r) return false;
+		this.replies.delete(m.id);
+		r(m);
+		return true;
+	}
+
+	/** Sends a request and resolves with its `fs_ok` / `fs_error`. */
+	private request(id: number, msg: object): Promise<any> {
+		return new Promise((resolve) => {
+			this.replies.set(id, resolve);
+			this.send(msg);
+		});
+	}
+
+	private op(msg: Record<string, unknown>) {
+		const id = this.nextTransfer++;
+		this.ops.add(id);
+		this.files = { ...this.files, error: '' };
+		this.send({ ...msg, id });
+	}
+
+	makeDir(dir: string, name: string) {
+		this.op({ t: 'mkdir', dir, name });
+	}
+
+	rename(path: string, name: string) {
+		this.op({ t: 'mv', path, name });
+	}
+
+	remove(path: string) {
+		this.op({ t: 'rm', path });
+	}
+
+	private subFinished(sub: number, ok: boolean) {
+		const id = this.subOf.get(sub)!;
+		this.subOf.delete(sub);
+		const t = this.transfers.find((x) => x.id === id);
+		if (!t) return;
+		this.updateTransfer(id, ok ? { filesDone: (t.filesDone ?? 0) + 1 } : { filesFailed: (t.filesFailed ?? 0) + 1 });
+		this.checkFolderUpload(id);
+	}
+
+	private checkFolderUpload(id: number) {
+		const t = this.transfers.find((x) => x.id === id);
+		if (!t || !this.folderSent.has(id) || t.status !== 'active') return;
+		if ((t.filesDone ?? 0) + (t.filesFailed ?? 0) < (t.files ?? 0)) return;
+		this.folderSent.delete(id);
+		const failed = t.filesFailed ?? 0;
+		this.updateTransfer(id, failed ? { status: 'error', message: `ส่งไม่สำเร็จ ${failed} ไฟล์` } : { status: 'done', current: undefined });
+		if (this.files.path) this.listDir(this.files.path);
+	}
+
+	/** Uploads a whole folder into `dir` (`""` = ~/Downloads/Aegiron) keeping its structure. */
+	async uploadTree(tree: LocalTree, dir: string) {
+		const id = this.nextTransfer++;
+		const size = tree.files.reduce((n, f) => n + f.file.size, 0);
+		const active = () => this.phase === 'connected' && this.transfers.find((t) => t.id === id)?.status === 'active';
+		this.transfers = [
+			...this.transfers,
+			{ id, name: tree.name, direction: 'up', size, done: 0, status: 'active', folder: true, files: tree.files.length, filesDone: 0, filesFailed: 0 }
+		];
+		// A new folder (`name (1)` if taken), so nothing existing is merged into or overwritten.
+		const r = await this.request(id, { t: 'mkdir', id, dir, name: tree.name });
+		if (r.t !== 'fs_ok') {
+			this.updateTransfer(id, { status: 'error', message: r.message });
+			return;
+		}
+		const root: string = r.path;
+		for (const rel of tree.emptyDirs) {
+			const sub = this.nextTransfer++;
+			this.quiet.add(sub);
+			await this.send({ t: 'mkdir', id: sub, dir: root, name: rel });
+		}
+		let done = 0;
+		for (const { rel, file } of tree.files) {
+			if (!active()) return;
+			const sub = this.nextTransfer++;
+			this.subOf.set(sub, id);
+			this.updateTransfer(id, { current: rel, curSize: file.size, curDone: 0 });
+			await this.send({ t: 'put', id: sub, dir: root, name: file.name, size: file.size, rel });
+			for (let off = 0; off < file.size; off += CHUNK) {
+				if (!active()) {
+					this.send({ t: 'cancel', id: sub });
+					this.subOf.delete(sub);
+					return;
+				}
+				const data = new Uint8Array(await file.slice(off, off + CHUNK).arrayBuffer());
+				await this.enqueue(this.chunk(sub, data));
+				while (this.ws && this.ws.bufferedAmount > MAX_BUFFERED) await new Promise((r) => setTimeout(r, 20));
+				done += data.length;
+				this.updateTransfer(id, { done, curDone: Math.min(file.size, off + CHUNK) });
+			}
+			await this.send({ t: 'put_end', id: sub });
+		}
+		this.folderSent.add(id);
+		this.checkFolderUpload(id);
+	}
+
+	/** Downloads a remote folder; the browser saves it as `<name>.zip`. */
+	downloadDir(path: string, name: string) {
+		const id = this.nextTransfer++;
+		this.transfers = [
+			...this.transfers,
+			{ id, name, direction: 'down', size: 0, done: 0, status: 'active', folder: true, files: 0, filesDone: 0, filesFailed: 0 }
+		];
+		this.folderDownloads.set(id, { zip: new ZipWriter(), root: sanitizeRel(name)?.[0] ?? 'folder', valid: false, started: false });
+		this.send({ t: 'get_dir', id, path });
+	}
+
+	private onDirStart(m: any) {
+		const fd = this.folderDownloads.get(m.id);
+		if (!fd) return;
+		if (m.size >= ZIP_LIMIT) {
+			this.cancelTransfer(m.id, 'โฟลเดอร์ใหญ่เกิน 4 GB สำหรับไฟล์ ZIP');
+			return;
+		}
+		fd.root = sanitizeRel(String(m.name ?? ''))?.[0] ?? fd.root;
+		fd.zip.addDir(fd.root);
+		for (const d of m.dirs ?? []) {
+			const parts = sanitizeRel(String(d));
+			if (parts) fd.zip.addDir(`${fd.root}/${parts.join('/')}`);
+		}
+		this.updateTransfer(m.id, { name: fd.root, size: m.size, files: m.files });
+	}
+
+	private onDirFile(m: any) {
+		const fd = this.folderDownloads.get(m.id);
+		const t = this.transfers.find((x) => x.id === m.id);
+		if (!fd || !t) return;
+		const parts = sanitizeRel(String(m.rel ?? ''));
+		const patch: Partial<Transfer> = { current: String(m.rel ?? ''), curSize: m.size, curDone: 0 };
+		if (fd.started) patch.filesDone = (t.filesDone ?? 0) + 1;
+		if (parts) {
+			fd.zip.beginFile(`${fd.root}/${parts.join('/')}`);
+			fd.valid = true;
+			fd.started = true;
+		} else {
+			// Unsafe path from the remote side: drop this file.
+			fd.zip.endFile();
+			fd.valid = false;
+			fd.started = false;
+			patch.filesFailed = (t.filesFailed ?? 0) + 1;
+		}
+		this.updateTransfer(m.id, patch);
+	}
+
+	private onDirSkip(m: any) {
+		const fd = this.folderDownloads.get(m.id);
+		const t = this.transfers.find((x) => x.id === m.id);
+		if (!fd || !t) return;
+		fd.zip.endFile();
+		this.updateTransfer(m.id, {
+			filesDone: (t.filesDone ?? 0) + (fd.started ? 1 : 0),
+			filesFailed: (t.filesFailed ?? 0) + 1
+		});
+		fd.started = false;
+		fd.valid = false;
+	}
+
+	private finishFolderDownload(id: number) {
+		const fd = this.folderDownloads.get(id);
+		this.folderDownloads.delete(id);
+		const t = this.transfers.find((x) => x.id === id);
+		if (!fd || !t || t.status !== 'active') return;
+		const url = URL.createObjectURL(fd.zip.finish());
+		const a = document.createElement('a');
+		a.href = url;
+		a.download = `${fd.root}.zip`;
+		a.click();
+		setTimeout(() => URL.revokeObjectURL(url), 60_000);
+		const failed = t.filesFailed ?? 0;
+		this.updateTransfer(id, {
+			status: 'done',
+			filesDone: (t.filesDone ?? 0) + (fd.started ? 1 : 0),
+			current: undefined,
+			message: failed ? `ข้ามไป ${failed} ไฟล์` : undefined
+		});
+	}
+
+	private chunk(id: number, data: Uint8Array): Uint8Array<ArrayBuffer> {
+		const plain = new Uint8Array(5 + data.length);
+		plain[0] = MSG_FILE;
+		new DataView(plain.buffer).setUint32(1, id);
+		plain.set(data, 5);
+		return plain;
 	}
 
 	clearFinishedTransfers() {
@@ -410,6 +666,15 @@ export class RemoteViewer {
 
 	private onFileChunk(p: Uint8Array<ArrayBuffer>) {
 		const id = new DataView(p.buffer, p.byteOffset).getUint32(1);
+		const fd = this.folderDownloads.get(id);
+		if (fd) {
+			const data = p.slice(5);
+			if (fd.valid) fd.zip.write(data);
+			const t = this.transfers.find((x) => x.id === id);
+			if (t) this.updateTransfer(id, { done: t.done + data.length, curDone: (t.curDone ?? 0) + data.length });
+			if (fd.zip.size >= ZIP_LIMIT) this.cancelTransfer(id, 'โฟลเดอร์ใหญ่เกิน 4 GB สำหรับไฟล์ ZIP');
+			return;
+		}
 		const parts = this.downloads.get(id);
 		if (!parts) return;
 		parts.push(p.slice(5));
