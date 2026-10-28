@@ -21,7 +21,7 @@ fn main() -> anyhow::Result<()> {
     let server = std::env::var("AEGIRON_URL").unwrap_or_else(|_| "http://127.0.0.1:21114".into());
     let email = std::env::var("AEGIRON_EMAIL").unwrap_or_else(|_| "admin@aegiron.local".into());
     let password = std::env::var("AEGIRON_PASSWORD")?;
-    let Login::Ok(session) = account::login(&server, true, &email, &password, "")? else { anyhow::bail!("2FA not supported here") };
+    let Login::Ok(session) = account::login(&server, true, &account::LoginRequest { email, password, ..Default::default() })? else { anyhow::bail!("2FA not supported here") };
 
     let target = Target { server, token: session.token, insecure: true, device_id: id, name: "probe".into(), direct: true, only: None };
     let v = Viewer::connect(target, Arc::new(|| {}));
