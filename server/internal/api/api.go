@@ -85,6 +85,9 @@ func (a *API) Handler() http.Handler {
 	user("POST /api/auth/totp/setup", a.totpSetup)
 	user("POST /api/auth/totp/enable", a.totpEnable)
 	user("POST /api/auth/totp/disable", a.totpDisable)
+	user("GET /api/auth/trusted-devices", a.listMyTrustedDevices)
+	user("DELETE /api/auth/trusted-devices", a.deleteMyTrustedDevices)
+	user("DELETE /api/auth/trusted-devices/{tid}", a.deleteMyTrustedDevice)
 
 	user("GET /api/devices", a.listDevices)
 	user("GET /api/devices/{id}", a.getDevice)
@@ -116,6 +119,9 @@ func (a *API) Handler() http.Handler {
 	admin("PATCH /api/users/{id}", a.updateUser)
 	admin("POST /api/users/{id}/password", a.adminSetPassword)
 	admin("DELETE /api/users/{id}/totp", a.adminResetTOTP)
+	admin("GET /api/users/{id}/trusted-devices", a.adminListTrustedDevices)
+	admin("DELETE /api/users/{id}/trusted-devices", a.adminDeleteTrustedDevices)
+	admin("DELETE /api/users/{id}/trusted-devices/{tid}", a.adminDeleteTrustedDevice)
 
 	user("GET /api/endpoints", a.listEndpoints)
 	user("POST /api/endpoints", a.createEndpoint)

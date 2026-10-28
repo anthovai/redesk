@@ -34,15 +34,35 @@ func (a *API) login(w http.ResponseWriter, r *http.Request) {
 		Email    string `json:"email"`
 		Password string `json:"password"`
 		TOTP     string `json:"totp"`
+		// RememberDevice: after a correct TOTP code, set a 30-day cookie that skips the
+		// TOTP step (not the password) on this browser.
+		RememberDevice bool `json:"remember_device"`
 	}
 	if !readJSON(w, r, &req) {
 		return
 	}
-	u, ok := a.checkCredentials(w, r, req.Email, req.Password, req.TOTP)
+	creds := credentials{Email: req.Email, Password: req.Password, TOTP: req.TOTP}
+	if c, err := r.Cookie(trustCookie); err == nil {
+		creds.TrustToken = c.Value
+	}
+	res, ok := a.checkCredentials(w, r, creds)
 	if !ok {
 		return
 	}
+	u := res.user
 	ip, email := a.clientIP(r), u.Email
+	var auditDetail map[string]any
+	if res.trusted != nil {
+		auditDetail = map[string]any{"trusted_device": res.trusted.ID}
+	} else if req.RememberDevice && res.totpVerified {
+		tok, d, err := a.rememberDevice(r, u, browserLabel(r.UserAgent()), r.UserAgent())
+		if err != nil {
+			a.internal(w, err)
+			return
+		}
+		auditDetail = map[string]any{"trusted_device_added": d.ID}
+		http.SetCookie(w, a.trustCookieFor(tok, d.ExpiresAt))
+	}
 
 	st, err := a.store.GetSettings(r.Context())
 	if err != nil {
@@ -56,7 +76,7 @@ func (a *API) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = a.store.TouchLogin(r.Context(), u.ID)
-	_ = a.store.AddAudit(r.Context(), &u.ID, ip, "auth.login", email, nil)
+	_ = a.store.AddAudit(r.Context(), &u.ID, ip, "auth.login", email, auditDetail)
 	http.SetCookie(w, &http.Cookie{
 		Name: cookieName, Value: tok, Path: "/", Expires: exp,
 		HttpOnly: true, Secure: a.cfg.CookieSecure, SameSite: http.SameSiteStrictMode,
@@ -107,6 +127,7 @@ func (a *API) changePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.audit(r, "user.password_changed", u.Email, nil)
+	a.revokeTrustedDevices(r, u, "password_changed")
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -147,6 +168,7 @@ func (a *API) totpEnable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.audit(r, "user.totp_enabled", u.Email, nil)
+	a.revokeTrustedDevices(r, u, "totp_enabled")
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -167,5 +189,6 @@ func (a *API) totpDisable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.audit(r, "user.totp_disabled", u.Email, nil)
+	a.revokeTrustedDevices(r, u, "totp_disabled")
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }

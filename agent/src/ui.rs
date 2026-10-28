@@ -725,6 +725,8 @@ struct LoginForm {
     password: String,
     totp: String,
     need_totp: bool,
+    /// "Remember this device for 30 days" on the 2FA step.
+    remember: bool,
     busy: bool,
     error: String,
     /// Set while waiting for the browser SSO sign-in; storing true cancels the wait.
@@ -1138,13 +1140,35 @@ impl App {
 
     fn start_login(&mut self, ctx: &egui::Context) {
         let (server, insecure) = self.login_target();
-        let (email, password, totp) = (self.login.email.clone(), self.login.password.clone(), self.login.totp.clone());
+        let email = self.login.email.clone();
+        // A remembered-device token for this account replaces the 2FA code (never the password).
+        let trust_token = self.agent.as_ref().and_then(|a| a.config.lock().unwrap().trust_token(&server, &email));
+        let req = account::LoginRequest {
+            email,
+            password: self.login.password.clone(),
+            totp: self.login.totp.clone(),
+            trust_token: trust_token.filter(|_| !self.login.need_totp),
+            remember: self.login.need_totp && self.login.remember,
+        };
         self.login.busy = true;
         self.login.error.clear();
         self.spawn_job(ctx, move || {
-            let result = account::login(&server, insecure, &email, &password, &totp).map_err(|e| format!("{e:#}"));
+            let result = account::login(&server, insecure, &req).map_err(|e| format!("{e:#}"));
             Job::Login { server, insecure, result }
         });
+    }
+
+    /// Forgets this device's remembered 2FA token for `email` (expired or revoked on the server).
+    fn forget_trust_token(&mut self, server: &str, email: &str) {
+        if let Some(agent) = &self.agent {
+            let mut c = agent.config.lock().unwrap();
+            if c.trust_token(server, email).is_some() {
+                c.set_trust_token(server, email, None);
+                if let Err(e) = c.save(&agent.config_path) {
+                    tracing::warn!("could not save config: {e:#}");
+                }
+            }
+        }
     }
 
     fn refresh_book(&mut self, ctx: &egui::Context) {
@@ -1309,7 +1333,11 @@ impl App {
                 self.login.sso = None;
                 match result {
                     Err(e) => self.login.error = e,
-                    Ok(account::Login::NeedTotp) => {
+                    Ok(account::Login::NeedTotp { trust_rejected }) => {
+                        if trust_rejected {
+                            let email = self.login.email.clone();
+                            self.forget_trust_token(&server, &email);
+                        }
                         self.login.need_totp = true;
                         self.login.error.clear();
                     }
@@ -1372,6 +1400,9 @@ impl App {
                 let mut c = Config::new(server.to_string(), sess.server_key)?;
                 c.enroll_token = Some(sess.enroll_token);
                 c.allow_insecure_transport = insecure;
+                if let Some(t) = sess.trust_token {
+                    c.set_trust_token(server, &acc.email, Some(t));
+                }
                 c.account = Some(acc);
                 c.ws_base()?;
                 c.save(&self.config_path)?;
@@ -1382,6 +1413,9 @@ impl App {
                 let mut c = agent.config.lock().unwrap();
                 if c.server_key != sess.server_key {
                     anyhow::bail!("กุญแจของเซิร์ฟเวอร์ไม่ตรงกับที่เครื่องนี้ใช้อยู่ — ไม่ได้เข้าสู่ระบบ");
+                }
+                if let Some(t) = sess.trust_token {
+                    c.set_trust_token(server, &acc.email, Some(t));
                 }
                 c.account = Some(acc);
                 c.save(&agent.config_path)?;
@@ -2204,6 +2238,8 @@ impl App {
             );
             r.request_focus();
             submit |= enter(ui, &r);
+            ui.checkbox(&mut self.login.remember, "จดจำอุปกรณ์นี้ 30 วัน")
+                .on_hover_text("ครั้งต่อไปใส่แค่รหัสผ่าน ไม่ต้องใส่รหัส 2FA (เลิกจดจำได้ที่หน้าบัญชีในเว็บคอนโซล)");
         }
         if !self.login.error.is_empty() {
             ui.label(RichText::new(&self.login.error).size(13.0).color(pal.danger));

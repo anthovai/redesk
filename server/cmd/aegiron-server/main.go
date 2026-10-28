@@ -90,6 +90,7 @@ func run(log *slog.Logger) error {
 			case <-t.C:
 				_ = st.PurgeExpiredSessions(ctx)
 				a.PurgeRecordings(ctx)
+				_ = st.PurgeExpiredTrustedDevices(ctx)
 			}
 		}
 	}()

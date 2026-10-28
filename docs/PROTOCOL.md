@@ -142,6 +142,26 @@ app  → POST /api/agent/login {email, password, totp?, device}      (HTTPS, cer
 - `enroll_token`: single-use, 1 hour, owned by the user. Registering with it sets `devices.owner_id` and adds the device to that user's address book.
 - Opening the web viewer from the app: `POST /api/auth/handoff` (bearer) returns a code valid for 60 s and usable once; the browser opens `GET /api/auth/handoff/{code}?next=/connect/<id>`, which sets the console cookie and redirects. `next` must be a same-site path.
 
+### Trusted devices ("remember this device for 30 days")
+
+On the 2FA step a client may ask to be remembered. The trust token replaces only the TOTP code; the password is always checked first, and the brute-force limits apply as before.
+
+```
+web  → POST /api/auth/login  {email, password, totp, remember_device: true}
+     ← Set-Cookie: aegiron_trust=<token>; Path=/api/auth; HttpOnly; SameSite=Strict; Secure; Max-Age=30 days
+web  → POST /api/auth/login  {email, password}            (cookie sent automatically)  → {user}
+app  → POST /api/agent/login {email, password, totp, device, remember_device: true}
+     ← {user, token, server_key, enroll_token, trust_token}
+app  → POST /api/agent/login {email, password, device, trust_token}                      → {user, token, …}
+     ← {need_totp: true, trust_rejected: true}   when the token is expired, revoked or another user's
+```
+
+- The token is 32 random bytes (base64url). The server stores only its SHA-256 in `trusted_devices`, bound to the user, with a label (browser/OS, or the app's host name), user agent, first and last IP, created / last-used time and a fixed 30-day expiry (not extended by use). At most 20 per user; the oldest go first.
+- A token is issued only in the same request as a correct TOTP code, and only if the account has 2FA. It travels in a request body or an HttpOnly cookie, never in a URL. The app keeps it in `agent.toml` (owner-only) per server and account, and keeps it after signing out; it is dropped on `trust_rejected`.
+- Revocation: `GET /api/auth/trusted-devices` (the current browser is marked `current`), `DELETE /api/auth/trusted-devices/{id}`, `DELETE /api/auth/trusted-devices` (all). Admins: `GET|DELETE /api/users/{id}/trusted-devices[/{tid}]`. Every remembered device of a user is revoked automatically when the password is changed or reset, 2FA is enabled, disabled or reset, or the account is disabled.
+- Audit: `auth.trusted_device_added`, `auth.login` / `auth.agent_login` with `trusted_device_added` or `trusted_device` (2FA skipped) in the detail, `auth.trusted_device_rejected`, `user.trusted_device_revoked {id, label, by}`, `user.trusted_devices_revoked {count, reason}`.
+- SSO sign-in is unaffected: it never asks for TOTP (the IdP handles MFA) and never issues trust tokens.
+
 ### Organisation SSO (OpenID Connect)
 
 - Browser: `GET /api/oidc/login?next=` → identity provider (Authorization Code + PKCE, `state`, `nonce`, bound to the browser by a cookie) → `GET /api/oidc/callback`. The ID token is verified (signature, issuer, audience, expiry, nonce); `email_verified` and the allowed domains are enforced. TOTP is not asked again: the IdP is responsible for MFA.
@@ -194,6 +214,7 @@ The viewer draws on the remote screen; the controlled machine shows the strokes 
   - `wb {op:"line", id, c:"#rrggbb", w, p:[x0,y0,x1,y1,...]}` appends points to stroke `id` (created on first use with color `c` and width `w`, a fraction of the display height). Points are normalised 0–1 over the displayed frame, like pointer input.
   - `wb {op:"clear"}` removes all strokes.
 - Limits on the agent: 1024 points per message, 300 strokes, 60 000 points (oldest strokes go first). Strokes stay until cleared; they disappear when the session ends or the viewer switches display. The overlay is part of the screen, so the stream (and a recording) shows it too.
+
 ## 9. Direct connections (LAN/TCP and P2P) and proxies
 
 A native viewer can reach the agent without the relay. The bytes on a direct path are the same WebSocket messages as on the relay (`paired`, then the §3 handshake and the §4 encrypted channel, unchanged), so a direct path gains no trust: the agent is still authenticated by its device key, and the viewer by the password or click inside the channel. The browser viewer always uses the relay.
@@ -229,3 +250,9 @@ The agent checks it during the HTTP upgrade, before any WebSocket frame: the sid
 **Proxy.** `[proxy]` in `agent.toml` (`kind = "socks5" | "http"`, `host`, `port`, optional `username`/`password`, stored like the other secrets in the owner-only file; Settings → Network → พร็อกซี, or `aegiron-agent set --proxy socks5://host:port --proxy-user NAME`, which prompts for the password) sends every connection to the server through a SOCKS5 tunnel (RFC 1928 with username/password, RFC 1929; the proxy resolves the name) or an HTTP `CONNECT` tunnel (`Proxy-Authorization: Basic`). This covers signaling, relay and the HTTPS API (sign-in, address book, sessions, updates). TLS to the server runs inside the tunnel with the same certificate verification as without a proxy. Credentials are refused in proxy addresses and never appear in URLs. Direct and P2P paths do not use the proxy; turn them off where all traffic must go through it.
 
 `aegiron-agent connect <ID> [--only relay|direct|p2p]` runs the app's viewer from a terminal and prints the path it used, which helps diagnose a deployment.
+
+## 10. `aegiron://` links and the single app instance
+
+- Links: `aegiron://connect/<id>` or `aegiron://<id>` (also `redesk://`), where `<id>` is 9 digits (spaces or `%20` allowed). Nothing else is accepted: no query string, no extra path, no password. The app always asks before connecting.
+- macOS delivers links as a `kAEGetURL` Apple Event, at launch and while the app runs. The app handles it with `NSAppleEventManager` (installed before the event loop starts and again after launch). Windows passes the link as the first argument.
+- One app instance per user and config file. The first instance holds an exclusive lock on `instance.lock` next to `agent.toml` and listens on a Unix socket `instance.sock` there (folder 0700, socket 0600) or, on Windows, on the named pipe `\\.\pipe\aegiron-<first 8 bytes of SHA-256(config path), hex>` (remote clients rejected; other users cannot write to it). A second launch sends one message, `aegiron-show` or `aegiron-open <9-digit id>` (at most 64 bytes, parsed strictly), and exits.

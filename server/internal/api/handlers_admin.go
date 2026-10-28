@@ -118,10 +118,11 @@ func (a *API) updateUser(w http.ResponseWriter, r *http.Request) {
 		storeErr(a, w, err)
 		return
 	}
+	a.audit(r, "user.updated", target.Email, map[string]any{"role": req.Role, "disabled": req.Disabled})
 	if req.Disabled {
 		_ = a.store.DeleteUserSessions(r.Context(), target.ID)
+		a.revokeTrustedDevices(r, target, "account_disabled")
 	}
-	a.audit(r, "user.updated", target.Email, map[string]any{"role": req.Role, "disabled": req.Disabled})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -151,6 +152,7 @@ func (a *API) adminSetPassword(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = a.store.DeleteUserSessions(r.Context(), target.ID)
 	a.audit(r, "user.password_reset", target.Email, nil)
+	a.revokeTrustedDevices(r, target, "password_reset")
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -164,6 +166,7 @@ func (a *API) adminResetTOTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.audit(r, "user.totp_reset", target.Email, nil)
+	a.revokeTrustedDevices(r, target, "totp_reset")
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 

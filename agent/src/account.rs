@@ -58,34 +58,69 @@ pub struct Session {
     pub token: String,
     pub server_key: String,
     pub enroll_token: String,
+    /// New "remember this device" token, when one was asked for with a correct 2FA code.
+    pub trust_token: Option<String>,
 }
 
 pub enum Login {
     Ok(Session),
-    NeedTotp,
+    /// The account has 2FA. `trust_rejected`: the remembered-device token that was sent is
+    /// expired or revoked and should be forgotten.
+    NeedTotp { trust_rejected: bool },
+}
+
+/// One password sign-in attempt from the app.
+#[derive(Debug, Clone, Default)]
+pub struct LoginRequest {
+    pub email: String,
+    pub password: String,
+    pub totp: String,
+    /// Remembered-device token for this account (skips the TOTP step, not the password).
+    pub trust_token: Option<String>,
+    /// Ask the server to remember this device for 30 days (only honoured with a valid code).
+    pub remember: bool,
 }
 
 #[derive(Deserialize)]
 struct LoginReply {
     #[serde(default)]
     need_totp: bool,
+    #[serde(default)]
+    trust_rejected: bool,
     user: Option<User>,
     token: Option<String>,
     server_key: Option<String>,
     enroll_token: Option<String>,
+    trust_token: Option<String>,
 }
 
-pub fn login(server: &str, insecure: bool, email: &str, password: &str, totp: &str) -> Result<Login> {
+/// The JSON body of POST /api/agent/login. Secrets only ever travel in this body (HTTPS),
+/// never in a URL.
+fn login_body(req: &LoginRequest, device: &str) -> serde_json::Value {
+    let mut body = json!({"email": req.email.trim(), "password": req.password, "totp": req.totp.trim(), "device": device});
+    if let Some(t) = req.trust_token.as_deref().filter(|t| !t.is_empty()) {
+        body["trust_token"] = json!(t);
+    }
+    if req.remember && !req.totp.trim().is_empty() {
+        body["remember_device"] = json!(true);
+    }
+    body
+}
+
+pub fn login(server: &str, insecure: bool, req: &LoginRequest) -> Result<Login> {
     check_server_url(server, insecure)?;
     let device = hostname::get().map(|h| h.to_string_lossy().into_owned()).unwrap_or_default();
-    let body = json!({"email": email.trim(), "password": password, "totp": totp.trim(), "device": device});
-    let r: LoginReply = call(agent().post(&format!("{server}/api/agent/login")).header("X-Aegiron", "1").send_json(&body))
-        .map_err(|(_, m)| anyhow!(m))?;
+    let r: LoginReply =
+        call(agent().post(&format!("{server}/api/agent/login")).header("X-Aegiron", "1").send_json(login_body(req, &device)))
+            .map_err(|(_, m)| anyhow!(m))?;
     if r.need_totp {
-        return Ok(Login::NeedTotp);
+        return Ok(Login::NeedTotp { trust_rejected: r.trust_rejected });
     }
+    let trust_token = r.trust_token.filter(|t| !t.is_empty() && t.len() <= 128);
     match (r.user, r.token, r.server_key, r.enroll_token) {
-        (Some(user), Some(token), Some(server_key), Some(enroll_token)) => Ok(Login::Ok(Session { user, token, server_key, enroll_token })),
+        (Some(user), Some(token), Some(server_key), Some(enroll_token)) => {
+            Ok(Login::Ok(Session { user, token, server_key, enroll_token, trust_token }))
+        }
         _ => bail!("เซิร์ฟเวอร์นี้ยังไม่รองรับการเข้าสู่ระบบจากโปรแกรม (ต้องเป็น Aegiron 0.3 ขึ้นไป)"),
     }
 }
@@ -260,7 +295,9 @@ pub fn oidc_poll(server: &str, insecure: bool, code: &str) -> Result<Option<Sess
         return Ok(None);
     }
     match (r.user, r.token, r.server_key, r.enroll_token) {
-        (Some(user), Some(token), Some(server_key), Some(enroll_token)) => Ok(Some(Session { user, token, server_key, enroll_token })),
+        (Some(user), Some(token), Some(server_key), Some(enroll_token)) => {
+            Ok(Some(Session { user, token, server_key, enroll_token, trust_token: None }))
+        }
         _ => bail!("คำตอบจากเซิร์ฟเวอร์ไม่ถูกต้อง"),
     }
 }
@@ -277,4 +314,24 @@ fn oidc_reason(msg: &str) -> String {
         _ => "เข้าสู่ระบบด้วย SSO ไม่สำเร็จ",
     }
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn login_body_sends_trust_only_when_set() {
+        let mut req = LoginRequest { email: " a@b.c ".into(), password: "pw".into(), ..Default::default() };
+        let b = login_body(&req, "mac");
+        assert_eq!(b["email"], "a@b.c");
+        assert!(b.get("trust_token").is_none() && b.get("remember_device").is_none());
+        // Remember is only asked for together with a code.
+        req.remember = true;
+        assert!(login_body(&req, "mac").get("remember_device").is_none());
+        req.totp = "123456".into();
+        assert_eq!(login_body(&req, "mac")["remember_device"], true);
+        req.trust_token = Some("tok".into());
+        assert_eq!(login_body(&req, "mac")["trust_token"], "tok");
+    }
 }
