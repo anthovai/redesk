@@ -25,6 +25,9 @@ use crate::{fingerprint, format_id, service};
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(30);
 const SIDEBAR_WIDTH: f32 = 340.0;
 
+#[path = "ui_permissions.rs"]
+mod permissions_ui;
+
 // ---------------------------------------------------------------------------------------------
 // Look and feel
 
@@ -1026,6 +1029,7 @@ impl App {
     }
 
     fn home(&mut self, ui: &mut Ui, agent: &Agent) {
+        permissions_ui::missing_permissions_banner(ui);
         let pal = Palette::of(ui);
         ui.label(RichText::new("ควบคุมเครื่องอื่น").font(semi(20.0)).color(pal.fg));
         ui.label(RichText::new("ใส่ ID แล้วควบคุมหน้าจอเครื่องนั้นในหน้าต่างใหม่ เข้ารหัสต้นทาง-ปลายทาง").size(13.0).color(pal.muted));
@@ -1103,6 +1107,9 @@ impl App {
         let c = agent.config.lock().unwrap().clone();
         ui.label(RichText::new("ตั้งค่า").font(semi(20.0)).color(pal.fg));
         ui.add_space(6.0);
+        if cfg!(target_os = "macos") {
+            permissions_ui::permissions_card(ui);
+        }
 
         let section = |ui: &mut Ui, title: &str| {
             ui.add_space(12.0);
