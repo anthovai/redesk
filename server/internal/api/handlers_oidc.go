@@ -631,7 +631,7 @@ func (a *API) oidcAppQuery(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusForbidden, "sign-in failed: disabled_account")
 			return
 		}
-		a.issueAppSession(w, r, u, app.device, map[string]any{"method": "oidc"})
+		a.issueAppSession(w, r, u, app.device, map[string]any{"method": "oidc"}, nil)
 	}
 }
 

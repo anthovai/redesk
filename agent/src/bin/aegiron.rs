@@ -4,28 +4,23 @@
 //!
 //! `--background` starts hidden in the tray (used by autostart). Launching it again while it
 //! runs just brings the existing window to the front, or hands it the `aegiron://` link
-//! (registered as a URL handler by the Windows installer, which passes it as "%1").
-//! macOS delivers URL-scheme launches as an Apple Event (`application:openURLs:`), not as an
-//! argument; winit 0.30 / eframe 0.37 do not expose that event, so on macOS a link currently
-//! works only when passed explicitly (`open -a Aegiron --args aegiron://connect/<id>`).
+//! (see `aegiron_agent::instance`: a per-user Unix socket or named pipe, not a TCP port).
+//! Windows passes links as "%1" (registered by the installer). macOS delivers them as a
+//! `kAEGetURL` Apple Event, both at launch and while the app runs (`aegiron_agent::url_event`).
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
 
 use eframe::egui;
 use aegiron_agent::config::Config;
+use aegiron_agent::instance::{self, Request};
 use aegiron_agent::local::{self, LocalState};
 use aegiron_agent::service;
 use aegiron_agent::signal::Agent;
 use aegiron_agent::ui::{self, App, OpenRequests, Options, ShowSignal};
 
-/// Loopback port used to find an already running instance (per machine).
-const INSTANCE_PORT: u16 = 21119;
 /// Size of the main window unless a remembered one is available.
 const MAIN_SIZE: [f32; 2] = [1000.0, 640.0];
 const MAIN_MIN: [f32; 2] = [820.0, 540.0];
@@ -58,8 +53,16 @@ fn main() -> eframe::Result {
         open.0.lock().unwrap().push_back(id.clone());
     }
     let ctx_cell: Arc<OnceLock<egui::Context>> = Arc::default();
-    if screenshot.is_none() && !claim_single_instance(show.clone(), open.clone(), ctx_cell.clone(), link.as_deref()) {
-        return Ok(()); // the running instance was asked to show itself (or open the link)
+    if screenshot.is_none() {
+        let req = link.clone().map_or(Request::Show, Request::Open);
+        let (s, o, c) = (show.clone(), open.clone(), ctx_cell.clone());
+        let first = instance::claim(&config_path, &req, move |r| deliver(&s, &o, &c, r));
+        if !first {
+            tracing::info!("another Aegiron is running; sent it {req:?}");
+            return Ok(()); // the running instance was asked to show itself (or open the link)
+        }
+        #[cfg(target_os = "macos")]
+        install_url_handler(&show, &open, &ctx_cell);
     }
     // Remembered window geometry (not in demo mode: screenshots use the default size).
     let geom = if demo.is_none() { LocalState::load(&LocalState::path_for(&config_path)).main_window } else { None };
@@ -143,6 +146,11 @@ fn main() -> eframe::Result {
             options,
             Box::new(move |cc| {
                 let _ = ctx_cell.set(cc.egui_ctx.clone());
+                // Again now that AppKit has finished launching (it may install its own handler).
+                #[cfg(target_os = "macos")]
+                if opts.screenshot.is_none() {
+                    install_url_handler(&show, &opts.open, &ctx_cell);
+                }
                 if has_tray {
                     tray::create(&cc.egui_ctx, show, quit);
                 }
@@ -160,51 +168,27 @@ fn main() -> eframe::Result {
     })
 }
 
-/// Messages a second launch sends to the running instance (one per connection):
-/// `aegiron-show`, or `aegiron-open <9-digit id>` for a `aegiron://` link.
-fn parse_instance_msg(raw: &[u8]) -> Option<Option<String>> {
-    let msg = std::str::from_utf8(raw).ok()?.trim_end();
-    if msg == "aegiron-show" {
-        return Some(None);
+/// Hands a request from another launch (or an Apple Event) to the window.
+fn deliver(show: &ShowSignal, open: &OpenRequests, ctx: &OnceLock<egui::Context>, req: Request) {
+    if let Request::Open(id) = req {
+        open.0.lock().unwrap().push_back(id);
     }
-    let id = msg.strip_prefix("aegiron-open ")?;
-    local::normalize_id(id).filter(|n| n == id).map(Some)
+    show.0.store(true, Ordering::Relaxed);
+    if let Some(c) = ctx.get() {
+        c.request_repaint();
+    }
 }
 
-/// Returns false if another instance is running (after asking it to show its window or open
-/// `link`).
-fn claim_single_instance(show: ShowSignal, open: OpenRequests, ctx: Arc<OnceLock<egui::Context>>, link: Option<&str>) -> bool {
-    match TcpListener::bind(("127.0.0.1", INSTANCE_PORT)) {
-        Ok(listener) => {
-            std::thread::spawn(move || {
-                for mut conn in listener.incoming().flatten() {
-                    let mut buf = Vec::new();
-                    let _ = conn.set_read_timeout(Some(Duration::from_secs(1)));
-                    let _ = (&mut conn).take(64).read_to_end(&mut buf);
-                    let Some(msg) = parse_instance_msg(&buf) else { continue };
-                    if let Some(id) = msg {
-                        open.0.lock().unwrap().push_back(id);
-                    }
-                    show.0.store(true, Ordering::Relaxed);
-                    if let Some(c) = ctx.get() {
-                        c.request_repaint();
-                    }
-                }
-            });
-            true
+#[cfg(target_os = "macos")]
+fn install_url_handler(show: &ShowSignal, open: &OpenRequests, ctx: &Arc<OnceLock<egui::Context>>) {
+    let (show, open, ctx) = (show.clone(), open.clone(), ctx.clone());
+    aegiron_agent::url_event::install(move |r| match r {
+        Ok(id) => {
+            tracing::info!("aegiron:// link received (Apple Event): {id}");
+            deliver(&show, &open, &ctx, Request::Open(id));
         }
-        Err(_) => {
-            if let Ok(mut s) = TcpStream::connect_timeout(&([127, 0, 0, 1], INSTANCE_PORT).into(), Duration::from_secs(1)) {
-                let msg = match link {
-                    Some(id) => format!("aegiron-open {id}"),
-                    None => "aegiron-show".to_string(),
-                };
-                let _ = s.write_all(msg.as_bytes());
-                return false;
-            }
-            true // port taken by something else: run anyway
-        }
-    }
+        Err(u) => tracing::warn!("ignoring invalid aegiron:// link (Apple Event): {u:?}"),
+    });
 }
 
 fn init_logging() {
@@ -268,19 +252,4 @@ mod tray {
 mod tray {
     use super::*;
     pub fn create(_: &egui::Context, _: ShowSignal, _: Arc<AtomicBool>) {}
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_instance_msg;
-
-    #[test]
-    fn instance_messages() {
-        assert_eq!(parse_instance_msg(b"aegiron-show"), Some(None));
-        assert_eq!(parse_instance_msg(b"aegiron-open 123456789"), Some(Some("123456789".into())));
-        assert_eq!(parse_instance_msg(b"aegiron-open 123456789\n"), Some(Some("123456789".into())));
-        for bad in [&b"aegiron-open 12345678"[..], b"aegiron-open 123 456 789", b"aegiron-open 123456789x", b"aegiron-open ", b"hello", b"\xff\xfe", b""] {
-            assert_eq!(parse_instance_msg(bad), None);
-        }
-    }
 }

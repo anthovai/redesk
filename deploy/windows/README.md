@@ -45,4 +45,30 @@ Aegiron-Agent-Setup-<version>.exe /S /SERVER=https://aegiron.kgarden.co.th /KEY=
 - **ควบคุมเครื่องได้เฉพาะตอนที่ผู้ใช้ล็อกอินอยู่** agent รันใน session ของผู้ใช้ (จับภาพหน้าจอจาก service ใน session 0 ไม่ได้) จึงยังควบคุมหน้าจอล็อกอินหรือหน้าต่าง UAC ไม่ได้
 - **การแสดงผล:** ใช้ Direct3D 12 (wgpu) ถ้าใช้ไม่ได้จะเปลี่ยนไปใช้ OpenGL เอง
 - **ภาษาไทย:** ใช้ฟอนต์ Leelawadee UI ที่มากับ Windows
-- **Tray:** ปิดหน้าต่างแล้วโปรแกรมยังทำงานอยู่ที่ tray ถ้าจะออกจริงให้คลิกขวาที่ไอคอนแล้วเลือก "ออกจาก Aegiron" ถ้าเปิดโปรแกรมซ้ำจะสลับไปที่หน้าต่างเดิม (ใช้พอร์ต 127.0.0.1:21119 ตรวจว่าเปิดอยู่แล้วหรือไม่)
+- **Tray:** ปิดหน้าต่างแล้วโปรแกรมยังทำงานอยู่ที่ tray ถ้าจะออกจริงให้คลิกขวาที่ไอคอนแล้วเลือก "ออกจาก Aegiron" ถ้าเปิดโปรแกรมซ้ำ (หรือคลิกลิงก์ `aegiron://`) จะส่งต่อไปที่หน้าต่างเดิมผ่าน named pipe ของผู้ใช้คนนั้น (`\\.\pipe\aegiron-…`, ไม่รับการเชื่อมต่อจากเครื่องอื่น)
+
+## เซ็นโค้ด (Authenticode)
+
+`build-installer.sh` เซ็นให้ได้ด้วย [osslsigncode](https://github.com/mtrojnar/osslsigncode) (`brew install osslsigncode`) โดยเซ็น `aegiron.exe` และ `aegiron-agent.exe` ก่อนแพ็ก, เซ็น `uninstall.exe` ระหว่างที่ NSIS สร้าง (`!uninstfinalize`) แล้วเซ็นตัวติดตั้งเป็นขั้นสุดท้าย และตรวจด้วย `osslsigncode verify`
+
+```sh
+# PKCS#12 (.p12/.pfx ที่มี certificate chain + private key)
+AEGIRON_WIN_SIGN_PKCS12=org-codesign.p12 AEGIRON_WIN_SIGN_PASS_FILE=~/.secrets/p12-pass deploy/windows/build-installer.sh
+
+# หรือ certificate + key แยกไฟล์ (PEM/DER/SPC)
+AEGIRON_WIN_SIGN_CERT=org.crt AEGIRON_WIN_SIGN_KEY=org.key deploy/windows/build-installer.sh
+```
+
+| ตัวแปร | ความหมาย |
+|---|---|
+| `AEGIRON_WIN_SIGN_PKCS12` | ไฟล์ PKCS#12 (ใช้อย่างใดอย่างหนึ่งกับ CERT+KEY) |
+| `AEGIRON_WIN_SIGN_CERT`, `AEGIRON_WIN_SIGN_KEY` | certificate และ private key |
+| `AEGIRON_WIN_SIGN_PASS_FILE` | ไฟล์ที่มีรหัสผ่านของ key (แนะนำ) |
+| `AEGIRON_WIN_SIGN_PASS` | รหัสผ่านโดยตรง — สคริปต์เขียนลงไฟล์ชั่วคราวสิทธิ์ 600 ไม่ส่งผ่าน command line |
+| `AEGIRON_WIN_SIGN_TIMESTAMP` | RFC 3161 timestamp server (ค่าเริ่มต้น `http://timestamp.digicert.com`) ตั้ง `none` เพื่อไม่ใส่ timestamp — ลายเซ็นจะหมดอายุพร้อมใบรับรอง |
+| `AEGIRON_WIN_SIGN_CAFILE` | CA bundle สำหรับขั้นตรวจ (เช่นใบรับรองจาก CA ภายในองค์กร) |
+
+สคริปต์ตรวจค่าทั้งหมดก่อนเริ่ม build: ไม่มี osslsigncode, ไฟล์อ่านไม่ได้, ตั้งทั้ง PKCS#12 และ CERT/KEY, ตั้งรหัสผ่านสองแบบ หรือ URL timestamp ผิดรูปแบบ จะหยุดพร้อมข้อความ ถ้าเซ็นไม่สำเร็จ (เช่นรหัสผ่านผิด) จะแสดงข้อความของ osslsigncode แล้วหยุด ไม่ตั้งตัวแปรเหล่านี้ = build แบบไม่เซ็นเหมือนเดิม
+
+ใบรับรองแบบ OV ทั่วไปยังทำให้ SmartScreen เตือนจนกว่าไฟล์จะมีประวัติการดาวน์โหลดพอ ใบรับรอง EV หรือ key ที่อยู่ใน HSM/token ต้องใช้ PKCS#11 ของ osslsigncode ซึ่งสคริปต์นี้ยังไม่รองรับ
+

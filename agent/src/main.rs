@@ -52,6 +52,9 @@ enum Cmd {
         /// Allow plain http:// to a non-loopback host (not recommended)
         #[arg(long)]
         insecure: bool,
+        /// With 2FA: remember this device for 30 days, so later sign-ins need only the password
+        #[arg(long)]
+        remember_device: bool,
     },
     /// Connect to the server and wait for sessions (default).
     Run,
@@ -136,8 +139,8 @@ async fn main() -> Result<()> {
             c.save(&path)?;
             println!("Initialised {}\n  ID: {}\n  Device key fingerprint: {}", path.display(), c.id, fingerprint(identity(&c)?.verifying_key().as_bytes()));
         }
-        Cmd::Login { server, email, insecure } => {
-            let existing = Config::load(&path).ok();
+        Cmd::Login { server, email, insecure, remember_device } => {
+            let mut existing = Config::load(&path).ok();
             let server = match (&existing, server) {
                 (Some(c), _) => c.server_url.clone(),
                 (None, Some(s)) => s.trim_end_matches('/').to_string(),
@@ -149,16 +152,36 @@ async fn main() -> Result<()> {
                 Ok(p) if !p.is_empty() => p,
                 _ => rpassword::prompt_password(format!("Password for {email}: "))?,
             };
-            let mut totp = String::new();
+            use aegiron_agent::account::{Login, LoginRequest};
+            let mut req = LoginRequest {
+                email: email.clone(),
+                password,
+                trust_token: existing.as_ref().and_then(|c| c.trust_token(&server, &email)),
+                remember: remember_device,
+                ..Default::default()
+            };
             let session = loop {
-                match aegiron_agent::account::login(&server, insecure, &email, &password, &totp)? {
-                    aegiron_agent::account::Login::Ok(s) => break s,
-                    aegiron_agent::account::Login::NeedTotp if totp.is_empty() => totp = rpassword::prompt_password("2FA code: ")?,
-                    aegiron_agent::account::Login::NeedTotp => bail!("invalid authentication code"),
+                match aegiron_agent::account::login(&server, insecure, &req)? {
+                    Login::Ok(s) => break s,
+                    Login::NeedTotp { trust_rejected: r } if req.totp.is_empty() => {
+                        req.trust_token = None;
+                        // Expired or revoked on the server: forget it now, even if this sign-in fails.
+                        if let (true, Some(c)) = (r, existing.as_mut()) {
+                            c.set_trust_token(&server, &email, None);
+                            c.save(&path)?;
+                        }
+                        // AEGIRON_LOGIN_TOTP: the current code, for scripted sign-in.
+                        req.totp = match std::env::var("AEGIRON_LOGIN_TOTP") {
+                            Ok(t) if !t.is_empty() => t,
+                            _ => rpassword::prompt_password("2FA code: ")?,
+                        };
+                    }
+                    Login::NeedTotp { .. } => bail!("invalid authentication code"),
                 }
             };
             let account = aegiron_agent::config::Account { email: session.user.email.clone(), name: session.user.name.clone(), token: session.token };
-            let c = match existing {
+            let trust = session.trust_token.clone();
+            let mut c = match existing {
                 Some(mut c) => {
                     if c.server_key != session.server_key {
                         bail!("server key differs from the one this device trusts; not signing in");
@@ -167,16 +190,20 @@ async fn main() -> Result<()> {
                     c
                 }
                 None => {
-                    let mut c = Config::new(server, session.server_key)?;
+                    let mut c = Config::new(server.clone(), session.server_key)?;
                     c.enroll_token = Some(session.enroll_token);
                     c.allow_insecure_transport = insecure;
                     c.account = Some(account);
                     c
                 }
             };
+            if let Some(t) = trust {
+                c.set_trust_token(&server, &session.user.email, Some(t));
+            }
             c.ws_base()?;
             c.save(&path)?;
-            println!("Signed in as {} — device ID {}", session.user.email, c.id);
+            let how = if req.totp.is_empty() && req.trust_token.is_some() { " (2FA skipped: remembered device)" } else { "" };
+            println!("Signed in as {} — device ID {}{how}", session.user.email, c.id);
         }
         Cmd::SetPassword => {
             let mut c = Config::load(&path)?;

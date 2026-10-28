@@ -1,7 +1,8 @@
 <script lang="ts">
 	import QRCode from 'qrcode';
 	import { goto } from '$app/navigation';
-	import { api } from '#lib/api.js';
+	import { api, type TrustedDevice } from '#lib/api.js';
+	import { ago, dateTime } from '#lib/format.js';
 	import { auth, loadMe, logout } from '#lib/session.svelte.js';
 
 	let pw = $state({ current: '', new: '', repeat: '' });
@@ -12,13 +13,50 @@
 	let disablePw = $state('');
 	let totpMsg = $state<[string, boolean] | null>(null);
 
+	let trusted = $state<TrustedDevice[]>([]);
+	let trustMsg = $state<[string, boolean] | null>(null);
+
+	async function loadTrusted() {
+		try {
+			trusted = (await api.get<{ devices: TrustedDevice[] }>('/api/auth/trusted-devices')).devices;
+		} catch (e) {
+			trustMsg = [(e as Error).message, false];
+		}
+	}
+	$effect(() => {
+		loadTrusted();
+	});
+
+	async function revokeTrusted(d: TrustedDevice) {
+		if (!confirm(`เลิกจดจำ "${d.label}"? ครั้งต่อไปอุปกรณ์นี้ต้องใส่รหัส 2FA`)) return;
+		try {
+			await api.del(`/api/auth/trusted-devices/${d.id}`);
+			trustMsg = ['เลิกจดจำอุปกรณ์แล้ว', true];
+		} catch (e) {
+			trustMsg = [(e as Error).message, false];
+		}
+		await loadTrusted();
+	}
+
+	async function revokeAllTrusted() {
+		if (!confirm('เลิกจดจำทุกอุปกรณ์? ทุกเครื่องต้องใส่รหัส 2FA ในการเข้าสู่ระบบครั้งต่อไป')) return;
+		try {
+			await api.del('/api/auth/trusted-devices');
+			trustMsg = ['เลิกจดจำทุกอุปกรณ์แล้ว', true];
+		} catch (e) {
+			trustMsg = [(e as Error).message, false];
+		}
+		await loadTrusted();
+	}
+
 	async function changePassword(ev: SubmitEvent) {
 		ev.preventDefault();
 		if (pw.new !== pw.repeat) return (pwMsg = ['รหัสผ่านใหม่ไม่ตรงกัน', false]);
 		try {
 			await api.post('/api/auth/password', { current: pw.current, new: pw.new });
 			pw = { current: '', new: '', repeat: '' };
-			pwMsg = ['เปลี่ยนรหัสผ่านแล้ว', true];
+			pwMsg = ['เปลี่ยนรหัสผ่านแล้ว อุปกรณ์ที่จดจำไว้ต้องใส่รหัส 2FA ใหม่', true];
+			await loadTrusted();
 		} catch (e) {
 			pwMsg = [(e as Error).message, false];
 		}
@@ -49,6 +87,7 @@
 			disablePw = '';
 			totpMsg = ['ปิด 2FA แล้ว', true];
 			await loadMe();
+			await loadTrusted();
 		} catch (e) {
 			totpMsg = [(e as Error).message, false];
 		}
@@ -97,6 +136,45 @@
 			<button class="btn btn-primary" onclick={startTotp}>ตั้งค่า 2FA</button>
 		{/if}
 		{#if totpMsg}<p class="text-sm {totpMsg[1] ? 'text-ok' : 'text-danger'}">{totpMsg[0]}</p>{/if}
+	</section>
+
+	<section class="card space-y-4 p-6 lg:col-span-2">
+		<div class="flex flex-wrap items-start justify-between gap-3">
+			<div>
+				<h2 class="font-semibold">อุปกรณ์ที่จดจำไว้</h2>
+				<p class="mt-1 text-sm text-muted">
+					เบราว์เซอร์และแอปที่เลือก "จดจำอุปกรณ์นี้ 30 วัน" ตอนใส่รหัส 2FA ยังต้องใส่รหัสผ่านทุกครั้ง แต่ไม่ต้องใส่รหัส 2FA
+					การเปลี่ยนรหัสผ่านหรือปิด 2FA จะเลิกจดจำทุกอุปกรณ์
+				</p>
+			</div>
+			{#if trusted.length > 0}<button class="btn btn-danger shrink-0" onclick={revokeAllTrusted}>เลิกจดจำทั้งหมด</button>{/if}
+		</div>
+		{#if trusted.length === 0}
+			<p class="text-sm text-muted">ยังไม่มีอุปกรณ์ที่จดจำไว้</p>
+		{:else}
+			<div class="overflow-x-auto">
+				<table class="table">
+					<thead><tr><th>อุปกรณ์</th><th>ใช้ล่าสุด</th><th>จดจำเมื่อ</th><th>หมดอายุ</th><th></th></tr></thead>
+					<tbody>
+						{#each trusted as d (d.id)}
+							<tr>
+								<td>
+									<p class="font-medium">
+										{d.label || 'ไม่ทราบชื่อ'}{#if d.current}<span class="ml-2 text-xs text-ok">เบราว์เซอร์นี้</span>{/if}
+									</p>
+									<p class="text-xs text-muted" title={d.user_agent}>IP {d.last_ip || d.ip || '—'}</p>
+								</td>
+								<td class="text-muted">{ago(d.last_used_at)}</td>
+								<td class="text-muted">{dateTime(d.created_at)}</td>
+								<td class="text-muted">{dateTime(d.expires_at)}</td>
+								<td class="text-right"><button class="btn" onclick={() => revokeTrusted(d)}>เลิกจดจำ</button></td>
+							</tr>
+						{/each}
+					</tbody>
+				</table>
+			</div>
+		{/if}
+		{#if trustMsg}<p class="text-sm {trustMsg[1] ? 'text-ok' : 'text-danger'}">{trustMsg[0]}</p>{/if}
 	</section>
 </div>
 

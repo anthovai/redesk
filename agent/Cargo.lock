@@ -48,6 +48,7 @@ dependencies = [
  "hostname",
  "image",
  "netdev",
+ "objc2 0.6.5",
  "openh264",
  "quinn",
  "rcgen",

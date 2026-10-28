@@ -40,6 +40,12 @@ Unicode true
 !define LEGACY_URL_KEY "Software\Classes\redesk"
 !define LEGACY_UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\ReDesk"
 
+; Authenticode: build-installer.sh passes its signing helper, which signs the uninstaller as
+; makensis writes it (NSIS 3.08+). The installer itself is signed after makensis.
+!ifdef SIGN_CMD
+  !uninstfinalize '"${SIGN_CMD}" "%1"' = 0
+!endif
+
 Name "Aegiron"
 OutFile "${OUTFILE}"
 InstallDir "$LOCALAPPDATA\Programs\Aegiron"

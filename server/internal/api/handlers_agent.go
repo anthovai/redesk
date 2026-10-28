@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"net/http"
 	"net/url"
 	"strings"
@@ -15,65 +16,125 @@ import (
 
 const agentSessionLifetime = 30 * 24 * time.Hour
 
-// checkCredentials verifies email, password and (if enabled) the TOTP code, writing the
-// error response itself. A missing TOTP code answers {"need_totp": true}.
-func (a *API) checkCredentials(w http.ResponseWriter, r *http.Request, email, password, code string) (*store.User, bool) {
+// credentials is what both sign-in endpoints accept besides their own fields.
+type credentials struct {
+	Email    string
+	Password string
+	TOTP     string
+	// TrustToken is a "remember this device" token from an earlier sign-in (web: cookie,
+	// app: request body). It replaces the TOTP code only; the password is always checked.
+	TrustToken string
+}
+
+// loginResult says how the second factor was satisfied.
+type loginResult struct {
+	user *store.User
+	// trusted is set when a remembered device skipped the TOTP step.
+	trusted *store.TrustedDevice
+	// totpVerified is true when a correct TOTP code was entered in this request, which is
+	// the only time a new device may be remembered.
+	totpVerified bool
+}
+
+// checkCredentials verifies email, password and (if enabled) the TOTP code or a trusted
+// device token, writing the error response itself. A missing TOTP code answers
+// {"need_totp": true} (plus "trust_rejected": true when a token was offered but is no longer
+// valid, so the client can forget it).
+func (a *API) checkCredentials(w http.ResponseWriter, r *http.Request, c credentials) (*loginResult, bool) {
 	ip := a.clientIP(r)
-	email = store.NormalizeEmail(email)
+	email := store.NormalizeEmail(c.Email)
 	if !a.limiter.allow("ip:"+ip, 20, 10*time.Minute) || !a.limiter.allow("email:"+email, 10, 10*time.Minute) {
 		writeErr(w, http.StatusTooManyRequests, "too many attempts, try again later")
 		return nil, false
 	}
 	u, err := a.store.GetUserByEmail(r.Context(), email)
 	if err != nil {
-		auth.VerifyDummy(password)
+		auth.VerifyDummy(c.Password)
 		_ = a.store.AddAudit(r.Context(), nil, ip, "auth.login_failed", email, map[string]any{"reason": "bad_credentials"})
 		writeErr(w, http.StatusUnauthorized, "invalid email or password")
 		return nil, false
 	}
-	if !auth.VerifyPassword(u.PasswordHash, password) || u.Disabled {
+	if !auth.VerifyPassword(u.PasswordHash, c.Password) || u.Disabled {
 		_ = a.store.AddAudit(r.Context(), &u.ID, ip, "auth.login_failed", email, map[string]any{"reason": "bad_credentials"})
 		writeErr(w, http.StatusUnauthorized, "invalid email or password")
 		return nil, false
 	}
-	if u.TOTPEnabled {
-		if code == "" {
-			writeJSON(w, http.StatusOK, map[string]any{"need_totp": true})
-			return nil, false
-		}
-		if u.TOTPSecret == nil || !totp.Validate(code, *u.TOTPSecret) {
-			_ = a.store.AddAudit(r.Context(), &u.ID, ip, "auth.login_failed", email, map[string]any{"reason": "bad_totp"})
-			writeErr(w, http.StatusUnauthorized, "invalid authentication code")
-			return nil, false
-		}
+	res := &loginResult{user: u}
+	if !u.TOTPEnabled {
+		return res, true
 	}
-	return u, true
+	if c.TOTP == "" {
+		if c.TrustToken != "" && len(c.TrustToken) <= 128 {
+			d, err := a.store.UseTrustedDevice(r.Context(), auth.HashToken(c.TrustToken), u.ID, ip)
+			if err == nil {
+				res.trusted = d
+				return res, true
+			}
+			if !errors.Is(err, store.ErrNotFound) {
+				a.internal(w, err)
+				return nil, false
+			}
+			_ = a.store.AddAudit(r.Context(), &u.ID, ip, "auth.trusted_device_rejected", email, nil)
+			// Expired or revoked: the browser should stop sending it (the app ignores cookies
+			// and forgets its copy on trust_rejected).
+			http.SetCookie(w, a.trustCookieFor("", time.Now().Add(-time.Hour)))
+			writeJSON(w, http.StatusOK, map[string]any{"need_totp": true, "trust_rejected": true})
+			return nil, false
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"need_totp": true})
+		return nil, false
+	}
+	if u.TOTPSecret == nil || !totp.Validate(c.TOTP, *u.TOTPSecret) {
+		_ = a.store.AddAudit(r.Context(), &u.ID, ip, "auth.login_failed", email, map[string]any{"reason": "bad_totp"})
+		writeErr(w, http.StatusUnauthorized, "invalid authentication code")
+		return nil, false
+	}
+	res.totpVerified = true
+	return res, true
 }
 
 // agentLogin: POST /api/agent/login — sign-in from the desktop app.
 // Returns a bearer token for the app, the server's identity key (trusted because this
 // request arrived over the server's TLS) and a one-time enrollment token that makes the
-// new device belong to this user.
+// new device belong to this user. With remember_device after a correct TOTP code it also
+// returns trust_token, which the app sends back as trust_token instead of a code next time.
 func (a *API) agentLogin(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Email    string `json:"email"`
-		Password string `json:"password"`
-		TOTP     string `json:"totp"`
-		Device   string `json:"device"`
+		Email          string `json:"email"`
+		Password       string `json:"password"`
+		TOTP           string `json:"totp"`
+		Device         string `json:"device"`
+		TrustToken     string `json:"trust_token"`
+		RememberDevice bool   `json:"remember_device"`
 	}
 	if !readJSON(w, r, &req) {
 		return
 	}
-	u, ok := a.checkCredentials(w, r, req.Email, req.Password, req.TOTP)
+	res, ok := a.checkCredentials(w, r, credentials{Email: req.Email, Password: req.Password, TOTP: req.TOTP, TrustToken: req.TrustToken})
 	if !ok {
 		return
 	}
-	a.issueAppSession(w, r, u, req.Device, nil)
+	device := trim(req.Device, 80)
+	audit := map[string]any{}
+	reply := map[string]any{}
+	if res.trusted != nil {
+		audit["trusted_device"] = res.trusted.ID
+	} else if req.RememberDevice && res.totpVerified {
+		tok, d, err := a.rememberDevice(r, res.user, "แอป Aegiron: "+device, "Aegiron app: "+device)
+		if err != nil {
+			a.internal(w, err)
+			return
+		}
+		audit["trusted_device_added"] = d.ID
+		reply["trust_token"] = tok
+	}
+	a.issueAppSession(w, r, res.user, device, audit, reply)
 }
 
 // issueAppSession answers a successful desktop-app sign-in (password or OIDC) with
 // {user, token, server_key, enroll_token}. extra is merged into the audit detail.
-func (a *API) issueAppSession(w http.ResponseWriter, r *http.Request, u *store.User, device string, extra map[string]any) {
+// reply is merged into the JSON answer.
+func (a *API) issueAppSession(w http.ResponseWriter, r *http.Request, u *store.User, device string, extra, reply map[string]any) {
 	ip := a.clientIP(r)
 	device = trim(device, 80)
 	tok := auth.RandomToken(32)
@@ -94,12 +155,16 @@ func (a *API) issueAppSession(w http.ResponseWriter, r *http.Request, u *store.U
 		detail[k] = v
 	}
 	_ = a.store.AddAudit(r.Context(), &u.ID, ip, "auth.agent_login", u.Email, detail)
-	writeJSON(w, http.StatusOK, map[string]any{
+	out := map[string]any{
 		"user":         u,
 		"token":        tok,
 		"server_key":   auth.PublicKeyB64(a.key),
 		"enroll_token": enroll,
-	})
+	}
+	for k, v := range reply {
+		out[k] = v
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // --- handoff: open the web console from the app without signing in again ---

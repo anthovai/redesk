@@ -11,6 +11,20 @@ export interface User {
 	last_login_at: string | null;
 }
 
+/** A browser or app remembered on the 2FA step (skips the TOTP code, never the password). */
+export interface TrustedDevice {
+	id: number;
+	label: string;
+	user_agent: string;
+	ip: string;
+	last_ip: string;
+	created_at: string;
+	last_used_at: string | null;
+	expires_at: string;
+	/** This browser. */
+	current: boolean;
+}
+
 export interface Device {
 	id: string;
 	public_key: string | null; // base64

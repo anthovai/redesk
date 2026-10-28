@@ -8,6 +8,7 @@
 	let password = $state('');
 	let totp = $state('');
 	let needTotp = $state(false);
+	let remember = $state(false);
 	let busy = $state(false);
 	let error = $state('');
 	let sso = $state<ServerInfo['oidc'] | null>(null);
@@ -47,7 +48,12 @@
 		busy = true;
 		error = '';
 		try {
-			const r = await api.post<{ user?: User; need_totp?: boolean }>('/api/auth/login', { email, password, totp });
+			const r = await api.post<{ user?: User; need_totp?: boolean }>('/api/auth/login', {
+				email,
+				password,
+				totp,
+				remember_device: needTotp && remember
+			});
 			if (r.need_totp) {
 				needTotp = true;
 			} else if (r.user) {
@@ -96,6 +102,13 @@
 					/>
 					<p class="mt-2 text-xs text-muted">เปิดแอป Authenticator แล้วใส่รหัสของ Aegiron</p>
 				</div>
+				<label class="flex items-start gap-2 text-sm">
+					<input type="checkbox" class="mt-0.5" bind:checked={remember} />
+					<span>
+						จดจำอุปกรณ์นี้ 30 วัน
+						<span class="block text-xs text-muted">ครั้งต่อไปใส่แค่รหัสผ่าน ไม่ต้องใส่รหัส 2FA — อย่าเลือกบนเครื่องที่ใช้ร่วมกับผู้อื่น</span>
+					</span>
+				</label>
 			{/if}
 			{#if error || ssoError}
 				<p class="rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">{error || ssoError}</p>

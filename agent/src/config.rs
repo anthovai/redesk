@@ -37,6 +37,16 @@ pub struct Account {
     pub token: String,
 }
 
+/// "Remember this device for 30 days" from a 2FA sign-in: lets this account skip the TOTP
+/// code (never the password) on this server until the server-side expiry or revocation.
+/// Stays after signing out, like a browser's trusted-device cookie.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustedLogin {
+    pub server: String,
+    pub email: String,
+    pub token: String,
+}
+
 /// Transport policy for talking to the server: https, or plain http only to this machine
 /// (or when explicitly allowed). Never falls back silently.
 pub fn check_server_url(url: &str, allow_insecure: bool) -> Result<()> {
@@ -108,6 +118,10 @@ pub struct Config {
     /// Outbound proxy for every connection to the server (signaling, relay, HTTPS API).
     #[serde(default)]
     pub proxy: Option<crate::net::ProxyConfig>,
+    /// Trusted-device tokens for 2FA sign-in, one per (server, email). Secrets: this file is
+    /// owner-only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_logins: Vec<TrustedLogin>,
 }
 
 fn yes() -> bool {
@@ -148,6 +162,7 @@ impl Config {
             direct_enabled: true,
             direct_port: crate::direct::DEFAULT_PORT,
             proxy: None,
+            trusted_logins: Vec::new(),
         })
     }
 
@@ -181,6 +196,21 @@ impl Config {
         Ok(())
     }
 
+    /// The trusted-device token for this account on this server, if any.
+    pub fn trust_token(&self, server: &str, email: &str) -> Option<String> {
+        let (server, email) = trust_key(server, email);
+        self.trusted_logins.iter().find(|t| t.server == server && t.email == email).map(|t| t.token.clone())
+    }
+
+    /// Stores (Some) or forgets (None) the trusted-device token for this account.
+    pub fn set_trust_token(&mut self, server: &str, email: &str, token: Option<String>) {
+        let (server, email) = trust_key(server, email);
+        self.trusted_logins.retain(|t| !(t.server == server && t.email == email));
+        if let Some(token) = token {
+            self.trusted_logins.push(TrustedLogin { server, email, token });
+        }
+    }
+
     /// Where the running agent publishes its current temporary password (owner-only).
     pub fn temp_password_path(config_path: &Path) -> PathBuf {
         config_path.with_file_name("temp_password")
@@ -205,6 +235,10 @@ impl Config {
     }
 }
 
+fn trust_key(server: &str, email: &str) -> (String, String) {
+    (server.trim().trim_end_matches('/').to_ascii_lowercase(), email.trim().to_lowercase())
+}
+
 /// Moves the settings folder of a pre-rename (ReDesk) install to the Aegiron folder once, so
 /// the device keeps its ID, key, sign-in and history. Does nothing when the new folder exists.
 pub fn migrate_legacy_dir(old: &Path, new: &Path) {
@@ -219,6 +253,22 @@ pub fn migrate_legacy_dir(old: &Path, new: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trust_tokens_per_account() {
+        let mut c = Config::new("https://a.example".into(), B64.encode([7u8; 32])).unwrap();
+        c.set_trust_token("https://A.example/", " Me@Example.com", Some("t1".into()));
+        c.set_trust_token("https://a.example", "other@example.com", Some("t2".into()));
+        assert_eq!(c.trust_token("https://a.example", "me@example.com").as_deref(), Some("t1"));
+        assert_eq!(c.trust_token("https://b.example", "me@example.com"), None);
+        c.set_trust_token("https://a.example", "me@example.com", Some("t3".into()));
+        assert_eq!(c.trusted_logins.len(), 2);
+        let back: Config = toml::from_str(&toml::to_string_pretty(&c).unwrap()).unwrap();
+        assert_eq!(back.trust_token("https://a.example", "ME@example.com").as_deref(), Some("t3"));
+        c.set_trust_token("https://a.example", "me@example.com", None);
+        assert_eq!(c.trust_token("https://a.example", "me@example.com"), None);
+        assert_eq!(c.trust_token("https://a.example", "other@example.com").as_deref(), Some("t2"));
+    }
 
     #[test]
     fn legacy_folder_moves_once() {

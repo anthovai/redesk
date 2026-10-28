@@ -69,6 +69,8 @@ sudo ./install.sh --domain aegiron.kgarden.co.th --email it@kgarden.co.th --serv
 | Accessibility | ใช่ | ให้ผู้ควบคุมใช้เมาส์และคีย์บอร์ด |
 | Input Monitoring | ไม่บังคับ | ปุ่มลัดของระบบระหว่างควบคุม |
 
+ลิงก์ `aegiron://connect/<ID>` (เช่นปุ่ม "เปิดในแอป" ของเว็บคอนโซล หรือ `open aegiron://connect/123456789`) เปิดหน้าต่างเชื่อมต่อในแอปที่รันอยู่แล้ว หรือเปิดแอปให้ถ้ายังไม่ได้เปิด แอปจะถามก่อนเชื่อมต่อทุกครั้ง เปิด Aegiron ซ้ำจะสลับไปที่หน้าต่างเดิม (คุยกันผ่าน Unix socket ในโฟลเดอร์ตั้งค่าของผู้ใช้ ไม่ใช้พอร์ตเครือข่าย)
+
 ระหว่างที่มีผู้ควบคุม Aegiron จะกันเครื่องและหน้าจอไม่ให้หลับ (IOPMAssertion) และปล่อยทันทีเมื่อเซสชันจบ ในแอปยังมี `aegiron-agent` (CLI) อยู่ที่ `/Applications/Aegiron.app/Contents/MacOS/aegiron-agent` สำหรับสคริปต์ติดตั้ง
 
 สร้างเฉพาะแอปและ dmg ได้ด้วย `deploy/macos/build-app.sh` (`build-kit.sh` เรียกให้เองและใส่ dmg ไว้ใน `dist/` พร้อม SHA256SUMS)
@@ -95,6 +97,45 @@ xcrun stapler staple dist/Aegiron-<version>.dmg
 ```
 
 หมายเหตุ: Screen Recording ให้ล่วงหน้าผ่าน PPPC ไม่ได้ (MDM อนุญาตได้แค่ให้ผู้ใช้ที่ไม่ใช่ admin เปิดเองได้) ส่วน Accessibility ให้ผ่าน PPPC ได้ bundle ID คือ `co.aegiron.app`
+
+### เซ็น Developer ID, notarize และสร้าง PPPC profile ด้วยสคริปต์
+
+`build-app.sh` ทำให้ครบในคำสั่งเดียว ต้องมีใบรับรอง **Developer ID Application** ใน keychain ของเครื่องที่ build และ Xcode 13+ (หรือ Command Line Tools)
+
+```sh
+# ครั้งเดียว: เก็บ credential สำหรับ notarytool ไว้ใน keychain (ใช้ app-specific password หรือ App Store Connect API key)
+xcrun notarytool store-credentials aegiron-notary --apple-id it@example.com --team-id ABCDE12345
+
+AEGIRON_SIGN_ID="Developer ID Application: Example Co., Ltd. (ABCDE12345)" \
+AEGIRON_NOTARY_PROFILE=aegiron-notary \
+deploy/macos/build-app.sh          # หรือ deploy/macos/build-kit.sh ซึ่งเรียก build-app.sh ให้
+```
+
+| ตัวแปร | ความหมาย |
+|---|---|
+| `AEGIRON_SIGN_ID` | ชื่อหรือ SHA-1 ของ identity (`security find-identity -v -p codesigning`) ไม่ตั้ง = ad-hoc เหมือนเดิม |
+| `AEGIRON_NOTARY_PROFILE` | ชื่อ profile ที่สร้างด้วย `notarytool store-credentials` ตั้งแล้วจะ notarize และ staple ทั้งแอปและ dmg |
+| `AEGIRON_NOTARY_KEYCHAIN` | (ไม่บังคับ) keychain ที่เก็บ profile นั้น เช่นบนเครื่อง CI |
+
+ลำดับที่สคริปต์ทำ: เซ็น `aegiron-agent` แล้วเซ็นแอป (hardened runtime + secure timestamp) → zip แอปส่ง `xcrun notarytool submit --wait` → `xcrun stapler staple` แอป → สร้าง dmg จากแอปที่ staple แล้ว → เซ็น dmg → notarize และ staple dmg → ตรวจด้วย `spctl` → เขียน `dist/Aegiron-PPPC.mobileconfig`
+
+สคริปต์ตรวจค่าก่อนเริ่ม build และหยุดพร้อมข้อความชัดเจนเมื่อ: identity ไม่อยู่ใน keychain, ตั้ง `AEGIRON_NOTARY_PROFILE` แต่ยังเซ็นแบบ ad-hoc (notarize ไม่ได้), หา `notarytool`/`stapler` ไม่เจอ, หรือใช้ profile ไม่ได้ (ชื่อผิด/credential หมดอายุ) ถ้า Apple ปฏิเสธ จะแสดง log ของ notarytool แล้วหยุด
+
+**PPPC profile สำหรับ MDM** (`deploy/macos/make-pppc.sh`) — build ด้วย Developer ID จะสร้างให้เอง หรือสร้างแยก:
+
+```sh
+deploy/macos/make-pppc.sh --app dist/Aegiron.app        # อ่าน designated requirement และ Team ID จากแอปที่เซ็นแล้ว
+deploy/macos/make-pppc.sh --team-id ABCDE12345           # จาก Team ID (ใช้ requirement มาตรฐานของ Developer ID)
+deploy/macos/make-pppc.sh                                # template ที่มี __TEAM_ID__ ให้แทนเอง
+```
+
+| บริการ (TCC) | ค่าใน profile | ผล |
+|---|---|---|
+| Accessibility | `Allow` | อนุญาตเมาส์/คีย์บอร์ดทันที ผู้ใช้ไม่ต้องกด |
+| PostEvent | `Allow` | ส่ง input event สังเคราะห์ |
+| ScreenCapture | `AllowStandardUserToSetSystemService` | **ไม่ได้อนุญาตให้เอง** — macOS ไม่ให้ MDM เปิด Screen Recording แทนผู้ใช้ ค่านี้แค่ให้ผู้ใช้ทั่วไป (ไม่ใช่ admin) เปิดสวิตช์เองได้ใน System Settings |
+
+ทุกรายการผูกกับ bundle ID `co.aegiron.app` และ code requirement ที่มี Team ID ขององค์กร แอปที่ถูกแก้หรือเซ็นด้วย identity อื่นจะไม่ได้สิทธิ์ ต้องติดตั้ง profile ผ่าน MDM ที่ผู้ใช้อนุมัติแล้ว (User Approved MDM) หรือ Automated Device Enrollment — การดับเบิลคลิกติดตั้ง profile เองจะไม่มีผลกับ TCC ส่วน Input Monitoring และไมโครโฟนให้ล่วงหน้าผ่าน MDM ไม่ได้เช่นกัน
 
 ## ดูแลระบบ
 

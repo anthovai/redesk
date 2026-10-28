@@ -8,6 +8,7 @@ pub mod crypto;
 pub mod direct;
 pub mod files;
 pub mod input;
+pub mod instance;
 pub mod lan;
 pub mod local;
 pub mod net;
@@ -21,6 +22,8 @@ pub mod signal;
 pub mod status;
 pub mod ui;
 pub mod updater;
+#[cfg(target_os = "macos")]
+pub mod url_event;
 pub mod viewer;
 pub mod whiteboard;
 

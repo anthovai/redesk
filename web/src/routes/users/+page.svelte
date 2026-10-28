@@ -1,12 +1,34 @@
 <script lang="ts">
-	import { api, type User } from '#lib/api.js';
-	import { ago } from '#lib/format.js';
+	import { api, type TrustedDevice, type User } from '#lib/api.js';
+	import { ago, dateTime } from '#lib/format.js';
 	import { auth } from '#lib/session.svelte.js';
 
 	let users = $state<User[]>([]);
 	let error = $state('');
 	let creating = $state<{ email: string; name: string; role: 'admin' | 'user'; password: string } | null>(null);
 	let editing = $state<{ u: User; name: string; role: 'admin' | 'user'; disabled: boolean; password: string } | null>(null);
+	let trusted = $state<TrustedDevice[]>([]);
+
+	async function loadTrusted(u: User) {
+		trusted = [];
+		try {
+			trusted = (await api.get<{ devices: TrustedDevice[] }>(`/api/users/${u.id}/trusted-devices`)).devices;
+		} catch (e) {
+			error = (e as Error).message;
+		}
+	}
+
+	function edit(u: User) {
+		editing = { u, name: u.name, role: u.role, disabled: u.disabled, password: '' };
+		loadTrusted(u);
+	}
+
+	async function revokeTrusted(u: User, d?: TrustedDevice) {
+		const what = d ? `"${d.label}" ของ ${u.email}` : `ทุกอุปกรณ์ของ ${u.email}`;
+		if (!confirm(`เลิกจดจำ${what}? อุปกรณ์จะต้องใส่รหัส 2FA ในการเข้าสู่ระบบครั้งต่อไป`)) return;
+		await run(() => api.del(`/api/users/${u.id}/trusted-devices${d ? `/${d.id}` : ''}`));
+		await loadTrusted(u);
+	}
 
 	async function load() {
 		try {
@@ -87,7 +109,7 @@
 					<td class="text-muted">{ago(u.last_login_at)}</td>
 					<td>{u.disabled ? 'ระงับ' : 'ใช้งาน'}</td>
 					<td class="text-right">
-						<button class="btn" onclick={() => (editing = { u, name: u.name, role: u.role, disabled: u.disabled, password: '' })}>แก้ไข</button>
+						<button class="btn" onclick={() => edit(u)}>แก้ไข</button>
 					</td>
 				</tr>
 			{/each}
@@ -133,6 +155,27 @@
 			<label class="flex items-center gap-2 text-sm">
 				<input type="checkbox" bind:checked={editing.disabled} disabled={editing.u.id === auth.user?.id} /> ระงับบัญชี (ออกจากระบบทุกอุปกรณ์)
 			</label>
+			<div class="space-y-2 border-t border-line pt-4">
+				<div class="flex items-center justify-between gap-2">
+					<p class="text-sm font-medium">อุปกรณ์ที่จดจำไว้ (ข้ามรหัส 2FA)</p>
+					{#if trusted.length > 0}<button type="button" class="btn" onclick={() => revokeTrusted(editing!.u)}>เลิกจดจำทั้งหมด</button>{/if}
+				</div>
+				{#if trusted.length === 0}
+					<p class="text-xs text-muted">ไม่มี</p>
+				{:else}
+					<ul class="space-y-1 text-sm">
+						{#each trusted as d (d.id)}
+							<li class="flex items-center justify-between gap-2">
+								<span class="min-w-0">
+									<span class="block truncate">{d.label || 'ไม่ทราบชื่อ'}</span>
+									<span class="block text-xs text-muted">ใช้ล่าสุด {ago(d.last_used_at)} · หมดอายุ {dateTime(d.expires_at)}</span>
+								</span>
+								<button type="button" class="btn shrink-0" onclick={() => revokeTrusted(editing!.u, d)}>เลิกจดจำ</button>
+							</li>
+						{/each}
+					</ul>
+				{/if}
+			</div>
 			<div class="flex flex-wrap justify-between gap-2 border-t border-line pt-4">
 				<button type="button" class="btn" disabled={!editing.u.totp_enabled} onclick={() => resetTotp(editing!.u)}>รีเซ็ต 2FA</button>
 				<div class="flex gap-2"><button type="button" class="btn" onclick={() => (editing = null)}>ยกเลิก</button><button class="btn btn-primary">บันทึก</button></div>
