@@ -720,12 +720,21 @@ impl App {
                 ("home", HomeTab::Lan)
             }
             "settings-update" => {
-                self.demo_scroll = Some(1450.0);
+                settings_ui::demo_page(settings_ui::Page::About);
                 self.update = UpdateState::Available(Release::demo());
                 ("settings", HomeTab::Recent)
             }
             "settings-pin" => {
-                self.demo_scroll = Some(640.0);
+                settings_ui::demo_page(settings_ui::Page::Security);
+                self.demo_scroll = Some(760.0); // the PIN card, at the bottom
+                ("settings", HomeTab::Recent)
+            }
+            "settings-security" | "settings-network" | "settings-account" => {
+                settings_ui::demo_page(match view {
+                    "settings-security" => settings_ui::Page::Security,
+                    "settings-network" => settings_ui::Page::Network,
+                    _ => settings_ui::Page::Account,
+                });
                 ("settings", HomeTab::Recent)
             }
             v => (v, HomeTab::Recent),
