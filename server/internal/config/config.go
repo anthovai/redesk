@@ -26,6 +26,8 @@ type Config struct {
 	Timezone             string // REDESK_TIMEZONE: sent to remote sessions (default Asia/Bangkok)
 	TeamViewerAPI        string // REDESK_TEAMVIEWER_API: Web API base URL (override for testing)
 	SyncInterval         int    // REDESK_SYNC_MINUTES: vendor API sync period (default 15)
+	// REDESK_PUBLIC_URL: external base URL, e.g. https://redesk.example.com (OIDC redirect URI)
+	PublicURL string
 }
 
 func Load() Config {
@@ -45,6 +47,7 @@ func Load() Config {
 
 		GatewayRecordingPath: os.Getenv("REDESK_GATEWAY_RECORDING_PATH"),
 		TeamViewerAPI:        env("REDESK_TEAMVIEWER_API", "https://webapi.teamviewer.com"),
+		PublicURL:            strings.TrimRight(strings.TrimSpace(os.Getenv("REDESK_PUBLIC_URL")), "/"),
 	}
 	c.SyncInterval, _ = strconv.Atoi(env("REDESK_SYNC_MINUTES", "15"))
 	if c.SyncInterval < 1 {

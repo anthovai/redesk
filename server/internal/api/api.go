@@ -36,10 +36,11 @@ type API struct {
 	limiter  *rateLimiter
 	vault    *vault.Vault
 	handoffs *handoffs
+	oidc     *oidcState
 }
 
 func New(cfg config.Config, s *store.Store, h *hub.Hub, key ed25519.PrivateKey, v *vault.Vault, log *slog.Logger) *API {
-	a := &API{cfg: cfg, store: s, hub: h, key: key, vault: v, log: log, limiter: newRateLimiter(), handoffs: newHandoffs()}
+	a := &API{cfg: cfg, store: s, hub: h, key: key, vault: v, log: log, limiter: newRateLimiter(), handoffs: newHandoffs(), oidc: newOIDCState()}
 	h.ClientIP = a.clientIP
 	h.ViewerUserID = func(r *http.Request) int64 {
 		if u := a.sessionUser(r); u != nil {
@@ -63,6 +64,18 @@ func (a *API) Handler() http.Handler {
 	pub("GET /api/server-info", a.serverInfo)
 	pub("POST /api/auth/login", a.login)
 	pub("POST /api/agent/login", a.agentLogin)
+	pub("GET /api/oidc/login", a.oidcLogin)
+	pub("GET /api/oidc/callback", a.oidcCallback)
+	pub("POST /api/oidc/auth", a.oidcAppStart)
+	pub("GET /api/oidc/auth-query", a.oidcAppQuery)
+	admin("GET /api/oidc/settings", a.getOIDCSettings)
+	admin("PUT /api/oidc/settings", a.putOIDCSettings)
+	pub("GET /api/agent/update", a.agentUpdate)
+	pub("GET /api/agent/releases/{id}/download", a.downloadRelease)
+	admin("GET /api/agent/releases", a.listReleases)
+	admin("POST /api/agent/releases", a.uploadRelease)
+	admin("PATCH /api/agent/releases/{id}", a.updateRelease)
+	admin("DELETE /api/agent/releases/{id}", a.deleteRelease)
 	user("POST /api/auth/handoff", a.createHandoff)
 	pub("GET /api/auth/handoff/{code}", a.useHandoff)
 	user("POST /api/auth/logout", a.logout)

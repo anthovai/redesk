@@ -200,3 +200,70 @@ pub fn start_session(server: &str, token: &str, device_id: &str) -> Result<Sessi
         _ => msg,
     })
 }
+
+// --- single sign-on (OIDC), like RustDesk's /api/oidc/auth + /api/oidc/auth-query ---
+
+/// Starts SSO sign-in. Returns `(code, url)`: open `url` in the browser, then call
+/// [`oidc_poll`] with `code` every ~2 seconds until it returns a session (valid 5 minutes).
+pub fn oidc_start(server: &str, insecure: bool, device: &str) -> Result<(String, String)> {
+    check_server_url(server, insecure)?;
+    let server = server.trim_end_matches('/');
+    #[derive(Deserialize)]
+    struct R {
+        code: String,
+        url: String,
+    }
+    let r: R = call(agent().post(&format!("{server}/api/oidc/auth")).header("X-ReDesk", "1").send_json(&json!({"device": device})))
+        .map_err(|(status, m)| match status {
+            400 => anyhow!("เซิร์ฟเวอร์ยังไม่ได้เปิดการเข้าสู่ระบบด้วย SSO"),
+            404 | 405 => anyhow!("เซิร์ฟเวอร์นี้ยังไม่รองรับการเข้าสู่ระบบด้วย SSO"),
+            _ => anyhow!(m),
+        })?;
+    // Only a page on the same server: never open a URL from elsewhere.
+    let tail = r.url.strip_prefix("/api/oidc/login?app=").unwrap_or("");
+    if r.code.is_empty() || tail.is_empty() || !tail.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        bail!("คำตอบจากเซิร์ฟเวอร์ไม่ถูกต้อง");
+    }
+    Ok((r.code, format!("{server}{}", r.url)))
+}
+
+/// Checks whether the browser part of SSO sign-in finished. `Ok(None)` = still waiting.
+pub fn oidc_poll(server: &str, insecure: bool, code: &str) -> Result<Option<Session>> {
+    check_server_url(server, insecure)?;
+    let server = server.trim_end_matches('/');
+    #[derive(Deserialize)]
+    struct R {
+        #[serde(default)]
+        pending: bool,
+        user: Option<User>,
+        token: Option<String>,
+        server_key: Option<String>,
+        enroll_token: Option<String>,
+    }
+    let r: R = call(agent().get(&format!("{server}/api/oidc/auth-query")).query("code", code).call()).map_err(|(status, m)| match status {
+        404 => anyhow!("คำขอเข้าสู่ระบบหมดอายุ กรุณาลองใหม่"),
+        403 => anyhow!(oidc_reason(&m)),
+        _ => anyhow!(m),
+    })?;
+    if r.pending {
+        return Ok(None);
+    }
+    match (r.user, r.token, r.server_key, r.enroll_token) {
+        (Some(user), Some(token), Some(server_key), Some(enroll_token)) => Ok(Some(Session { user, token, server_key, enroll_token })),
+        _ => bail!("คำตอบจากเซิร์ฟเวอร์ไม่ถูกต้อง"),
+    }
+}
+
+/// Thai text for "sign-in failed: <reason>" from the server.
+fn oidc_reason(msg: &str) -> String {
+    match msg.rsplit(": ").next().unwrap_or("") {
+        "no_account" => "ยังไม่มีบัญชี ReDesk สำหรับอีเมลนี้ กรุณาติดต่อผู้ดูแลระบบ",
+        "domain_not_allowed" => "โดเมนอีเมลนี้ไม่ได้รับอนุญาต",
+        "email_unverified" => "อีเมลของบัญชี SSO ยังไม่ได้รับการยืนยัน",
+        "no_email" => "บัญชี SSO ไม่มีอีเมล",
+        "disabled_account" => "บัญชีนี้ถูกปิดใช้งาน",
+        "idp_error" => "ผู้ให้บริการ SSO ปฏิเสธการเข้าสู่ระบบ",
+        _ => "เข้าสู่ระบบด้วย SSO ไม่สำเร็จ",
+    }
+    .into()
+}

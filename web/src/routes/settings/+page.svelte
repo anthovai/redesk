@@ -1,7 +1,7 @@
 <script lang="ts">
-	import { api, type EnrollToken, type Group, type Integration, type ServerInfo, type Settings } from '#lib/api.js';
+	import { api, type AgentRelease, type EnrollToken, type Group, type Integration, type OIDCSettings, type ServerInfo, type Settings } from '#lib/api.js';
 	import { ago } from '#lib/format.js';
-	import { dateTime, fingerprint } from '#lib/format.js';
+	import { bytes, dateTime, fingerprint } from '#lib/format.js';
 	import Icon from '#lib/Icon.svelte';
 
 	let info = $state<ServerInfo | null>(null);
@@ -17,6 +17,16 @@
 	let tvMsg = $state<[string, boolean] | null>(null);
 	let tvBusy = $state(false);
 	let error = $state('');
+	let oidc = $state<OIDCSettings | null>(null);
+	let oidcRedirect = $state('');
+	let oidcForm = $state({ name: '', issuer: '', client_id: '', client_secret: '', domains: '', auto_create: false, enabled: false });
+	let oidcMsg = $state<[string, boolean] | null>(null);
+	let oidcBusy = $state(false);
+	let releases = $state<AgentRelease[]>([]);
+	let relForm = $state({ version: '', os: 'windows', arch: 'x86_64', notes: '' });
+	let relFile = $state<FileList | null>(null);
+	let relMsg = $state<[string, boolean] | null>(null);
+	let relBusy = $state(false);
 
 	async function load() {
 		try {
@@ -27,6 +37,19 @@
 			groups = (await api.get<{ groups: Group[] }>('/api/groups')).groups;
 			tv = await api.get('/api/integrations/teamviewer');
 			if (tv?.integration) tvForm = { token: '', enabled: tv.integration.enabled, group: tv.integration.group_id ? String(tv.integration.group_id) : '' };
+			const o = await api.get<{ settings: OIDCSettings; redirect_uri: string }>('/api/oidc/settings');
+			oidc = o.settings;
+			oidcRedirect = o.redirect_uri;
+			oidcForm = {
+				name: o.settings.name,
+				issuer: o.settings.issuer,
+				client_id: o.settings.client_id,
+				client_secret: '',
+				domains: (o.settings.allowed_domains ?? []).join(', '),
+				auto_create: o.settings.auto_create,
+				enabled: o.settings.enabled
+			};
+			releases = (await api.get<{ releases: AgentRelease[] }>('/api/agent/releases')).releases;
 		} catch (e) {
 			error = (e as Error).message;
 		}
@@ -100,6 +123,79 @@
 			tvBusy = false;
 		}
 	}
+
+	async function saveOidc(ev: SubmitEvent) {
+		ev.preventDefault();
+		oidcMsg = null;
+		oidcBusy = true;
+		try {
+			await api.put('/api/oidc/settings', {
+				name: oidcForm.name,
+				issuer: oidcForm.issuer,
+				client_id: oidcForm.client_id,
+				client_secret: oidcForm.client_secret ? oidcForm.client_secret : null,
+				allowed_domains: oidcForm.domains
+					.split(/[\s,]+/)
+					.map((d) => d.trim())
+					.filter(Boolean),
+				auto_create: oidcForm.auto_create,
+				enabled: oidcForm.enabled
+			});
+			oidcMsg = ['บันทึกแล้ว', true];
+			await load();
+		} catch (e) {
+			oidcMsg = [(e as Error).message, false];
+		} finally {
+			oidcBusy = false;
+		}
+	}
+
+	async function uploadRelease(ev: SubmitEvent) {
+		ev.preventDefault();
+		const file = relFile?.[0];
+		if (!file) return;
+		relMsg = null;
+		relBusy = true;
+		try {
+			const fd = new FormData();
+			fd.set('version', relForm.version.trim());
+			fd.set('os', relForm.os);
+			fd.set('arch', relForm.arch);
+			fd.set('notes', relForm.notes);
+			fd.set('file', file);
+			await api.upload('/api/agent/releases', fd);
+			relForm = { version: '', os: relForm.os, arch: relForm.arch, notes: '' };
+			relFile = null;
+			(ev.target as HTMLFormElement).reset();
+			relMsg = ['อัปโหลดแล้ว — ตรวจสอบ SHA-256 แล้วกด "เปิดให้ดาวน์โหลด" เมื่อพร้อม', true];
+			await load();
+		} catch (e) {
+			relMsg = [(e as Error).message, false];
+		} finally {
+			relBusy = false;
+		}
+	}
+
+	async function toggleRelease(r: AgentRelease) {
+		try {
+			await api.patch(`/api/agent/releases/${r.id}`, { enabled: !r.enabled });
+			await load();
+		} catch (e) {
+			relMsg = [(e as Error).message, false];
+		}
+	}
+
+	async function deleteRelease(r: AgentRelease) {
+		if (!confirm(`ลบเวอร์ชัน ${r.version} (${r.os}/${r.arch})?`)) return;
+		try {
+			await api.del(`/api/agent/releases/${r.id}`);
+			await load();
+		} catch (e) {
+			relMsg = [(e as Error).message, false];
+		}
+	}
+
+	const osLabel: Record<string, string> = { windows: 'Windows', macos: 'macOS', linux: 'Linux' };
 
 	async function removeTv() {
 		if (!confirm('ยกเลิกการเชื่อม TeamViewer API? (อุปกรณ์ที่ซิงก์มาแล้วจะยังอยู่)')) return;
@@ -243,5 +339,128 @@
 		<p class="border-t border-line pt-3 text-xs text-muted">
 			AnyDesk: REST API สาธารณะของ AnyDesk ยังไม่เปิดข้อมูลอุปกรณ์/เซสชัน ให้ใช้ "นำเข้า CSV" ที่หน้าการเชื่อมต่อแทน
 		</p>
+	</section>
+
+	<section class="card space-y-4 p-6 lg:col-span-2">
+		<div>
+			<h2 class="font-semibold">เข้าสู่ระบบด้วย SSO (OpenID Connect)</h2>
+			<p class="mt-1 text-sm text-muted">
+				ให้ผู้ใช้เข้าสู่ระบบด้วยบัญชีองค์กร เช่น Microsoft 365 (Entra ID), Google Workspace หรือ Keycloak ทั้งในคอนโซลเว็บและโปรแกรม ReDesk
+				โดยลงทะเบียนแอปที่ผู้ให้บริการแล้วใส่ Redirect URI ด้านล่าง
+			</p>
+		</div>
+		{#if oidcRedirect}
+			<div class="flex items-center gap-2 rounded-lg bg-raised p-3 text-sm">
+				<span class="text-muted">Redirect URI</span>
+				<code class="mono flex-1 break-all">{oidcRedirect}</code>
+				<button class="btn shrink-0" onclick={() => copy(oidcRedirect)} title="คัดลอก"><Icon name="copy" /></button>
+			</div>
+		{/if}
+		<form class="grid gap-3 sm:grid-cols-2" onsubmit={saveOidc}>
+			<div>
+				<label class="label" for="oidc-name">ชื่อที่แสดงบนปุ่ม</label>
+				<input id="oidc-name" class="input" placeholder="Microsoft 365" maxlength="64" bind:value={oidcForm.name} />
+			</div>
+			<div>
+				<label class="label" for="oidc-issuer">Issuer URL</label>
+				<input id="oidc-issuer" class="input mono" placeholder="https://login.microsoftonline.com/<tenant-id>/v2.0" bind:value={oidcForm.issuer} />
+			</div>
+			<div>
+				<label class="label" for="oidc-client">Client ID</label>
+				<input id="oidc-client" class="input mono" autocomplete="off" bind:value={oidcForm.client_id} />
+			</div>
+			<div>
+				<label class="label" for="oidc-secret">Client secret</label>
+				<input
+					id="oidc-secret"
+					class="input mono"
+					type="password"
+					autocomplete="off"
+					placeholder={oidc?.has_secret ? 'เก็บไว้แล้ว (เข้ารหัส) — เว้นว่างถ้าไม่เปลี่ยน' : ''}
+					bind:value={oidcForm.client_secret}
+				/>
+			</div>
+			<div class="sm:col-span-2">
+				<label class="label" for="oidc-domains">โดเมนอีเมลที่อนุญาต (ไม่บังคับ)</label>
+				<input id="oidc-domains" class="input mono" placeholder="example.co.th, example.com" bind:value={oidcForm.domains} />
+				<p class="mt-1 text-xs text-muted">เว้นว่าง = รับทุกโดเมนที่ผู้ให้บริการยืนยันแล้ว</p>
+			</div>
+			<label class="flex items-start gap-3 text-sm sm:col-span-2">
+				<input type="checkbox" class="mt-1" bind:checked={oidcForm.auto_create} />
+				<span>
+					<span class="font-medium">สร้างบัญชีให้อัตโนมัติ</span>
+					<span class="block text-muted">ผู้ที่เข้าสู่ระบบครั้งแรกจะได้บัญชีสิทธิ์ "ผู้ใช้" ถ้าปิดไว้ ผู้ดูแลต้องสร้างบัญชีที่อีเมลตรงกันไว้ก่อน</span>
+				</span>
+			</label>
+			<label class="flex items-center gap-2 text-sm sm:col-span-2"><input type="checkbox" bind:checked={oidcForm.enabled} /> เปิดใช้งาน</label>
+			<div class="sm:col-span-2">
+				<button class="btn btn-primary" disabled={oidcBusy}>{oidcBusy ? 'กำลังตรวจสอบ…' : 'บันทึก'}</button>
+			</div>
+		</form>
+		{#if oidcMsg}<p class="text-sm {oidcMsg[1] ? 'text-ok' : 'text-danger'}">{oidcMsg[0]}</p>{/if}
+	</section>
+
+	<section class="card space-y-4 p-6 lg:col-span-2">
+		<div>
+			<h2 class="font-semibold">เวอร์ชันของ agent</h2>
+			<p class="mt-1 text-sm text-muted">
+				อัปโหลดไฟล์ติดตั้งที่ตรวจสอบแล้ว โปรแกรม ReDesk จะแจ้งผู้ใช้เมื่อมีเวอร์ชันใหม่ที่เปิดให้ดาวน์โหลด และตรวจขนาดกับ SHA-256 ก่อนใช้ไฟล์ทุกครั้ง
+				— ไม่มีการติดตั้งอัตโนมัติ
+			</p>
+		</div>
+		<form class="grid gap-3 sm:grid-cols-[1fr_auto_auto]" onsubmit={uploadRelease}>
+			<div>
+				<label class="label" for="rel-version">เวอร์ชัน</label>
+				<input id="rel-version" class="input mono" placeholder="0.4.0" required maxlength="64" bind:value={relForm.version} />
+			</div>
+			<div>
+				<label class="label" for="rel-os">ระบบปฏิบัติการ</label>
+				<select id="rel-os" class="input" bind:value={relForm.os}>
+					<option value="windows">Windows</option>
+					<option value="macos">macOS</option>
+					<option value="linux">Linux</option>
+				</select>
+			</div>
+			<div>
+				<label class="label" for="rel-arch">สถาปัตยกรรม</label>
+				<select id="rel-arch" class="input" bind:value={relForm.arch}>
+					<option value="x86_64">x86_64</option>
+					<option value="aarch64">aarch64 (ARM64)</option>
+					<option value="universal">universal</option>
+				</select>
+			</div>
+			<div class="sm:col-span-3">
+				<label class="label" for="rel-notes">รายละเอียดการเปลี่ยนแปลง</label>
+				<textarea id="rel-notes" class="input" rows="2" maxlength="4000" bind:value={relForm.notes}></textarea>
+			</div>
+			<div class="sm:col-span-2">
+				<label class="label" for="rel-file">ไฟล์ (สูงสุด 300 MB)</label>
+				<input id="rel-file" class="input" type="file" required bind:files={relFile} />
+			</div>
+			<div class="flex items-end">
+				<button class="btn btn-primary" disabled={relBusy || !relFile?.length}>{relBusy ? 'กำลังอัปโหลด…' : 'อัปโหลด'}</button>
+			</div>
+		</form>
+		{#if relMsg}<p class="text-sm {relMsg[1] ? 'text-ok' : 'text-danger'}">{relMsg[0]}</p>{/if}
+		<ul class="divide-y divide-line text-sm">
+			{#each releases as r (r.id)}
+				<li class="flex flex-wrap items-center gap-3 py-3">
+					<div class="min-w-0 flex-1">
+						<p>
+							<span class="font-medium">{r.version}</span>
+							<span class="text-muted">· {osLabel[r.os] ?? r.os} {r.arch} · {bytes(r.size)} · {dateTime(r.created_at)}</span>
+							{#if r.enabled}<span class="ml-1 rounded bg-accent-soft px-1.5 py-0.5 text-xs text-accent">เปิดให้ดาวน์โหลด</span>{/if}
+						</p>
+						<p class="mono text-xs break-all text-muted">{r.filename} · SHA-256 {r.sha256}</p>
+						{#if r.notes}<p class="mt-1 text-xs whitespace-pre-line text-muted">{r.notes}</p>{/if}
+					</div>
+					<a class="btn btn-ghost p-1.5" title="ดาวน์โหลด" href={`/api/agent/releases/${r.id}/download`} data-sveltekit-reload><Icon name="download" /></a>
+					<button class="btn" onclick={() => toggleRelease(r)}>{r.enabled ? 'ปิดการดาวน์โหลด' : 'เปิดให้ดาวน์โหลด'}</button>
+					<button class="btn btn-ghost p-1.5" title="ลบ" onclick={() => deleteRelease(r)}><Icon name="trash" /></button>
+				</li>
+			{:else}
+				<li class="py-2 text-muted">ยังไม่มีเวอร์ชันที่อัปโหลด</li>
+			{/each}
+		</ul>
 	</section>
 </div>
