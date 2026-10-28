@@ -28,7 +28,12 @@ use crate::updater::{self, Release};
 use crate::{fingerprint, format_id, lan, service};
 
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(30);
-const SIDEBAR_WIDTH: f32 = 340.0;
+const SIDEBAR_WIDTH: f32 = 290.0;
+const TABBAR_HEIGHT: f32 = 38.0;
+const CARD_MIN_W: f32 = 190.0;
+const CARD_MAX_W: f32 = 260.0;
+const CARD_H: f32 = 140.0;
+const CARD_HEAD: f32 = 88.0;
 const VIEWER_SIZE: [f32; 2] = [1280.0, 800.0];
 const PIN_MAX_TRIES: u32 = 5;
 const PIN_LOCKOUT: Duration = Duration::from_secs(60);
@@ -230,9 +235,12 @@ enum Icon {
     Back,
     Monitor,
     Shield,
-    Star,
     StarFilled,
     Search,
+    Grid,
+    List,
+    /// Vertical ellipsis (⋮).
+    More,
 }
 
 fn arc(c: Pos2, r: f32, from: f32, to: f32) -> Vec<Pos2> {
@@ -291,7 +299,7 @@ fn paint_icon(ui: &Ui, rect: Rect, icon: Icon, color: Color32) {
             ));
             p.add(Shape::line(vec![at(5.5, 8.0), at(7.4, 9.9), at(10.8, 6.3)], st));
         }
-        Icon::Star | Icon::StarFilled => {
+        Icon::StarFilled => {
             let c = at(8.0, 8.6);
             let pts: Vec<Pos2> = (0..10)
                 .map(|k| {
@@ -300,11 +308,9 @@ fn paint_icon(ui: &Ui, rect: Rect, icon: Icon, color: Color32) {
                     c + vec2(a.cos(), a.sin()) * r
                 })
                 .collect();
-            if matches!(icon, Icon::StarFilled) {
-                // The star is concave: fill it as triangles around the centre.
-                for k in 0..10 {
-                    p.add(Shape::convex_polygon(vec![c, pts[k], pts[(k + 1) % 10]], color, Stroke::NONE));
-                }
+            // The star is concave: fill it as triangles around the centre.
+            for k in 0..10 {
+                p.add(Shape::convex_polygon(vec![c, pts[k], pts[(k + 1) % 10]], color, Stroke::NONE));
             }
             let mut outline = pts.clone();
             outline.push(pts[0]);
@@ -313,6 +319,22 @@ fn paint_icon(ui: &Ui, rect: Rect, icon: Icon, color: Color32) {
         Icon::Search => {
             p.circle_stroke(at(6.8, 6.8), 4.3 * s, st);
             p.line_segment([at(10.0, 10.0), at(14.0, 14.0)], st);
+        }
+        Icon::Grid => {
+            for (x, y) in [(2.0, 2.0), (9.0, 2.0), (2.0, 9.0), (9.0, 9.0)] {
+                p.rect_stroke(Rect::from_min_size(at(x, y), vec2(5.0, 5.0) * s), 1.2 * s, st, egui::StrokeKind::Middle);
+            }
+        }
+        Icon::List => {
+            for y in [3.5, 8.0, 12.5] {
+                p.circle_filled(at(2.5, y), 1.1 * s, color);
+                p.line_segment([at(5.5, y), at(14.0, y)], st);
+            }
+        }
+        Icon::More => {
+            for y in [3.5, 8.0, 12.5] {
+                p.circle_filled(at(8.0, y), 1.4 * s, color);
+            }
         }
     }
 }
@@ -454,17 +476,205 @@ fn verify_pin(hash: &str, pin: &str) -> bool {
     !pin.is_empty() && PasswordHash::new(hash).is_ok_and(|h| Argon2::default().verify_password(pin.as_bytes(), &h).is_ok())
 }
 
-/// Square, frameless star toggle (local favorites).
-fn star_button(ui: &mut Ui, on: bool) -> Response {
+// ---------------------------------------------------------------------------------------------
+// Main-window pieces shaped like RustDesk's desktop home
+
+#[derive(Clone, Copy)]
+enum TabIcon {
+    Logo,
+    Gear,
+}
+
+/// One tab of the strip under the title bar. Returns the tab response and whether its close
+/// button was clicked.
+fn tab_chip(ui: &mut Ui, text: &str, icon: TabIcon, selected: bool, closable: bool) -> (Response, bool) {
     let pal = Palette::of(ui);
-    let (rect, resp) = ui.allocate_exact_size(vec2(32.0, 32.0), Sense::click());
-    if resp.hovered() {
-        ui.painter().rect_filled(rect, 8.0, if ui.visuals().dark_mode { pal.field } else { pal.line });
+    let font = if selected { semi(13.0) } else { FontId::proportional(13.0) };
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font, if selected { pal.fg } else { pal.muted });
+    let w = 14.0 + 16.0 + 8.0 + galley.size().x + if closable { 30.0 } else { 16.0 };
+    let (rect, resp) = ui.allocate_exact_size(vec2(w, TABBAR_HEIGHT - 6.0), Sense::click());
+    let rect = rect.translate(vec2(0.0, 3.0));
+    let corners = CornerRadius { nw: 8, ne: 8, sw: 0, se: 0 };
+    if selected {
+        ui.painter().rect_filled(rect, corners, pal.bg);
+    } else if resp.hovered() {
+        ui.painter().rect_filled(rect.shrink2(vec2(0.0, 3.0)), 6, pal.line.gamma_multiply(0.6));
     }
-    let (icon, color) = if on { (Icon::StarFilled, pal.warn) } else { (Icon::Star, if resp.hovered() { pal.fg } else { pal.muted }) };
-    paint_icon(ui, Rect::from_center_size(rect.center(), vec2(17.0, 17.0)), icon, color);
-    let tip = if on { "เอาออกจากรายการโปรด" } else { "เพิ่มในรายการโปรด" };
+    let ic = Rect::from_center_size(pos2(rect.left() + 22.0, rect.center().y), vec2(16.0, 16.0));
+    match icon {
+        TabIcon::Logo => {
+            let tex = ui.ctx().load_texture(
+                "logo-tab",
+                egui::ColorImage::from_rgba_unmultiplied([64, 64], &icon_rgba(64)),
+                egui::TextureOptions::LINEAR,
+            );
+            ui.painter().image(tex.id(), ic, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+        }
+        TabIcon::Gear => paint_icon(ui, ic, Icon::Gear, if selected { pal.accent } else { pal.muted }),
+    }
+    ui.painter().galley(pos2(ic.right() + 8.0, rect.center().y - galley.size().y / 2.0), galley, pal.fg);
+    let mut closed = false;
+    if closable {
+        let x = Rect::from_center_size(pos2(rect.right() - 16.0, rect.center().y), vec2(18.0, 18.0));
+        let xr = ui.interact(x, resp.id.with("close"), Sense::click());
+        if xr.hovered() {
+            ui.painter().rect_filled(x, 4, pal.line);
+        }
+        let c = x.center();
+        let st = Stroke::new(1.3, if xr.hovered() { pal.fg } else { pal.muted });
+        ui.painter().line_segment([c + vec2(-3.5, -3.5), c + vec2(3.5, 3.5)], st);
+        ui.painter().line_segment([c + vec2(-3.5, 3.5), c + vec2(3.5, -3.5)], st);
+        closed = xr.on_hover_text("ปิดแท็บ").clicked();
+    }
+    (resp.on_hover_cursor(egui::CursorIcon::PointingHand), closed)
+}
+
+/// A labelled value with RustDesk's thin accent bar on its left.
+fn accent_block(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
+    let pal = Palette::of(ui);
+    let r = Frame::new()
+        .inner_margin(Margin { left: 14, right: 0, top: 2, bottom: 2 })
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 2.0;
+            add(ui)
+        })
+        .response
+        .rect;
+    ui.painter().rect_filled(Rect::from_min_size(r.min, vec2(3.0, r.height())), 1.5, pal.accent);
+}
+
+fn small_icon_button(ui: &mut Ui, icon: Icon, tip: &str) -> Response {
+    let pal = Palette::of(ui);
+    let (rect, resp) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::click());
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, 6.0, if ui.visuals().dark_mode { pal.field } else { pal.line });
+    }
+    paint_icon(ui, Rect::from_center_size(rect.center(), vec2(15.0, 15.0)), icon, if resp.hovered() { pal.accent } else { pal.muted });
     resp.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// White card floating on the gray pane.
+fn card_frame(pal: &Palette) -> Frame {
+    Frame::new()
+        .fill(pal.bg)
+        .corner_radius(12)
+        .inner_margin(Margin::symmetric(22, 18))
+        .shadow(egui::Shadow { offset: [0, 1], blur: 8, spread: 0, color: Color32::from_black_alpha(18) })
+}
+
+/// Header colors of device cards, picked from the ID so a device keeps its color.
+const CARD_COLORS: [Color32; 8] = [
+    Color32::from_rgb(0x2f, 0x80, 0xed),
+    Color32::from_rgb(0x9b, 0x51, 0xe0),
+    Color32::from_rgb(0x27, 0xae, 0x60),
+    Color32::from_rgb(0xeb, 0x57, 0x57),
+    Color32::from_rgb(0xf2, 0x99, 0x4a),
+    Color32::from_rgb(0x56, 0xcc, 0xf2),
+    Color32::from_rgb(0x6f, 0x52, 0xed),
+    Color32::from_rgb(0x21, 0x96, 0x8f),
+];
+
+fn card_color(id: &str) -> Color32 {
+    let h = id.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
+    CARD_COLORS[(h % CARD_COLORS.len() as u64) as usize]
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum OsKind {
+    Windows,
+    Mac,
+    Linux,
+    Unknown,
+}
+
+fn os_kind(os: &str) -> OsKind {
+    let os = os.to_ascii_lowercase();
+    if os.contains("win") {
+        OsKind::Windows
+    } else if os.contains("mac") || os.contains("darwin") {
+        OsKind::Mac
+    } else if os.contains("linux") {
+        OsKind::Linux
+    } else {
+        OsKind::Unknown
+    }
+}
+
+/// Plain platform glyphs (not vendor logos): four panes, a laptop, a terminal, a monitor.
+fn paint_os(ui: &Ui, rect: Rect, kind: OsKind, color: Color32) {
+    let p = ui.painter();
+    let s = rect.width() / 16.0;
+    let at = |x: f32, y: f32| rect.min + vec2(x, y) * s;
+    let st = Stroke::new(1.4 * s, color);
+    match kind {
+        OsKind::Windows => {
+            for (x, y) in [(1.5, 2.0), (8.5, 2.0), (1.5, 8.5), (8.5, 8.5)] {
+                p.rect_filled(Rect::from_min_size(at(x, y), vec2(6.0, 5.5) * s), 0.6 * s, color);
+            }
+        }
+        OsKind::Mac => {
+            p.rect_stroke(Rect::from_min_max(at(3.0, 3.0), at(13.0, 10.5)), 1.2 * s, st, egui::StrokeKind::Middle);
+            p.add(Shape::convex_polygon(vec![at(1.0, 12.0), at(15.0, 12.0), at(14.0, 13.6), at(2.0, 13.6)], color, Stroke::NONE));
+        }
+        OsKind::Linux => {
+            p.rect_stroke(Rect::from_min_max(at(1.5, 2.5), at(14.5, 13.5)), 1.5 * s, st, egui::StrokeKind::Middle);
+            p.add(Shape::line(vec![at(4.5, 6.0), at(6.8, 8.0), at(4.5, 10.0)], st));
+            p.line_segment([at(8.0, 10.2), at(11.5, 10.2)], st);
+        }
+        OsKind::Unknown => paint_icon(ui, rect, Icon::Monitor, color),
+    }
+}
+
+/// Single line of text cut with an ellipsis at `max_w`.
+fn one_line(ui: &Ui, text: &str, font: FontId, color: Color32, max_w: f32) -> Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_string(), font, color);
+    job.wrap = egui::text::TextWrapping { max_width: max_w, max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+    ui.painter().layout_job(job)
+}
+
+/// Underlined text tabs (RustDesk's peer tabs). Returns true when the selection changed.
+fn text_tabs<T: PartialEq + Copy>(ui: &mut Ui, value: &mut T, options: &[(T, &str)]) -> bool {
+    let pal = Palette::of(ui);
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 18.0;
+        for (v, text) in options {
+            let selected = *value == *v;
+            let font = if selected { semi(14.5) } else { FontId::proportional(14.5) };
+            let galley = ui.painter().layout_no_wrap(text.to_string(), font, pal.fg);
+            let (rect, resp) = ui.allocate_exact_size(vec2(galley.size().x, 30.0), Sense::click());
+            let color = if selected { pal.accent } else if resp.hovered() { pal.fg } else { pal.muted };
+            ui.painter().galley(pos2(rect.left(), rect.center().y - galley.size().y / 2.0 - 1.0), galley, color);
+            if selected {
+                ui.painter().rect_filled(Rect::from_min_max(pos2(rect.left(), rect.bottom() - 2.5), rect.right_bottom()), 1.0, pal.accent);
+            }
+            if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() && !selected {
+                *value = *v;
+                changed = true;
+            }
+        }
+    });
+    changed
+}
+
+/// Small icon toggle (grid / list view switch).
+fn view_toggle(ui: &mut Ui, icon: Icon, on: bool, tip: &str) -> Response {
+    let pal = Palette::of(ui);
+    let (rect, resp) = ui.allocate_exact_size(vec2(28.0, 28.0), Sense::click());
+    if on || resp.hovered() {
+        ui.painter().rect_filled(rect, 6.0, if on { pal.accent_soft } else { pal.line });
+    }
+    paint_icon(ui, Rect::from_center_size(rect.center(), vec2(15.0, 15.0)), icon, if on { pal.accent } else { pal.muted });
+    resp.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// What the user picked on a device card or row.
+enum PeerAction {
+    Connect(String, String),
+    Star(String),
+    CopyId(String),
+    Forget(String),
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -550,6 +760,9 @@ struct DeviceRow {
     /// Known only for devices in the address book.
     online: Option<bool>,
     tags: Vec<String>,
+    /// "windows x86_64" etc., empty when unknown.
+    os: String,
+    host: String,
 }
 
 /// Results of network calls made on background threads.
@@ -631,6 +844,8 @@ pub struct App {
     viewer_size_seen: Arc<Mutex<Option<[f32; 2]>>>,
     /// Demo screenshots of the lower part of a view.
     demo_scroll: Option<f32>,
+    /// The settings tab stays in the tab strip until closed.
+    settings_tab: bool,
 }
 
 impl App {
@@ -685,6 +900,7 @@ impl App {
             viewer_init: HashMap::new(),
             viewer_size_seen: Arc::default(),
             demo_scroll: None,
+            settings_tab: false,
         };
         if let Some(a) = agent {
             app.attach(&cc.egui_ctx, a);
@@ -1283,29 +1499,44 @@ impl eframe::App for App {
             None => {
                 egui::CentralPanel::default().frame(Frame::new().fill(pal.side)).show(ui, |ui| self.welcome_view(ui));
             }
-            Some(agent) => match self.view {
-                // Settings take the whole window (own navigation and scrolling).
-                View::Settings => {
-                    egui::CentralPanel::default().frame(Frame::new().fill(pal.bg)).show(ui, |ui| self.settings(ui, &agent));
+            Some(agent) => {
+                egui::Panel::top("tabs")
+                    .exact_size(TABBAR_HEIGHT)
+                    .resizable(false)
+                    .show_separator_line(false)
+                    .frame(Frame::new().fill(pal.side).inner_margin(Margin { left: 8, right: 10, top: 0, bottom: 0 }))
+                    .show(ui, |ui| self.tab_bar(ui));
+                match self.view {
+                    // Settings take the whole window (own navigation and scrolling).
+                    View::Settings => {
+                        egui::CentralPanel::default().frame(Frame::new().fill(pal.bg)).show(ui, |ui| self.settings(ui, &agent));
+                    }
+                    View::Home => {
+                        egui::Panel::left("this-device")
+                            .exact_size(SIDEBAR_WIDTH)
+                            .resizable(false)
+                            .show_separator_line(true)
+                            .frame(Frame::new().fill(pal.bg).inner_margin(Margin { left: 24, right: 20, top: 22, bottom: 16 }))
+                            .show(ui, |ui| self.sidebar(ui, &agent));
+                        egui::CentralPanel::default().frame(Frame::new().fill(pal.side)).show(ui, |ui| {
+                            egui::Panel::bottom("status")
+                                .exact_size(32.0)
+                                .resizable(false)
+                                .show_separator_line(false)
+                                .frame(Frame::new().inner_margin(Margin::symmetric(24, 0)))
+                                .show(ui, |ui| self.status_bar(ui, &agent));
+                            egui::CentralPanel::default()
+                                .frame(Frame::new().inner_margin(Margin { left: 24, right: 24, top: 20, bottom: 0 }))
+                                .show(ui, |ui| {
+                                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                                        // Room for card shadows at the edges.
+                                        Frame::new().inner_margin(Margin { left: 2, right: 6, top: 2, bottom: 12 }).show(ui, |ui| self.home(ui, &agent));
+                                    });
+                                });
+                        });
+                    }
                 }
-                View::Home => {
-                    egui::Panel::bottom("status")
-                        .exact_size(34.0)
-                        .resizable(false)
-                        .show_separator_line(false)
-                        .frame(Frame::new().fill(pal.side).inner_margin(Margin::symmetric(18, 0)).stroke(Stroke::new(1.0, pal.line)))
-                        .show(ui, |ui| self.status_bar(ui, &agent));
-                    egui::Panel::left("this-device")
-                        .exact_size(SIDEBAR_WIDTH)
-                        .resizable(false)
-                        .show_separator_line(false)
-                        .frame(Frame::new().fill(pal.side).inner_margin(Margin { left: 28, right: 24, top: 24, bottom: 18 }))
-                        .show(ui, |ui| self.sidebar(ui, &agent));
-                    egui::CentralPanel::default().frame(Frame::new().fill(pal.bg).inner_margin(Margin::symmetric(36, 28))).show(ui, |ui| {
-                        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.home(ui, &agent));
-                    });
-                }
-            },
+            }
         }
         if self.login_modal {
             self.login_modal(ui);
@@ -1336,65 +1567,98 @@ impl App {
         ui.add(egui::Image::new(&tex).fit_to_exact_size(vec2(size, size)));
     }
 
+    /// RustDesk-style tab strip under the title bar: the home tab, a closable settings tab,
+    /// and the settings gear on the right.
+    fn tab_bar(&mut self, ui: &mut Ui) {
+        let pal = Palette::of(ui);
+        if self.view == View::Settings {
+            self.settings_tab = true;
+        }
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            let (home, _) = tab_chip(ui, "ReDesk", TabIcon::Logo, self.view == View::Home, false);
+            if home.clicked() {
+                self.view = View::Home;
+            }
+            if self.settings_tab {
+                let (tab, close) = tab_chip(ui, "ตั้งค่า", TabIcon::Gear, self.view == View::Settings, true);
+                if close {
+                    self.settings_tab = false;
+                    self.view = View::Home;
+                } else if tab.clicked() && self.view != View::Settings {
+                    let ctx = ui.ctx().clone();
+                    self.guarded(&ctx, PinAction::OpenSettings);
+                }
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if icon_button(ui, Icon::Gear, "ตั้งค่า").clicked() && self.view != View::Settings {
+                    let ctx = ui.ctx().clone();
+                    self.guarded(&ctx, PinAction::OpenSettings);
+                }
+                let _ = pal;
+            });
+        });
+    }
+
+    /// Left pane: this machine's ID and password, like RustDesk's "Your Desktop".
     fn sidebar(&mut self, ui: &mut Ui, agent: &Agent) {
         let pal = Palette::of(ui);
         let (id, verification, approve) = {
             let c = agent.config.lock().unwrap();
             (c.id.clone(), c.verification, c.approve_mode)
         };
-        ui.horizontal(|ui| {
-            Self::brand(ui, 30.0);
-            ui.label(RichText::new("ReDesk").font(semi(19.0)).color(pal.fg));
-        });
-        ui.add_space(30.0);
-        ui.label(RichText::new("เครื่องนี้").font(semi(17.0)).color(pal.fg));
-        ui.label(RichText::new("ให้ ID และรหัสผ่านนี้กับผู้ที่จะช่วยเหลือคุณ").size(13.0).color(pal.muted));
-        ui.add_space(22.0);
+        ui.label(RichText::new("เครื่องของคุณ").font(semi(19.0)).color(pal.fg));
+        ui.label(RichText::new("ผู้อื่นควบคุมเครื่องนี้ได้ด้วย ID และรหัสผ่านด้านล่าง").size(12.5).color(pal.muted));
+        ui.add_space(18.0);
 
-        label(ui, "ID ของคุณ");
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(format_id(&id)).font(mono(27.0)).color(pal.fg).strong());
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if icon_button(ui, Icon::Copy, "คัดลอก ID").clicked() {
-                    ui.ctx().copy_text(id.clone());
-                    self.flash("คัดลอก ID แล้ว");
-                }
-            });
-        });
-        ui.add_space(10.0);
-        let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
-        ui.painter().rect_filled(r, 0.0, pal.line);
-        ui.add_space(10.0);
-
-        if approve == ApproveMode::Click {
-            label(ui, "การเข้าถึง");
-            ui.label(RichText::new("ไม่ใช้รหัสผ่าน ต้องกดอนุญาตที่เครื่องนี้").color(pal.fg));
-        } else if verification == Verification::Permanent {
-            label(ui, "รหัสผ่าน");
-            ui.label(RichText::new("ใช้รหัสผ่านถาวรที่ตั้งไว้").color(pal.fg));
-        } else {
-            label(ui, "รหัสผ่านใช้ครั้งเดียว");
-            let pw = agent.temp_password.lock().unwrap().clone();
+        accent_block(ui, |ui| {
             ui.horizontal(|ui| {
-                let shown = if self.show_password { pw.clone() } else { "•".repeat(pw.chars().count()) };
-                ui.label(RichText::new(shown).font(mono(21.0)).color(pal.fg));
+                ui.label(RichText::new("ID").size(13.0).color(pal.muted));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = 2.0;
-                    if icon_button(ui, Icon::Copy, "คัดลอกรหัสผ่าน").clicked() {
-                        ui.ctx().copy_text(pw.clone());
-                        self.flash("คัดลอกรหัสผ่านแล้ว");
-                    }
-                    if icon_button(ui, Icon::Refresh, "สร้างรหัสใหม่ (รหัสเดิมใช้ไม่ได้ทันที)").clicked() {
-                        agent.rotate_temp_password();
-                        self.flash("สร้างรหัสผ่านใหม่แล้ว");
-                    }
-                    let (icon, tip) = if self.show_password { (Icon::EyeOff, "ซ่อน") } else { (Icon::Eye, "แสดง") };
-                    if icon_button(ui, icon, tip).clicked() {
-                        self.show_password = !self.show_password;
+                    if small_icon_button(ui, Icon::Copy, "คัดลอก ID").clicked() {
+                        ui.ctx().copy_text(id.clone());
+                        self.flash("คัดลอก ID แล้ว");
                     }
                 });
             });
-            ui.label(RichText::new("เปลี่ยนใหม่อัตโนมัติหลังมีผู้เชื่อมต่อสำเร็จ").size(12.5).color(pal.muted));
+            ui.label(RichText::new(format_id(&id)).font(semi(25.0)).color(pal.fg));
+        });
+        ui.add_space(16.0);
+
+        accent_block(ui, |ui| {
+            if approve == ApproveMode::Click {
+                ui.label(RichText::new("การเข้าถึง").size(13.0).color(pal.muted));
+                ui.label(RichText::new("ไม่ใช้รหัสผ่าน ต้องกดอนุญาตที่เครื่องนี้").color(pal.fg));
+            } else if verification == Verification::Permanent {
+                ui.label(RichText::new("รหัสผ่าน").size(13.0).color(pal.muted));
+                ui.label(RichText::new("ใช้รหัสผ่านถาวรที่ตั้งไว้").color(pal.fg));
+            } else {
+                let pw = agent.temp_password.lock().unwrap().clone();
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("รหัสผ่านใช้ครั้งเดียว").size(13.0).color(pal.muted));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        if small_icon_button(ui, Icon::Copy, "คัดลอกรหัสผ่าน").clicked() {
+                            ui.ctx().copy_text(pw.clone());
+                            self.flash("คัดลอกรหัสผ่านแล้ว");
+                        }
+                        if small_icon_button(ui, Icon::Refresh, "สร้างรหัสใหม่ (รหัสเดิมใช้ไม่ได้ทันที)").clicked() {
+                            agent.rotate_temp_password();
+                            self.flash("สร้างรหัสผ่านใหม่แล้ว");
+                        }
+                        let (icon, tip) = if self.show_password { (Icon::EyeOff, "ซ่อน") } else { (Icon::Eye, "แสดง") };
+                        if small_icon_button(ui, icon, tip).clicked() {
+                            self.show_password = !self.show_password;
+                        }
+                    });
+                });
+                let shown = if self.show_password { pw.clone() } else { "•".repeat(pw.chars().count()) };
+                ui.label(RichText::new(shown).font(semi(22.0)).color(pal.fg));
+            }
+        });
+        if approve == ApproveMode::Password && verification != Verification::Permanent {
+            ui.add_space(4.0);
+            ui.label(RichText::new("เปลี่ยนใหม่อัตโนมัติหลังมีผู้เชื่อมต่อสำเร็จ").size(12.0).color(pal.muted));
         }
 
         if approve != ApproveMode::Password {
@@ -1404,64 +1668,40 @@ impl App {
                 ui.horizontal(|ui| {
                     let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
                     paint_icon(ui, r, Icon::Shield, pal.accent);
-                    ui.label(RichText::new("ทุกการเชื่อมต่อต้องกดอนุญาตที่เครื่องนี้").size(13.0).color(pal.accent));
+                    ui.label(RichText::new("ทุกการเชื่อมต่อต้องกดอนุญาตที่เครื่องนี้").size(12.5).color(pal.accent));
                 });
             });
         }
 
         let account = agent.config.lock().unwrap().account.clone();
-        ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
-            // Signed-in account (like RustDesk's account menu), or a sign-in button.
-            match &account {
-                Some(acc) => {
-                    ui.horizontal(|ui| {
-                        avatar(ui, &initials(&acc.name, &acc.email), 34.0);
-                        ui.vertical(|ui| {
-                            ui.spacing_mut().item_spacing.y = 0.0;
-                            let name = if acc.name.is_empty() { acc.email.clone() } else { acc.name.clone() };
-                            ui.label(RichText::new(name).font(semi(13.5)).color(pal.fg));
-                            ui.label(RichText::new(&acc.email).size(12.0).color(pal.muted));
-                        });
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.add(Button::new(RichText::new("ออกจากระบบ").size(12.5).color(pal.muted)).frame(false)).clicked() {
-                                let ctx = ui.ctx().clone();
-                                self.guarded(&ctx, PinAction::SignOut);
-                            }
-                        });
+        ui.with_layout(Layout::bottom_up(Align::Min), |ui| match &account {
+            Some(acc) => {
+                ui.horizontal(|ui| {
+                    avatar(ui, &initials(&acc.name, &acc.email), 34.0);
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        let name = if acc.name.is_empty() { acc.email.clone() } else { acc.name.clone() };
+                        ui.add(egui::Label::new(RichText::new(name).font(semi(13.5)).color(pal.fg)).truncate());
+                        ui.add(egui::Label::new(RichText::new(&acc.email).size(12.0).color(pal.muted)).truncate());
                     });
-                }
-                None => {
-                    let b = Button::new(RichText::new("เข้าสู่ระบบ").font(semi(14.0)).color(pal.accent))
-                        .fill(pal.bg)
-                        .stroke(Stroke::new(1.0, pal.line))
-                        .corner_radius(8)
-                        .min_size(vec2(ui.available_width(), 38.0));
-                    // A fixed rect keeps the label centred without a nested layout eating the column.
-                    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 38.0), Sense::hover());
-                    if ui.put(rect, b).clicked() {
-                        self.login = LoginForm { email: self.login.email.clone(), ..Default::default() };
-                        self.login_modal = true;
-                    }
-                }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.add(Button::new(RichText::new("ออกจากระบบ").size(12.5).color(pal.muted)).frame(false)).clicked() {
+                            let ctx = ui.ctx().clone();
+                            self.guarded(&ctx, PinAction::SignOut);
+                        }
+                    });
+                });
             }
-            ui.add_space(6.0);
-            let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
-            ui.painter().rect_filled(r, 0.0, pal.line);
-            ui.add_space(2.0);
-            let (text, icon) = if self.view == View::Home { ("ตั้งค่า", Icon::Gear) } else { ("กลับหน้าหลัก", Icon::Back) };
-            let resp = ui.add(
-                Button::new(RichText::new(format!("      {text}")).color(pal.fg))
-                    .fill(Color32::TRANSPARENT)
-                    .stroke(Stroke::NONE)
-                    .min_size(vec2(0.0, 36.0)),
-            );
-            paint_icon(ui, Rect::from_min_size(resp.rect.left_center() + vec2(12.0, -8.0), vec2(16.0, 16.0)), icon, pal.muted);
-            if resp.clicked() {
-                if self.view == View::Home {
-                    let ctx = ui.ctx().clone();
-                    self.guarded(&ctx, PinAction::OpenSettings);
-                } else {
-                    self.view = View::Home;
+            None => {
+                let b = Button::new(RichText::new("เข้าสู่ระบบ").font(semi(14.0)).color(pal.accent))
+                    .fill(pal.bg)
+                    .stroke(Stroke::new(1.0, pal.line))
+                    .corner_radius(8);
+                // A fixed rect keeps the label centred without a nested layout eating the column.
+                let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 38.0), Sense::hover());
+                if ui.put(rect, b).clicked() {
+                    self.login = LoginForm { email: self.login.email.clone(), ..Default::default() };
+                    self.login_modal = true;
                 }
             }
         });
@@ -1470,54 +1710,61 @@ impl App {
     fn status_bar(&mut self, ui: &mut Ui, agent: &Agent) {
         let pal = Palette::of(ui);
         let server = host_of(&agent.config.lock().unwrap().server_url);
+        let incoming = agent.status.lock().unwrap().sessions.len();
         ui.horizontal_centered(|ui| {
             let (color, text, detail) = match &agent.status.lock().unwrap().server {
-                ServerState::Online => (pal.ok, "พร้อมใช้งาน".to_string(), format!("เชื่อมต่อ {server} แล้ว · เข้ารหัสต้นทาง-ปลายทาง")),
+                ServerState::Online => (pal.ok, "พร้อมใช้งาน".to_string(), format!("{server} · เข้ารหัสต้นทาง-ปลายทาง")),
                 ServerState::Connecting => (pal.warn, "กำลังเชื่อมต่อ…".to_string(), server.clone()),
                 ServerState::Error(e) => (pal.danger, "ไม่ได้เชื่อมต่อ".to_string(), e.chars().take(80).collect()),
             };
             let (r, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
             ui.painter().circle_filled(r.center(), 4.0, color);
             ui.label(RichText::new(text).size(12.5).color(pal.fg));
-            ui.label(RichText::new(detail).size(12.5).color(pal.muted));
+            ui.add(egui::Label::new(RichText::new(detail).size(12.5).color(pal.muted)).truncate());
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.label(RichText::new(format!("v{}", env!("CARGO_PKG_VERSION"))).size(12.0).color(pal.muted));
+                if incoming > 0 {
+                    ui.label(RichText::new(format!("มีผู้ควบคุมเครื่องนี้ {incoming} คน")).size(12.5).color(pal.accent));
+                }
             });
         });
     }
 
+    /// Right pane: the "control a remote desktop" card, then the device tabs.
     fn home(&mut self, ui: &mut Ui, agent: &Agent) {
         permissions_ui::missing_permissions_banner(ui);
         let pal = Palette::of(ui);
-        ui.label(RichText::new("ควบคุมเครื่องอื่น").font(semi(20.0)).color(pal.fg));
-        ui.label(RichText::new("ใส่ ID แล้วควบคุมหน้าจอเครื่องนั้นในหน้าต่างใหม่ เข้ารหัสต้นทาง-ปลายทาง").size(13.0).color(pal.muted));
-        ui.add_space(12.0);
         let digits: String = self.remote_id.chars().filter(|c| c.is_ascii_digit()).collect();
         let mut go = false;
-        ui.horizontal(|ui| {
+        card_frame(&pal).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new("ควบคุมเครื่องอื่น").font(semi(18.0)).color(pal.fg));
+            ui.add_space(6.0);
             let edit = TextEdit::singleline(&mut self.remote_id)
-                .hint_text("ใส่ ID ของเครื่องปลายทาง")
-                .font(mono(18.0))
-                .margin(Margin::symmetric(12, 9))
-                .desired_width((ui.available_width() - 130.0).clamp(160.0, 340.0));
+                .hint_text(RichText::new("ใส่ ID ของเครื่องปลายทาง").size(17.0))
+                .font(FontId::proportional(21.0))
+                .vertical_align(Align::Center)
+                .min_size(vec2(0.0, 46.0))
+                .margin(Margin::symmetric(14, 6))
+                .desired_width(f32::INFINITY);
             let r = ui.add(edit);
             if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 go = true;
             }
-            if primary(ui, "เชื่อมต่อ", digits.len() == 9).clicked() {
-                go = true;
-            }
+            ui.add_space(4.0);
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), 40.0), Layout::right_to_left(Align::Center), |ui| {
+                if primary(ui, "เชื่อมต่อ", digits.len() == 9).clicked() {
+                    go = true;
+                }
+            });
         });
         if go && digits.len() == 9 {
             let ctx = ui.ctx().clone();
             let name = self.device_title(&digits);
             self.open_remote(&ctx, &digits, &name);
         }
-
-        ui.add_space(28.0);
+        ui.add_space(18.0);
         self.address_book(ui, agent);
-        ui.add_space(28.0);
-        self.sessions_list(ui, agent);
     }
 
     fn book_entry(&self, id: &str) -> Option<&BookEntry> {
@@ -1547,7 +1794,16 @@ impl App {
         if parts.is_empty() {
             parts.push("ไม่อยู่ในสมุดที่อยู่".into());
         }
-        DeviceRow { id: id.to_string(), title, detail: parts.join(" · "), online, tags: entry.map(|e| e.tags.clone()).unwrap_or_default() }
+        let dev = entry.and_then(|e| e.device.as_ref());
+        DeviceRow {
+            id: id.to_string(),
+            title,
+            detail: parts.join(" · "),
+            online,
+            tags: entry.map(|e| e.tags.clone()).unwrap_or_default(),
+            os: dev.map(|d| d.os.clone()).unwrap_or_default(),
+            host: dev.map(|d| d.hostname.clone()).unwrap_or_default(),
+        }
     }
 
     /// Recent / favorites / address book, with search and a favorite star on every row.
@@ -1557,31 +1813,41 @@ impl App {
         let signed_in = self.account().is_some();
         ui.horizontal(|ui| {
             let mut tab = self.tab;
-            segmented(ui, &mut tab, &[(HomeTab::Recent, "ล่าสุด"), (HomeTab::Favorites, "รายการโปรด"), (HomeTab::Book, "สมุดที่อยู่"), (HomeTab::Lan, "ในเครือข่าย")], true);
+            text_tabs(ui, &mut tab, &[(HomeTab::Recent, "ล่าสุด"), (HomeTab::Favorites, "รายการโปรด"), (HomeTab::Lan, "ในเครือข่าย"), (HomeTab::Book, "สมุดที่อยู่")]);
             if tab == HomeTab::Lan && self.tab != HomeTab::Lan {
                 let ctx = ui.ctx().clone();
                 self.discover_lan(&ctx);
             }
             self.tab = tab;
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if self.tab == HomeTab::Book && signed_in && icon_button(ui, Icon::Refresh, "รีเฟรช").clicked() {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                if view_toggle(ui, Icon::List, self.local.peer_list, "มุมมองรายการ").clicked() && !self.local.peer_list {
+                    self.local.peer_list = true;
+                    self.mark_local();
+                }
+                if view_toggle(ui, Icon::Grid, !self.local.peer_list, "มุมมองการ์ด").clicked() && self.local.peer_list {
+                    self.local.peer_list = false;
+                    self.mark_local();
+                }
+                if self.tab == HomeTab::Book && signed_in && small_icon_button(ui, Icon::Refresh, "รีเฟรช").clicked() {
                     let ctx = ui.ctx().clone();
                     self.refresh_book(&ctx);
                 }
-                if self.tab == HomeTab::Lan && !self.lan_busy && icon_button(ui, Icon::Refresh, "ค้นหาอีกครั้ง").clicked() {
+                if self.tab == HomeTab::Lan && !self.lan_busy && small_icon_button(ui, Icon::Refresh, "ค้นหาอีกครั้ง").clicked() {
                     let ctx = ui.ctx().clone();
                     self.discover_lan(&ctx);
                 }
+                ui.add_space(4.0);
                 let edit = TextEdit::singleline(&mut self.search)
-                    .hint_text("ค้นหาชื่อ, ID, แท็ก")
-                    .margin(Margin { left: 30, right: 8, top: 8, bottom: 8 })
-                    .desired_width(ui.available_width().clamp(110.0, 220.0));
+                    .hint_text("ค้นหา")
+                    .margin(Margin { left: 28, right: 8, top: 5, bottom: 5 })
+                    .desired_width(ui.available_width().clamp(90.0, 170.0));
                 let r = ui.add(edit);
-                let icon = Rect::from_center_size(r.rect.left_center() + vec2(16.0, 0.0), vec2(14.0, 14.0));
+                let icon = Rect::from_center_size(r.rect.left_center() + vec2(15.0, 0.0), vec2(13.0, 13.0));
                 paint_icon(ui, icon, Icon::Search, pal.muted);
             });
         });
-        ui.add_space(4.0);
+        ui.add_space(10.0);
 
         let rows: Vec<DeviceRow> = match self.tab {
             HomeTab::Recent => self.local.recent.iter().filter(|r| r.id != my_id).map(|r| self.known_row(&r.id, Some(r.last))).collect(),
@@ -1600,6 +1866,8 @@ impl App {
                         detail: format!("{} · {} · {}", format_id(&p.id), p.addr, p.os),
                         online: Some(true),
                         tags: Vec::new(),
+                        os: p.os.clone(),
+                        host: p.hostname.clone(),
                     })
                     .collect()
             }
@@ -1638,6 +1906,8 @@ impl App {
                             detail: format!("{} · {status}", format_id(&e.device_id)),
                             online: Some(e.online()),
                             tags: e.tags.clone(),
+                            os: e.device.as_ref().map(|d| d.os.clone()).unwrap_or_default(),
+                            host: e.device.as_ref().map(|d| d.hostname.clone()).unwrap_or_default(),
                         }
                     })
                     .collect()
@@ -1646,7 +1916,7 @@ impl App {
         if rows.is_empty() {
             let msg = match self.tab {
                 HomeTab::Recent => "ยังไม่มีประวัติการเชื่อมต่อ — เครื่องที่คุณเคยควบคุมจะแสดงที่นี่",
-                HomeTab::Favorites => "ยังไม่มีรายการโปรด — กดรูปดาวที่เครื่องในรายการเพื่อเพิ่ม",
+                HomeTab::Favorites => "ยังไม่มีรายการโปรด — เพิ่มได้จากเมนู ⋮ ของแต่ละเครื่อง",
                 HomeTab::Book => "ยังไม่มีเครื่องในสมุดที่อยู่ — เพิ่มได้จากคอนโซล ReDesk",
                 HomeTab::Lan => "ไม่พบเครื่อง ReDesk อื่นในเครือข่ายเดียวกัน",
             };
@@ -1667,9 +1937,134 @@ impl App {
             return;
         }
 
-        let mut connect: Option<(String, String)> = None;
-        let mut star: Option<String> = None;
-        Frame::new().stroke(Stroke::new(1.0, pal.line)).corner_radius(12).inner_margin(Margin::symmetric(14, 4)).show(ui, |ui| {
+        let tab = self.tab;
+        let action = if self.local.peer_list { self.peer_list(ui, &rows, tab) } else { self.peer_grid(ui, &rows, tab) };
+        match action {
+            Some(PeerAction::Connect(id, name)) => {
+                let ctx = ui.ctx().clone();
+                self.open_remote(&ctx, &id, &name);
+            }
+            Some(PeerAction::Star(id)) => {
+                self.local.toggle_favorite(&id);
+                self.mark_local();
+            }
+            Some(PeerAction::CopyId(id)) => {
+                ui.ctx().copy_text(id);
+                self.flash("คัดลอก ID แล้ว");
+            }
+            Some(PeerAction::Forget(id)) => {
+                self.local.recent.retain(|r| r.id != id);
+                self.mark_local();
+            }
+            None => {}
+        }
+        if self.tab == HomeTab::Recent && self.search.trim().is_empty() {
+            ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                if ui.add(Button::new(RichText::new("ล้างประวัติ").size(12.5).color(pal.muted)).frame(false)).clicked() {
+                    self.local.recent.clear();
+                    self.mark_local();
+                }
+            });
+        }
+    }
+
+    /// Menu shared by cards (⋮ and right click) and list rows.
+    fn peer_menu(&self, ui: &mut Ui, r: &DeviceRow, tab: HomeTab, action: &mut Option<PeerAction>) {
+        ui.set_min_width(190.0);
+        let offline = r.online == Some(false);
+        if ui.add_enabled(!offline, Button::new("เชื่อมต่อ")).clicked() {
+            *action = Some(PeerAction::Connect(r.id.clone(), r.title.clone()));
+        }
+        let fav = if self.local.is_favorite(&r.id) { "เอาออกจากรายการโปรด" } else { "เพิ่มในรายการโปรด" };
+        if ui.button(fav).clicked() {
+            *action = Some(PeerAction::Star(r.id.clone()));
+        }
+        if ui.button("คัดลอก ID").clicked() {
+            *action = Some(PeerAction::CopyId(r.id.clone()));
+        }
+        if tab == HomeTab::Recent {
+            ui.separator();
+            if ui.button(RichText::new("ลบออกจากประวัติ").color(Palette::of(ui).danger)).clicked() {
+                *action = Some(PeerAction::Forget(r.id.clone()));
+            }
+        }
+    }
+
+    /// Device cards in a responsive grid (RustDesk's default peer view).
+    fn peer_grid(&self, ui: &mut Ui, rows: &[DeviceRow], tab: HomeTab) -> Option<PeerAction> {
+        const GAP: f32 = 14.0;
+        let avail = ui.available_width();
+        let cols = ((avail + GAP) / (CARD_MIN_W + GAP)).floor().max(1.0) as usize;
+        let w = ((avail - GAP * (cols - 1) as f32) / cols as f32).min(CARD_MAX_W);
+        let mut action = None;
+        for chunk in rows.chunks(cols) {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = GAP;
+                for r in chunk {
+                    self.peer_card(ui, r, w, tab, &mut action);
+                }
+            });
+            ui.add_space(GAP - ui.spacing().item_spacing.y);
+        }
+        action
+    }
+
+    fn peer_card(&self, ui: &mut Ui, r: &DeviceRow, w: f32, tab: HomeTab, action: &mut Option<PeerAction>) {
+        let pal = Palette::of(ui);
+        let (rect, resp) = ui.allocate_exact_size(vec2(w, CARD_H), Sense::click());
+        let head = Rect::from_min_size(rect.min, vec2(w, CARD_HEAD));
+        let offline = r.online == Some(false);
+        let p = ui.painter();
+        p.add(egui::Shadow { offset: [0, 1], blur: if resp.hovered() { 12 } else { 6 }, spread: 0, color: Color32::from_black_alpha(22) }.as_shape(rect, 10));
+        p.rect_filled(rect, 10, pal.bg);
+        let color = if offline { card_color(&r.id).gamma_multiply(0.55) } else { card_color(&r.id) };
+        p.rect_filled(head, CornerRadius { nw: 10, ne: 10, sw: 0, se: 0 }, color);
+        if resp.hovered() {
+            p.rect_stroke(rect, 10, Stroke::new(1.5, pal.accent), egui::StrokeKind::Inside);
+        }
+        // Header: platform glyph and host name in white.
+        let lift = if r.host.is_empty() { 0.0 } else { 11.0 };
+        let glyph = Rect::from_center_size(head.center() - vec2(0.0, lift), vec2(34.0, 34.0));
+        paint_os(ui, glyph, os_kind(&r.os), Color32::WHITE);
+        if !r.host.is_empty() {
+            let g = one_line(ui, &r.host, FontId::proportional(12.5), Color32::WHITE, w - 24.0);
+            ui.painter().galley(pos2(head.center().x - g.size().x / 2.0, head.bottom() - 26.0), g, Color32::WHITE);
+        }
+        if self.local.is_favorite(&r.id) {
+            paint_icon(ui, Rect::from_min_size(head.right_top() + vec2(-24.0, 8.0), vec2(14.0, 14.0)), Icon::StarFilled, Color32::WHITE);
+        }
+        // Footer: status dot, name and ID, menu.
+        let foot = Rect::from_min_max(pos2(rect.left(), head.bottom()), rect.max);
+        let dot = match r.online {
+            Some(true) => pal.ok,
+            Some(false) => pal.muted.gamma_multiply(0.6),
+            None => pal.line,
+        };
+        ui.painter().circle_filled(pos2(foot.left() + 15.0, foot.top() + 17.0), 4.0, dot);
+        let tw = w - 26.0 - 34.0;
+        let title = one_line(ui, &r.title, semi(13.5), pal.fg, tw);
+        ui.painter().galley(pos2(foot.left() + 26.0, foot.top() + 8.0), title, pal.fg);
+        let id = one_line(ui, &format_id(&r.id), FontId::proportional(12.0), pal.muted, tw);
+        ui.painter().galley(pos2(foot.left() + 26.0, foot.top() + 27.0), id, pal.muted);
+        let more = Rect::from_center_size(pos2(foot.right() - 18.0, foot.center().y), vec2(26.0, 26.0));
+        let more_resp = ui.interact(more, resp.id.with("more"), Sense::click());
+        if more_resp.hovered() {
+            ui.painter().rect_filled(more, 6, pal.line);
+        }
+        paint_icon(ui, Rect::from_center_size(more.center(), vec2(15.0, 15.0)), Icon::More, if more_resp.hovered() { pal.fg } else { pal.muted });
+        egui::Popup::menu(&more_resp).show(|ui| self.peer_menu(ui, r, tab, action));
+        resp.context_menu(|ui| self.peer_menu(ui, r, tab, action));
+        let resp = resp.on_hover_text(format!("{}\n{}\nดับเบิลคลิกเพื่อเชื่อมต่อ", r.title, r.detail));
+        if resp.double_clicked() && !offline {
+            *action = Some(PeerAction::Connect(r.id.clone(), r.title.clone()));
+        }
+    }
+
+    /// Compact list view: one row per device with a connect button.
+    fn peer_list(&self, ui: &mut Ui, rows: &[DeviceRow], tab: HomeTab) -> Option<PeerAction> {
+        let pal = Palette::of(ui);
+        let mut action = None;
+        card_frame(&pal).inner_margin(Margin::symmetric(14, 4)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             for (n, r) in rows.iter().enumerate() {
                 if n > 0 {
@@ -1678,25 +2073,25 @@ impl App {
                 }
                 ui.horizontal(|ui| {
                     ui.set_min_height(50.0);
-                    let online = r.online == Some(true);
-                    let (ic, _) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
-                    paint_icon(ui, ic, Icon::Monitor, if online { pal.accent } else { pal.muted });
+                    let offline = r.online == Some(false);
+                    let (ic, _) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::hover());
+                    ui.painter().rect_filled(ic, 7, if offline { card_color(&r.id).gamma_multiply(0.55) } else { card_color(&r.id) });
+                    paint_os(ui, ic.shrink(7.0), os_kind(&r.os), Color32::WHITE);
                     if let Some(on) = r.online {
-                        ui.painter().circle_filled(ic.right_bottom() - vec2(2.0, 2.0), 4.0, if on { pal.ok } else { pal.line });
+                        ui.painter().circle_filled(ic.right_bottom() - vec2(1.0, 1.0), 4.5, pal.bg);
+                        ui.painter().circle_filled(ic.right_bottom() - vec2(1.0, 1.0), 3.5, if on { pal.ok } else { pal.muted });
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
-                        if star_button(ui, self.local.is_favorite(&r.id)).clicked() {
-                            star = Some(r.id.clone());
-                        }
-                        let offline = r.online == Some(false);
+                        let more = small_icon_button(ui, Icon::More, "เพิ่มเติม");
+                        egui::Popup::menu(&more).show(|ui| self.peer_menu(ui, r, tab, &mut action));
                         let b = Button::new(RichText::new("เชื่อมต่อ").font(semi(13.5)).color(if offline { pal.muted } else { pal.accent }))
                             .fill(pal.bg)
                             .stroke(Stroke::new(1.0, pal.line))
                             .corner_radius(8)
                             .min_size(vec2(0.0, 32.0));
                         if ui.add_enabled(!offline, b).clicked() {
-                            connect = Some((r.id.clone(), r.title.clone()));
+                            action = Some(PeerAction::Connect(r.id.clone(), r.title.clone()));
                         }
                         // Name and details take the rest of the row, left aligned.
                         ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
@@ -1706,6 +2101,10 @@ impl App {
                                 ui.spacing_mut().interact_size.y = 0.0; // compact tag chips
                                 ui.horizontal(|ui| {
                                     ui.spacing_mut().item_spacing.x = 6.0;
+                                    if self.local.is_favorite(&r.id) {
+                                        let (s, _) = ui.allocate_exact_size(vec2(13.0, 13.0), Sense::hover());
+                                        paint_icon(ui, s, Icon::StarFilled, pal.warn);
+                                    }
                                     ui.add(egui::Label::new(RichText::new(&r.title).font(semi(14.0)).color(pal.fg)).truncate());
                                     for t in r.tags.iter().take(3) {
                                         Frame::new().fill(pal.accent_soft).corner_radius(6).inner_margin(Margin::symmetric(6, 0)).show(ui, |ui| {
@@ -1720,22 +2119,7 @@ impl App {
                 });
             }
         });
-        if let Some(id) = star {
-            self.local.toggle_favorite(&id);
-            self.mark_local();
-        }
-        if let Some((id, name)) = connect {
-            let ctx = ui.ctx().clone();
-            self.open_remote(&ctx, &id, &name);
-        }
-        if self.tab == HomeTab::Recent && self.search.trim().is_empty() {
-            ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-                if ui.add(Button::new(RichText::new("ล้างประวัติ").size(12.5).color(pal.muted)).frame(false)).clicked() {
-                    self.local.recent.clear();
-                    self.mark_local();
-                }
-            });
-        }
+        action
     }
 
     /// Email / password / 2FA fields. Returns true when the form should be submitted.

@@ -26,8 +26,8 @@ use redesk_agent::ui::{self, App, OpenRequests, Options, ShowSignal};
 /// Loopback port used to find an already running instance (per machine).
 const INSTANCE_PORT: u16 = 21119;
 /// Size of the main window unless a remembered one is available.
-const MAIN_SIZE: [f32; 2] = [880.0, 560.0];
-const MAIN_MIN: [f32; 2] = [780.0, 500.0];
+const MAIN_SIZE: [f32; 2] = [1000.0, 640.0];
+const MAIN_MIN: [f32; 2] = [820.0, 540.0];
 
 fn main() -> eframe::Result {
     let mut args = std::env::args().skip(1);

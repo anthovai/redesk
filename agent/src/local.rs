@@ -42,6 +42,9 @@ pub struct LocalState {
     pub main_window: Option<WindowGeom>,
     #[serde(default)]
     pub viewer_size: Option<[f32; 2]>,
+    /// Device list as rows instead of cards.
+    #[serde(default)]
+    pub peer_list: bool,
 }
 
 /// A device ID as typed or linked: exactly nine digits once spaces are removed.
