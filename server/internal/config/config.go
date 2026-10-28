@@ -28,6 +28,10 @@ type Config struct {
 	SyncInterval         int    // AEGIRON_SYNC_MINUTES: vendor API sync period (default 15)
 	// AEGIRON_PUBLIC_URL: external base URL, e.g. https://aegiron.example.com (OIDC redirect URI)
 	PublicURL string
+	// AEGIRON_P2P: offer direct/P2P sessions to native viewers (default true). False = relay only.
+	P2P bool
+	// AEGIRON_UDP_PORT: UDP rendezvous for hole punching and NAT probe; also uses port+1 (default 21116, 0 = off)
+	UDPPort int
 }
 
 func Load() Config {
@@ -52,6 +56,11 @@ func Load() Config {
 	c.SyncInterval, _ = strconv.Atoi(env("AEGIRON_SYNC_MINUTES", "15"))
 	if c.SyncInterval < 1 {
 		c.SyncInterval = 15
+	}
+	c.P2P = envBool("AEGIRON_P2P", true)
+	c.UDPPort, _ = strconv.Atoi(env("AEGIRON_UDP_PORT", "21116"))
+	if c.UDPPort < 0 || c.UDPPort > 65534 {
+		c.UDPPort = 0
 	}
 	c.CookieSecure = envBool("AEGIRON_COOKIE_SECURE", c.TLSCert != "")
 	for _, o := range strings.Split(getenv("AEGIRON_ALLOWED_ORIGINS"), ",") {

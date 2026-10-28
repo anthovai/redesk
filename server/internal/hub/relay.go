@@ -32,13 +32,21 @@ type relay struct {
 
 	toViewer atomic.Int64
 	toAgent  atomic.Int64
+
+	// direct is set when the viewer asked for, and the agent supports, a direct path.
+	direct *directState
 }
+
+// directStarted reports whether the session moved to a direct path (no relay audit then).
+func (rl *relay) directStarted() bool { return rl.direct != nil && rl.direct.isStarted() }
 
 // Ticket is what the console needs to open the viewer side of a session.
 type Ticket struct {
 	SID       string `json:"sid"`
 	Token     string `json:"token"`
 	RelayPath string `json:"relay_path"`
+	// Direct is present only when the viewer asked for it and the agent offered candidates.
+	Direct *DirectTicket `json:"direct,omitempty"`
 }
 
 type ViewerInfo struct {
@@ -48,7 +56,9 @@ type ViewerInfo struct {
 }
 
 // StartSession asks an online agent to join a fresh relay and returns the viewer ticket.
-func (h *Hub) StartSession(ctx context.Context, deviceID string, userID int64, viewer ViewerInfo) (*Ticket, error) {
+// With wantDirect (native viewers that can race a direct path), an agent that supports it
+// also gets a direct token and the ticket carries the agent's candidates.
+func (h *Hub) StartSession(ctx context.Context, deviceID string, userID int64, viewer ViewerInfo, wantDirect bool) (*Ticket, error) {
 	h.mu.Lock()
 	a := h.agents[deviceID]
 	h.mu.Unlock()
@@ -66,14 +76,28 @@ func (h *Hub) StartSession(ctx context.Context, deviceID string, userID int64, v
 		paired:    make(chan struct{}),
 		done:      make(chan struct{}),
 	}
+	if wantDirect && h.P2P && a.direct {
+		rl.direct = newDirectState()
+	}
 	if err := h.store.CreateRemoteSession(ctx, rl.sid, deviceID, userID, viewer.IP); err != nil {
 		return nil, err
 	}
 	h.mu.Lock()
 	h.relays[rl.sid] = rl
+	if rl.direct != nil {
+		h.directs[rl.sid] = rl
+	}
 	h.mu.Unlock()
 
-	if !a.send(map[string]any{"t": "session", "sid": rl.sid, "token": rl.agentTok, "relay": "/ws/relay", "viewer": viewer}) {
+	msg := map[string]any{"t": "session", "sid": rl.sid, "token": rl.agentTok, "relay": "/ws/relay", "viewer": viewer}
+	if rl.direct != nil {
+		d := map[string]any{"token": rl.direct.token}
+		if h.UDPPort > 0 {
+			d["punch_key"], d["udp_port"] = rl.direct.agentPunch, h.UDPPort
+		}
+		msg["direct"] = d
+	}
+	if !a.send(msg) {
 		h.endRelay(rl, "agent_busy")
 		return nil, ErrBusy
 	}
@@ -84,7 +108,18 @@ func (h *Hub) StartSession(ctx context.Context, deviceID string, userID int64, v
 			h.endRelay(rl, "pair_timeout")
 		}
 	})
-	return &Ticket{SID: rl.sid, Token: rl.viewerTok, RelayPath: "/ws/relay"}, nil
+	t := &Ticket{SID: rl.sid, Token: rl.viewerTok, RelayPath: "/ws/relay"}
+	if rl.direct != nil {
+		time.AfterFunc(directGrace, func() {
+			if !rl.direct.isStarted() {
+				h.mu.Lock()
+				delete(h.directs, rl.sid)
+				h.mu.Unlock()
+			}
+		})
+		t.Direct = h.awaitOffer(ctx, a, rl)
+	}
+	return t, nil
 }
 
 func (h *Hub) rejectRelay(sid, deviceID, reason string) {
@@ -111,13 +146,17 @@ func (h *Hub) endRelay(rl *relay, reason string) {
 		}
 		rl.mu.Unlock()
 
+		if rl.directStarted() {
+			// The session went direct before pairing: the direct path writes its own records.
+			return
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		tv, ta := rl.toViewer.Load(), rl.toAgent.Load()
 		_ = h.store.MarkSessionEnded(ctx, rl.sid, tv, ta, reason)
 		uid := rl.userID
 		_ = h.store.AddAudit(ctx, &uid, rl.viewerIP, "session.end", rl.deviceID, map[string]any{
-			"sid": rl.sid, "reason": reason, "seconds": int(time.Since(rl.created).Seconds()),
+			"sid": rl.sid, "path": "relay", "reason": reason, "seconds": int(time.Since(rl.created).Seconds()),
 			"bytes_to_viewer": tv, "bytes_to_agent": ta,
 		})
 		h.log.Info("session ended", "sid", rl.sid, "device", rl.deviceID, "reason", reason)
@@ -144,6 +183,14 @@ func (h *Hub) HandleRelay(w http.ResponseWriter, r *http.Request) {
 	if isViewer && (h.ViewerUserID == nil || h.ViewerUserID(r) != rl.userID) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
+	}
+	if rl.directStarted() {
+		http.Error(w, "session continues on a direct path", http.StatusConflict)
+		return
+	}
+	var directCh chan struct{}
+	if rl.direct != nil {
+		directCh = rl.direct.started
 	}
 
 	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{OriginPatterns: h.origins})
@@ -179,7 +226,7 @@ func (h *Hub) HandleRelay(w http.ResponseWriter, r *http.Request) {
 		close(rl.paired)
 		_ = h.store.MarkSessionStarted(r.Context(), rl.sid)
 		uid := rl.userID
-		_ = h.store.AddAudit(r.Context(), &uid, rl.viewerIP, "session.start", rl.deviceID, map[string]any{"sid": rl.sid})
+		_ = h.store.AddAudit(r.Context(), &uid, rl.viewerIP, "session.start", rl.deviceID, map[string]any{"sid": rl.sid, "path": "relay"})
 		h.log.Info("session started", "sid", rl.sid, "device", rl.deviceID)
 	}
 
@@ -187,7 +234,20 @@ func (h *Hub) HandleRelay(w http.ResponseWriter, r *http.Request) {
 	case <-rl.paired:
 	case <-rl.done:
 		return
+	case <-directCh:
+		c.Close(websocket.StatusNormalClosure, "direct")
+		return
 	case <-r.Context().Done():
+		if rl.direct != nil {
+			// A peer that won a direct path drops its relay slot; wait for direct_started
+			// or the pairing timeout instead of ending the session here.
+			rl.mu.Lock()
+			if *slot == c {
+				*slot = nil
+			}
+			rl.mu.Unlock()
+			return
+		}
 		h.endRelay(rl, "disconnected_before_pair")
 		return
 	}
@@ -241,7 +301,15 @@ func (h *Hub) ActiveSessions() []map[string]any {
 			state = "active"
 		default:
 		}
-		out = append(out, map[string]any{"sid": rl.sid, "device_id": rl.deviceID, "user_id": rl.userID, "state": state, "created_at": rl.created})
+		if rl.directStarted() {
+			continue // listed below
+		}
+		out = append(out, map[string]any{"sid": rl.sid, "device_id": rl.deviceID, "user_id": rl.userID, "state": state, "path": "relay", "created_at": rl.created})
+	}
+	for _, rl := range h.directs {
+		if rl.directStarted() {
+			out = append(out, map[string]any{"sid": rl.sid, "device_id": rl.deviceID, "user_id": rl.userID, "state": "active", "path": rl.direct.pathName(), "created_at": rl.created})
+		}
 	}
 	return out
 }

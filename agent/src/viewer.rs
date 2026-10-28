@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::tungstenite::Message;
 
 use crate::codec::H264Decoder;
 use crate::crypto::{Channel, ViewerKeys};
@@ -135,6 +135,8 @@ pub struct State {
     /// Codec the agent chose ("h264" or "jpeg").
     pub codec: String,
     pub transfers: Vec<Transfer>,
+    /// How the session travels: relay, direct (TCP) or P2P (UDP); None until connected.
+    pub path: Option<crate::direct::Path>,
 }
 
 enum Cmd {
@@ -156,6 +158,10 @@ pub struct Target {
     pub insecure: bool,
     pub device_id: String,
     pub name: String,
+    /// Try direct/P2P paths before falling back to the relay (Settings → Network).
+    pub direct: bool,
+    /// Diagnostics (`aegiron-agent connect --only`): use just this path, no fallback.
+    pub only: Option<crate::direct::Path>,
 }
 
 impl Viewer {
@@ -177,6 +183,7 @@ impl Viewer {
                 cursor: None,
                 codec: String::new(),
                 transfers: Vec::new(),
+                path: None,
             }),
             tx,
             repaint,
@@ -232,6 +239,7 @@ impl Viewer {
                 cursor: None,
                 codec: String::new(),
                 transfers: vec![Transfer { id: 1, name: "รายงานประจำเดือน.xlsx".into(), size: 100, sent: 64, status: TransferStatus::Active }],
+                path: Some(crate::direct::Path::Direct),
             }),
             tx,
             repaint: Arc::new(|| {}),
@@ -289,9 +297,7 @@ fn explain_close(reason: &str) -> String {
     }
 }
 
-type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
-
-async fn next_text(rx: &mut futures_util::stream::SplitStream<Ws>, what: &str, secs: u64) -> Result<String> {
+async fn next_text(rx: &mut crate::direct::WsRx, what: &str, secs: u64) -> Result<String> {
     loop {
         let m = tokio::time::timeout(Duration::from_secs(secs), rx.next())
             .await
@@ -308,7 +314,8 @@ async fn next_text(rx: &mut futures_util::stream::SplitStream<Ws>, what: &str, s
 async fn run(v: &Arc<Viewer>, t: Target, mut cmds: mpsc::UnboundedReceiver<Cmd>) -> Result<()> {
     // 1. Ask the server to wake the agent (blocking HTTPS call off the async threads).
     let (server, token, id) = (t.server.clone(), t.token.clone(), t.device_id.clone());
-    let ticket = tokio::task::spawn_blocking(move || account::start_session(&server, &token, &id))
+    let direct = t.direct && t.only != Some(crate::direct::Path::Relay);
+    let ticket = tokio::task::spawn_blocking(move || account::start_session(&server, &token, &id, direct))
         .await?
         .map_err(|e| anyhow!(e))?;
     let device_key: [u8; 32] = B64.decode(&ticket.device.public_key)?.try_into().map_err(|_| anyhow!("bad device key"))?;
@@ -326,17 +333,35 @@ async fn run(v: &Arc<Viewer>, t: Target, mut cmds: mpsc::UnboundedReceiver<Cmd>)
     ))?;
     let mut req = url.as_str().into_client_request()?;
     req.headers_mut().insert("Authorization", format!("Bearer {}", t.token).parse()?);
-    let (ws, _) = connect_async(req).await.context("เชื่อมต่อ relay ไม่สำเร็จ")?;
-    let (mut tx, mut rx) = ws.split();
-
-    let paired = next_text(&mut rx, "เครื่องปลายทางตอบรับ", 60).await?;
-    if !paired.contains("\"paired\"") {
-        bail!("unexpected relay message");
+    let relay = async move {
+        let (ws, _) = crate::net::connect_ws(req).await.context("เชื่อมต่อ relay ไม่สำเร็จ")?;
+        let mut l = crate::direct::link(ws, crate::direct::Path::Relay, Default::default());
+        let paired = next_text(&mut l.rx, "เครื่องปลายทางตอบรับ", 60).await?;
+        if !paired.contains("\"paired\"") {
+            bail!("unexpected relay message");
+        }
+        Ok(l)
+    };
+    // Direct (LAN/TCP) and P2P (QUIC) candidates race the relay; the relay is always the fallback.
+    let keys = ViewerKeys::new();
+    let direct = ticket.ticket.direct.clone().filter(|_| direct).map(|d| crate::direct::ViewerDirect {
+        server_url: t.server.clone(),
+        sid: ticket.ticket.sid.clone(),
+        ticket: d,
+        epk: B64.encode(keys.epk),
+        only: t.only,
+    });
+    if direct.is_none() && t.only.is_some_and(|o| o != crate::direct::Path::Relay) {
+        bail!("the server offered no direct path for this session");
     }
-    v.update(|st| st.phase = Phase::Handshake);
+    let crate::direct::Link { mut tx, mut rx, path, keep: _keep } = crate::direct::viewer_race(direct, relay).await?;
+    tracing::info!("viewer {}: connected via {}", t.device_id, path.as_str());
+    v.update(|st| {
+        st.phase = Phase::Handshake;
+        st.path = Some(path);
+    });
 
     // 3. End-to-end key exchange, authenticated by the device's registered key.
-    let keys = ViewerKeys::new();
     tx.send(Message::Text(json!({"t": "hello", "v": 1, "epk": B64.encode(keys.epk)}).to_string().into())).await?;
     #[derive(Deserialize)]
     struct Hello {

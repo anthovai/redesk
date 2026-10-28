@@ -62,6 +62,15 @@ func run(log *slog.Logger) error {
 	}
 
 	h := hub.New(st, key, log, cfg.AllowedOrigins)
+	h.P2P = cfg.P2P
+	if cfg.P2P && cfg.UDPPort > 0 {
+		if err := h.ServeUDP(ctx, cfg.UDPPort); err != nil {
+			log.Warn("UDP rendezvous disabled (P2P hole punching off; LAN direct still works)", "port", cfg.UDPPort, "err", err)
+		} else {
+			h.UDPPort = cfg.UDPPort
+			log.Info("P2P rendezvous and NAT probe", "udp", cfg.UDPPort, "nat_test", cfg.UDPPort+1)
+		}
+	}
 	a := api.New(cfg, st, h, key, v, log)
 
 	srv := &http.Server{

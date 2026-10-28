@@ -563,6 +563,79 @@ impl App {
         if lan_changed {
             self.save_config(|c| c.lan_discovery = lan_on);
         }
+
+        card_title(ui, "การเชื่อมต่อโดยตรง (P2P)");
+        let mut direct_on = c.direct_enabled;
+        let direct_changed = card(ui, |ui| {
+            let changed = switch_row(
+                ui,
+                "อนุญาตการเชื่อมต่อโดยตรง",
+                "เชื่อมต่อตรงในวงแลน หรือ P2P ผ่าน UDP hole punching แทนการส่งผ่าน relay ของเซิร์ฟเวอร์ ข้อมูลยังเข้ารหัสต้นทาง-ปลายทางเหมือนเดิม ปิดเพื่อบังคับใช้ relay เสมอ (นโยบายองค์กร)",
+                &mut direct_on,
+            );
+            sep(ui);
+            info_row(ui, "พอร์ตเชื่อมต่อตรง", &format!("TCP {}", c.direct_port), false);
+            let nat = crate::direct::nat_type().map(|n| n.label()).unwrap_or("ยังไม่ได้ตรวจ");
+            info_row(ui, "ประเภท NAT", nat, false);
+            ui.add_space(4.0);
+            changed
+        });
+        if direct_changed {
+            self.save_config(|c| c.direct_enabled = direct_on);
+        }
+
+        self.proxy_card(ui, c);
+    }
+
+    /// SOCKS5 / HTTP CONNECT proxy for every connection to the server. The form lives in egui's
+    /// temporary memory; a blank password keeps the stored one.
+    fn proxy_card(&mut self, ui: &mut Ui, c: &Config) {
+        let pal = Palette::of(ui);
+        card_title(ui, "พร็อกซี");
+        let fid = egui::Id::unique("aegiron-settings-proxy-form");
+        let mut f: ProxyForm = ui.ctx().data(|d| d.get_temp(fid)).unwrap_or_else(|| ProxyForm::from_config(c.proxy.as_ref()));
+        let save = card(ui, |ui| {
+            ui.add_space(8.0);
+            hint(ui, "ใช้กับทุกการเชื่อมต่อไปยังเซิร์ฟเวอร์ (signaling, relay และ HTTPS API) TLS ยังตรวจใบรับรองเต็มรูปแบบเหมือนเดิม การเชื่อมต่อโดยตรง/P2P ไม่ผ่านพร็อกซี");
+            text_tabs(ui, &mut f.kind, &[(0u8, "ไม่ใช้"), (1, "SOCKS5"), (2, "HTTP")]);
+            if f.kind != 0 {
+                fn field<'a>(hint: &str, v: &'a mut String, w: f32, pw: bool) -> TextEdit<'a> {
+                    TextEdit::singleline(v).password(pw).hint_text(hint).margin(Margin::symmetric(10, 8)).desired_width(w).char_limit(255)
+                }
+                ui.horizontal(|ui| {
+                    let w = (ui.available_width() - 110.0).max(120.0);
+                    ui.add(field("โฮสต์ เช่น proxy.example.com", &mut f.host, w, false));
+                    ui.add(field("พอร์ต", &mut f.port, 90.0, false));
+                });
+                ui.horizontal(|ui| {
+                    let w = ((ui.available_width() - 8.0) / 2.0).max(100.0);
+                    ui.add(field("ชื่อผู้ใช้ (ถ้ามี)", &mut f.user, w, false));
+                    let pw_hint = if f.has_password { "รหัสผ่าน (เว้นว่าง = ใช้รหัสเดิม)" } else { "รหัสผ่าน (ถ้ามี)" };
+                    ui.add(field(pw_hint, &mut f.pass, w, true));
+                });
+            }
+            let save = ui
+                .horizontal(|ui| {
+                    ui.set_min_height(40.0);
+                    let save = secondary(ui, "บันทึกพร็อกซี", None).clicked();
+                    let now = c.proxy.as_ref().map(|p| format!("ใช้อยู่: {}", p.display())).unwrap_or_else(|| "ไม่ได้ใช้พร็อกซี".into());
+                    ui.label(RichText::new(now).size(12.5).color(pal.muted));
+                    save
+                })
+                .inner;
+            ui.add_space(4.0);
+            save
+        });
+        if save {
+            match f.to_config(c.proxy.as_ref()) {
+                Ok(p) => {
+                    self.save_config(|c| c.proxy = p);
+                    f = ProxyForm::from_config(agent_proxy(self).as_ref());
+                }
+                Err(e) => self.flash(e),
+            }
+        }
+        ui.ctx().data_mut(|d| d.insert_temp(fid, f));
     }
 
     fn page_account(&mut self, ui: &mut Ui, c: &Config) {
@@ -705,5 +778,59 @@ impl App {
             }
             _ => {}
         }
+    }
+}
+
+fn agent_proxy(app: &App) -> Option<crate::net::ProxyConfig> {
+    app.agent.as_ref().and_then(|a| a.config.lock().unwrap().proxy.clone())
+}
+
+/// Proxy fields being edited in Settings → Network (0 = none, 1 = SOCKS5, 2 = HTTP).
+#[derive(Clone, Default)]
+struct ProxyForm {
+    kind: u8,
+    host: String,
+    port: String,
+    user: String,
+    pass: String,
+    has_password: bool,
+}
+
+impl ProxyForm {
+    fn from_config(p: Option<&crate::net::ProxyConfig>) -> Self {
+        use crate::net::ProxyKind;
+        let Some(p) = p else { return Self::default() };
+        Self {
+            kind: if p.kind == ProxyKind::Socks5 { 1 } else { 2 },
+            host: p.host.clone(),
+            port: p.port.to_string(),
+            user: p.username.clone().unwrap_or_default(),
+            pass: String::new(),
+            has_password: p.password.as_ref().is_some_and(|s| !s.is_empty()),
+        }
+    }
+
+    /// The proxy to store; a blank password keeps `old`'s for the same user.
+    fn to_config(&self, old: Option<&crate::net::ProxyConfig>) -> Result<Option<crate::net::ProxyConfig>, String> {
+        use crate::net::{ProxyConfig, ProxyKind};
+        if self.kind == 0 {
+            return Ok(None);
+        }
+        let port = self.port.trim().parse::<u16>().ok().filter(|p| *p > 0).ok_or("พอร์ตพร็อกซีไม่ถูกต้อง")?;
+        let user = self.user.trim().to_string();
+        let password = if !self.pass.is_empty() {
+            Some(self.pass.clone())
+        } else {
+            old.filter(|o| o.username.as_deref() == Some(user.as_str())).and_then(|o| o.password.clone())
+        };
+        let p = ProxyConfig {
+            kind: if self.kind == 1 { ProxyKind::Socks5 } else { ProxyKind::Http },
+            host: self.host.trim().trim_start_matches('[').trim_end_matches(']').to_string(),
+            port,
+            password: password.filter(|_| !user.is_empty()),
+            username: (!user.is_empty()).then_some(user),
+        };
+        p.validate().map_err(|_| "ที่อยู่พร็อกซีไม่ถูกต้อง".to_string())?;
+        Ok(Some(p))
     }
 }

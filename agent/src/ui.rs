@@ -1159,7 +1159,8 @@ impl App {
             return;
         };
         let insecure = agent.config.lock().unwrap().allow_insecure_transport;
-        let target = crate::viewer::Target { server, token: acc.token, insecure, device_id: id.to_string(), name: name.to_string() };
+        let direct = agent.config.lock().unwrap().direct_enabled;
+        let target = crate::viewer::Target { server, token: acc.token, insecure, device_id: id.to_string(), name: name.to_string(), direct, only: None };
         // Frames arrive on the network thread: wake that connection's own window.
         let viewport = egui::ViewportId::from_hash_of(("remote", id, Instant::now()));
         let rctx = ctx.clone();

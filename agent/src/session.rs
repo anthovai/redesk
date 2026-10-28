@@ -12,7 +12,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::{mpsc, watch};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::tungstenite::Message;
 
 use crate::capture::{self, Params};
 use crate::codec::Codec;
@@ -35,18 +35,15 @@ struct Hello {
     epk: String,
 }
 
-pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer: Viewer) -> Result<()> {
+pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer: Viewer, direct: Option<crate::direct::Offer>) -> Result<()> {
     let base = agent.config.lock().unwrap().ws_base()?;
     let url = format!("{base}{relay}?sid={sid}&token={token}");
-    let (ws, _) = connect_async(url.as_str()).await.context("relay connect")?;
-    let (mut tx, mut rx) = ws.split();
 
-    // 1. Wait for the server to pair us with the viewer, then read the viewer's ephemeral key.
-    let paired = read_text(&mut rx, "pairing", 60).await?;
-    if !paired.contains(r#""paired""#) {
-        bail!("unexpected relay message: {paired}");
-    }
-    let hello: Hello = serde_json::from_str(&read_text(&mut rx, "viewer hello", 30).await?)?;
+    // 1. Wait for the viewer on the relay (or a direct/P2P path when offered), then read its
+    //    ephemeral key. The handshake below is identical on every path.
+    let (link, hello) = crate::direct::agent_link(&agent, sid, url, direct).await?;
+    let crate::direct::Link { mut tx, mut rx, path: _, keep: _keep } = link;
+    let hello: Hello = serde_json::from_str(&hello)?;
     if hello.t != "hello" || hello.v != 1 {
         bail!("unsupported viewer protocol");
     }
@@ -249,23 +246,6 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
 }
 
 type WsError = tokio_tungstenite::tungstenite::Error;
-
-async fn read_text<S>(rx: &mut S, what: &str, secs: u64) -> Result<String>
-where
-    S: futures_util::Stream<Item = Result<Message, WsError>> + Unpin,
-{
-    loop {
-        let m = tokio::time::timeout(Duration::from_secs(secs), rx.next())
-            .await
-            .with_context(|| format!("timed out waiting for {what}"))?
-            .ok_or(anyhow!("relay closed"))??;
-        match m {
-            Message::Text(t) => return Ok(t.as_str().to_owned()),
-            Message::Close(_) => bail!("relay closed"),
-            _ => {}
-        }
-    }
-}
 
 async fn send_json<K>(tx: &mut K, ch: &mut Channel, v: serde_json::Value) -> Result<()>
 where

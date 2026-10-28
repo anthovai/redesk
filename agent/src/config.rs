@@ -95,10 +95,24 @@ pub struct Config {
     /// argon2id PHC hash of the 4-8 digit PIN that guards Settings and sign-out in the app.
     #[serde(default)]
     pub unlock_pin: Option<String>,
+    /// Allow direct sessions (LAN/TCP and P2P over UDP hole punching). False = always through
+    /// the server relay (enterprise policy). Applies to both incoming and outgoing sessions.
+    #[serde(default = "yes")]
+    pub direct_enabled: bool,
+    /// TCP port this device accepts direct sessions on (a random port is used when busy).
+    #[serde(default = "default_direct_port")]
+    pub direct_port: u16,
+    /// Outbound proxy for every connection to the server (signaling, relay, HTTPS API).
+    #[serde(default)]
+    pub proxy: Option<crate::net::ProxyConfig>,
 }
 
 fn yes() -> bool {
     true
+}
+
+fn default_direct_port() -> u16 {
+    crate::direct::DEFAULT_PORT
 }
 
 impl Config {
@@ -127,6 +141,9 @@ impl Config {
             account: None,
             lan_discovery: true,
             unlock_pin: None,
+            direct_enabled: true,
+            direct_port: crate::direct::DEFAULT_PORT,
+            proxy: None,
         })
     }
 
@@ -139,7 +156,9 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let s = std::fs::read_to_string(path)
             .with_context(|| format!("cannot read {} (run `aegiron-agent init` first)", path.display()))?;
-        toml::from_str(&s).context("invalid agent config")
+        let c: Self = toml::from_str(&s).context("invalid agent config")?;
+        crate::net::set_proxy(c.proxy.clone());
+        Ok(c)
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -154,6 +173,7 @@ impl Config {
             std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
         }
         std::fs::rename(&tmp, path)?;
+        crate::net::set_proxy(self.proxy.clone());
         Ok(())
     }
 

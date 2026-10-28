@@ -32,7 +32,7 @@ pub struct Release {
 }
 
 fn agent(timeout: Option<Duration>) -> ureq::Agent {
-    ureq::Agent::config_builder()
+    crate::net::with_proxy(ureq::Agent::config_builder())
         .http_status_as_error(false)
         .timeout_global(timeout)
         .timeout_connect(Some(Duration::from_secs(15)))

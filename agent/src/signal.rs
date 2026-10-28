@@ -11,7 +11,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::mpsc;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::tungstenite::Message;
 
 use crate::config::Config;
 use crate::crypto;
@@ -106,13 +106,26 @@ enum ServerMsg {
     #[serde(rename = "challenge")]
     Challenge { nonce: String },
     #[serde(rename = "registered")]
-    Registered { sig: String },
+    Registered {
+        sig: String,
+        /// UDP port of the server's NAT probe / P2P rendezvous (absent on older servers).
+        #[serde(default)]
+        udp_port: Option<u16>,
+    },
     #[serde(rename = "error")]
     Error { code: String, message: String },
     #[serde(rename = "pong")]
     Pong,
     #[serde(rename = "session")]
-    Session { sid: String, token: String, relay: String, viewer: Viewer },
+    Session {
+        sid: String,
+        token: String,
+        relay: String,
+        viewer: Viewer,
+        /// Present when the viewer may also connect directly (see direct.rs).
+        #[serde(default)]
+        direct: Option<crate::direct::Offer>,
+    },
     /// Wake-on-LAN request: send magic packets for these MACs on our LAN.
     #[serde(rename = "wol")]
     Wol {
@@ -177,14 +190,14 @@ pub async fn run_forever(agent: Arc<Agent>) {
 }
 
 async fn run_once(agent: &Arc<Agent>) -> Result<()> {
-    let (url, id, server_key, enroll) = {
+    let (url, id, server_key, enroll, direct) = {
         let c = agent.config.lock().unwrap();
-        (format!("{}/ws/agent", c.ws_base()?), c.id.clone(), c.server_key.clone(), c.enroll_token.clone())
+        (format!("{}/ws/agent", c.ws_base()?), c.id.clone(), c.server_key.clone(), c.enroll_token.clone(), c.direct_enabled)
     };
     let server_key: [u8; 32] = B64.decode(&server_key)?.try_into().map_err(|_| anyhow!("bad server key"))?;
     let server_key = VerifyingKey::from_bytes(&server_key)?;
 
-    let (ws, _) = connect_async(url.as_str()).await.with_context(|| format!("connect {url}"))?;
+    let (ws, _) = crate::net::connect_ws(url.as_str()).await.with_context(|| format!("connect {url}"))?;
     let (mut tx, mut rx) = ws.split();
 
     let ServerMsg::Challenge { nonce: server_nonce } = next_msg(&mut rx).await? else { bail!("expected challenge") };
@@ -203,16 +216,24 @@ async fn run_once(agent: &Arc<Agent>) -> Result<()> {
         "enroll_token": enroll,
         "macs": net.macs,
         "lan": net.lan,
+        // Advertised even when direct sessions are off: the agent then declines each offer at
+        // once (see direct::agent_link), so toggling the setting needs no reconnect.
+        "features": [crate::direct::FEATURE],
+        "nat": crate::direct::nat_type().map(|n| n.as_str()),
     });
     tx.send(Message::Text(reg.to_string().into())).await?;
 
     match next_msg(&mut rx).await? {
-        ServerMsg::Registered { sig } => {
+        ServerMsg::Registered { sig, udp_port } => {
             let sig: [u8; 64] = B64.decode(sig)?.try_into().map_err(|_| anyhow!("bad server signature"))?;
             let msg = format!("redesk-server-v1\n{id}\n{my_nonce}\n{server_nonce}");
             server_key
                 .verify(msg.as_bytes(), &Signature::from_bytes(&sig))
                 .map_err(|_| anyhow!("Handshake failed: invalid public key from server (pinned key mismatch)"))?;
+            if let Some(port) = udp_port.filter(|p| *p > 0 && direct) {
+                let server_url = agent.config.lock().unwrap().server_url.clone();
+                tokio::spawn(crate::direct::probe_and_store(server_url, port));
+            }
         }
         ServerMsg::Error { code, message } => {
             let mut c = agent.config.lock().unwrap();
@@ -248,11 +269,11 @@ async fn run_once(agent: &Arc<Agent>) -> Result<()> {
             m = tokio::time::timeout(Duration::from_secs(70), rx.next()) => {
                 let Some(m) = m.context("server silent for 70s")? else { return Ok(()) };
                 match parse(m?) {
-                    Some(ServerMsg::Session { sid, token, relay, viewer }) => {
+                    Some(ServerMsg::Session { sid, token, relay, viewer, direct }) => {
                         let agent = agent.clone();
                         tokio::spawn(async move {
                             tracing::info!("session {sid} requested by {} from {}", viewer.email, viewer.ip);
-                            if let Err(e) = crate::session::run(agent.clone(), &sid, &token, &relay, viewer).await {
+                            if let Err(e) = crate::session::run(agent.clone(), &sid, &token, &relay, viewer, direct).await {
                                 tracing::warn!("session {sid} ended: {e:#}");
                                 agent.send_server(json!({"t": "session_reject", "sid": sid, "reason": format!("{e}")}));
                             }

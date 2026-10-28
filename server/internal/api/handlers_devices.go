@@ -312,7 +312,7 @@ func (a *API) createSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ip := a.clientIP(r)
-	t, err := a.hub.StartSession(r.Context(), d.ID, u.ID, hub.ViewerInfo{Email: u.Email, Name: u.Name, IP: ip})
+	t, err := a.hub.StartSession(r.Context(), d.ID, u.ID, hub.ViewerInfo{Email: u.Email, Name: u.Name, IP: ip}, r.URL.Query().Get("direct") == "1")
 	switch {
 	case errors.Is(err, hub.ErrOffline):
 		writeErr(w, http.StatusConflict, "device is offline")
