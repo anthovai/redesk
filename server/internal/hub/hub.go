@@ -49,9 +49,15 @@ type Hub struct {
 	// device's one-time upload token ("" = not recorded).
 	RecordingToken func(ctx context.Context, sid, deviceID string, userID int64, viewerIP string) string
 
-	mu     sync.Mutex
-	agents map[string]*agentConn
-	relays map[string]*relay
+	// P2P allows direct/P2P sessions (AEGIRON_P2P); UDPPort is the rendezvous/NAT-probe
+	// port (0 = no UDP, so no hole punching; LAN/TCP direct still works).
+	P2P     bool
+	UDPPort int
+
+	mu      sync.Mutex
+	agents  map[string]*agentConn
+	relays  map[string]*relay
+	directs map[string]*relay // sessions offered a direct path, by sid
 }
 
 func New(s *store.Store, key ed25519.PrivateKey, log *slog.Logger, origins []string) *Hub {
@@ -60,14 +66,16 @@ func New(s *store.Store, key ed25519.PrivateKey, log *slog.Logger, origins []str
 		ClientIP: func(r *http.Request) string { return r.RemoteAddr },
 		agents:   map[string]*agentConn{},
 		relays:   map[string]*relay{},
+		directs:  map[string]*relay{},
 	}
 }
 
 type agentConn struct {
-	id   string
-	ip   string
-	conn *websocket.Conn
-	out  chan []byte
+	id     string
+	ip     string
+	conn   *websocket.Conn
+	out    chan []byte
+	direct bool // advertised FeatureDirect
 }
 
 func (a *agentConn) send(v any) bool {
@@ -122,6 +130,9 @@ type registerMsg struct {
 	// LAN facts for Wake-on-LAN (optional; older agents omit them).
 	Macs []string        `json:"macs,omitempty"`
 	LAN  []store.LanAddr `json:"lan,omitempty"`
+	// Optional capabilities, e.g. "direct1" (older agents omit them).
+	Features []string `json:"features,omitempty"`
+	NAT      string   `json:"nat,omitempty"`
 }
 
 type agentMsg struct {
@@ -130,6 +141,14 @@ type agentMsg struct {
 	Reason string         `json:"reason,omitempty"`
 	Kind   string         `json:"kind,omitempty"`
 	Detail map[string]any `json:"detail,omitempty"`
+	// direct_offer / direct_started / direct_ended
+	TCP           []string `json:"tcp,omitempty"`
+	Cert          string   `json:"cert,omitempty"`
+	NAT           string   `json:"nat,omitempty"`
+	Disabled      bool     `json:"disabled,omitempty"`
+	Path          string   `json:"path,omitempty"`
+	BytesToViewer int64    `json:"bytes_to_viewer,omitempty"`
+	BytesToAgent  int64    `json:"bytes_to_agent,omitempty"`
 }
 
 // agentEvents are the session events an agent may report into the audit log.
@@ -165,10 +184,14 @@ func (h *Hub) HandleAgent(w http.ResponseWriter, r *http.Request) {
 
 	defer func() {
 		h.mu.Lock()
-		if h.agents[a.id] == a {
+		current := h.agents[a.id] == a
+		if current {
 			delete(h.agents, a.id)
 		}
 		h.mu.Unlock()
+		if current {
+			h.endDirectSessionsOf(a.id)
+		}
 		h.log.Info("agent offline", "id", a.id)
 	}()
 
@@ -214,6 +237,12 @@ func (h *Hub) HandleAgent(w http.ResponseWriter, r *http.Request) {
 			h.rejectRelay(m.SID, a.id, m.Reason)
 		case "event":
 			h.agentEvent(ctx, a, m)
+		case "direct_offer":
+			h.handleDirectOffer(a, m)
+		case "direct_started":
+			h.directStarted(ctx, a, m)
+		case "direct_ended":
+			h.handleDirectEnded(a, m)
 		}
 	}
 }
@@ -294,10 +323,18 @@ func (h *Hub) registerAgent(ctx context.Context, c *websocket.Conn, ip string) (
 
 	// Prove server identity: agents pin this key and abort on mismatch.
 	serverSig := ed25519.Sign(h.key, []byte("redesk-server-v1\n"+m.ID+"\n"+m.Nonce+"\n"+sn))
-	if err := writeJSON(wctx, c, map[string]string{"t": "registered", "sig": base64.StdEncoding.EncodeToString(serverSig)}); err != nil {
+	reg := map[string]any{"t": "registered", "sig": base64.StdEncoding.EncodeToString(serverSig)}
+	if h.P2P && h.UDPPort > 0 {
+		reg["udp_port"] = h.UDPPort // for the agent's NAT-type probe
+	}
+	if err := writeJSON(wctx, c, reg); err != nil {
 		return nil, err
 	}
-	return &agentConn{id: m.ID, ip: ip, conn: c, out: make(chan []byte, 16)}, nil
+	direct := false
+	for _, f := range m.Features {
+		direct = direct || f == FeatureDirect
+	}
+	return &agentConn{id: m.ID, ip: ip, conn: c, out: make(chan []byte, 16), direct: direct}, nil
 }
 
 // agentEvent records an agent-reported session event, attributed to the session's viewer.
@@ -317,7 +354,11 @@ func (h *Hub) agentEvent(ctx context.Context, a *agentConn, m agentMsg) {
 	var actor *int64
 	ip := ""
 	h.mu.Lock()
-	if rl := h.relays[m.SID]; rl != nil && rl.deviceID == a.id {
+	rl := h.relays[m.SID]
+	if rl == nil {
+		rl = h.directs[m.SID]
+	}
+	if rl != nil && rl.deviceID == a.id {
 		uid := rl.userID
 		actor, ip = &uid, rl.viewerIP
 	}

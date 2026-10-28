@@ -90,6 +90,7 @@ struct Frame1<'a> {
     kbps: u32,
     codec: &'a str,
     fb: (usize, usize),
+    path: Option<crate::direct::Path>,
 }
 
 impl ViewerWindow {
@@ -124,7 +125,7 @@ impl ViewerWindow {
         self.demo_state(&ctx, w);
 
         // Pull new screen regions into the GPU texture and pick up state for this frame.
-        let (phase, error, name, fp, info, fps, kbps, clip, transfers, fb_size, cursor, codec) = {
+        let (phase, error, name, fp, info, fps, kbps, clip, transfers, fb_size, cursor, codec, path) = {
             let mut st = self.viewer.state.lock().unwrap();
             if st.fb.w > 0 {
                 let opts = egui::TextureOptions::LINEAR;
@@ -161,6 +162,7 @@ impl ViewerWindow {
                 (st.fb.w, st.fb.h),
                 st.cursor,
                 st.codec.clone(),
+                st.path,
             )
         };
         let connected = phase == Phase::Connected;
@@ -237,7 +239,7 @@ impl ViewerWindow {
         });
 
         if connected {
-            let f = Frame1 { name: &name, id: &self.device_id, fp: &fp, info: info.as_ref(), fps, kbps, codec: &codec, fb: fb_size };
+            let f = Frame1 { name: &name, id: &self.device_id, fp: &fp, info: info.as_ref(), fps, kbps, codec: &codec, fb: fb_size, path };
             if w.show_quality {
                 self.quality_monitor(&ctx, &f);
             }
@@ -597,6 +599,9 @@ impl ViewerWindow {
                     egui::Grid::new(("quality-grid", self.viewport)).num_columns(2).spacing(vec2(14.0, 3.0)).show(ui, |ui| {
                         ui.label(key("ID"));
                         ui.label(val(format_id(&self.device_id)));
+                        ui.end_row();
+                        ui.label(key("เส้นทาง"));
+                        ui.label(val(f.path.map_or("–", |p| p.label()).to_string()));
                         ui.end_row();
                         ui.label(key("ความเร็ว"));
                         ui.label(val(format!("{} kbps", f.kbps)));

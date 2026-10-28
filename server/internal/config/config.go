@@ -30,6 +30,10 @@ type Config struct {
 	PublicURL string
 	// AEGIRON_RECORDING_MAX_MB: largest session recording an agent may upload (default 4096)
 	RecordingMaxMB int64
+	// AEGIRON_P2P: offer direct/P2P sessions to native viewers (default true). False = relay only.
+	P2P bool
+	// AEGIRON_UDP_PORT: UDP rendezvous for hole punching and NAT probe; also uses port+1 (default 21116, 0 = off)
+	UDPPort int
 }
 
 func Load() Config {
@@ -58,6 +62,11 @@ func Load() Config {
 	c.RecordingMaxMB, _ = strconv.ParseInt(env("AEGIRON_RECORDING_MAX_MB", "4096"), 10, 64)
 	if c.RecordingMaxMB < 1 {
 		c.RecordingMaxMB = 4096
+	}
+	c.P2P = envBool("AEGIRON_P2P", true)
+	c.UDPPort, _ = strconv.Atoi(env("AEGIRON_UDP_PORT", "21116"))
+	if c.UDPPort < 0 || c.UDPPort > 65534 {
+		c.UDPPort = 0
 	}
 	c.CookieSecure = envBool("AEGIRON_COOKIE_SECURE", c.TLSCert != "")
 	for _, o := range strings.Split(getenv("AEGIRON_ALLOWED_ORIGINS"), ",") {

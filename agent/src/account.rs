@@ -12,7 +12,7 @@ use serde_json::json;
 use crate::config::check_server_url;
 
 fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
+    crate::net::with_proxy(ureq::Agent::config_builder())
         .http_status_as_error(false)
         .timeout_global(Some(Duration::from_secs(15)))
         .user_agent(concat!("Aegiron/", env!("CARGO_PKG_VERSION")))
@@ -168,6 +168,9 @@ pub struct Ticket {
     pub sid: String,
     pub token: String,
     pub relay_path: String,
+    /// Direct/P2P candidates, when requested and the agent offered them.
+    #[serde(default)]
+    pub direct: Option<crate::direct::Ticket>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -189,10 +192,12 @@ pub struct SessionTicket {
 }
 
 /// Asks the server to wake the remote agent and returns this viewer's relay ticket.
-pub fn start_session(server: &str, token: &str, device_id: &str) -> Result<SessionTicket, String> {
+/// `direct` also asks for direct/P2P candidates (a query flag, which older servers ignore).
+pub fn start_session(server: &str, token: &str, device_id: &str, direct: bool) -> Result<SessionTicket, String> {
+    let q = if direct { "?direct=1" } else { "" };
     call::<SessionTicket>(
         agent()
-            .post(&format!("{server}/api/sessions"))
+            .post(&format!("{server}/api/sessions{q}"))
             .header("X-Aegiron", "1")
             .header("Authorization", &format!("Bearer {token}"))
             .send_json(&json!({"device_id": device_id})),

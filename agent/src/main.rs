@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 use tokio::io::AsyncBufReadExt;
 
 use aegiron_agent::config::{ApproveMode, Config, Verification};
+use aegiron_agent::net::ProxyConfig;
 use aegiron_agent::{fingerprint, identity, service, signal};
 
 #[derive(Parser)]
@@ -77,6 +78,31 @@ enum Cmd {
         jpeg_quality: Option<u8>,
         #[arg(long)]
         max_width: Option<u32>,
+        /// Allow direct LAN/P2P sessions (false = always through the server relay)
+        #[arg(long)]
+        direct: Option<bool>,
+        /// TCP port for direct sessions (default 21118)
+        #[arg(long)]
+        direct_port: Option<u16>,
+        /// Proxy for connections to the server: socks5://host:port, http://host:port, or "none"
+        #[arg(long)]
+        proxy: Option<String>,
+        /// Proxy username (the password is prompted, or read from AEGIRON_PROXY_PASSWORD)
+        #[arg(long)]
+        proxy_user: Option<String>,
+    },
+    /// Connect to another device from the terminal (diagnostics): sign in with the remote
+    /// password, receive the screen for a few seconds and report the path (relay/direct/p2p).
+    /// The remote password is prompted, or read from AEGIRON_REMOTE_PASSWORD.
+    Connect {
+        /// Device ID
+        id: String,
+        /// Seconds to keep receiving after the first frame
+        #[arg(long, default_value_t = 3)]
+        seconds: u64,
+        /// Use only this path, without fallback: relay, direct or p2p
+        #[arg(long)]
+        only: Option<String>,
     },
     /// Show this device's id and key fingerprint.
     Info,
@@ -168,7 +194,21 @@ async fn main() -> Result<()> {
             c.save(&path)?;
             println!("Permanent password saved (verification = {:?}).", c.verification);
         }
-        Cmd::Set { verification, approve_mode, allow_input, allow_clipboard, allow_file_transfer, allow_whiteboard, max_fps, jpeg_quality, max_width } => {
+        Cmd::Set {
+            verification,
+            approve_mode,
+            allow_input,
+            allow_clipboard,
+            allow_file_transfer,
+            allow_whiteboard,
+            max_fps,
+            jpeg_quality,
+            max_width,
+            direct,
+            direct_port,
+            proxy,
+            proxy_user,
+        } => {
             let mut c = Config::load(&path)?;
             if let Some(v) = verification {
                 if v != Verification::Temporary && c.permanent_password.is_none() {
@@ -184,6 +224,26 @@ async fn main() -> Result<()> {
             if let Some(v) = max_fps { c.max_fps = v.clamp(1, 60); }
             if let Some(v) = jpeg_quality { c.jpeg_quality = v.clamp(10, 95); }
             if let Some(v) = max_width { c.max_width = v.clamp(320, 3840); }
+            if let Some(v) = direct { c.direct_enabled = v; }
+            if let Some(v) = direct_port { c.direct_port = v; }
+            match proxy.as_deref() {
+                Some("none" | "") => c.proxy = None,
+                Some(addr) => {
+                    let mut p = ProxyConfig::parse(addr)?;
+                    if let Some(user) = proxy_user.filter(|u| !u.is_empty()) {
+                        let pw = match std::env::var("AEGIRON_PROXY_PASSWORD") {
+                            Ok(p) if !p.is_empty() => p,
+                            _ => rpassword::prompt_password(format!("Proxy password for {user}: "))?,
+                        };
+                        p.username = Some(user);
+                        p.password = Some(pw);
+                    }
+                    p.validate()?;
+                    c.proxy = Some(p);
+                }
+                None if proxy_user.is_some() => bail!("--proxy-user needs --proxy"),
+                None => {}
+            }
             c.save(&path)?;
             println!("Saved.");
         }
@@ -196,6 +256,8 @@ async fn main() -> Result<()> {
             println!("Device key:   {}", fingerprint(identity(&c)?.verifying_key().as_bytes()));
             println!("Server key:   {}", fingerprint(&B64.decode(&c.server_key)?));
             println!("Input: {}, clipboard: {}, file transfer: {}, whiteboard: {}", c.allow_input, c.allow_clipboard, c.allow_file_transfer, c.allow_whiteboard);
+            println!("Direct/P2P:   {} (TCP port {})", if c.direct_enabled { "allowed" } else { "off (relay only)" }, c.direct_port);
+            println!("Proxy:        {}", c.proxy.as_ref().map(|p| p.display()).unwrap_or_else(|| "none".into()));
             service::status()?;
         }
         Cmd::ShowPassword => {
@@ -214,6 +276,7 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Uninstall => service::uninstall()?,
+        Cmd::Connect { id, seconds, only } => connect(&path, &id, seconds, only).await?,
         Cmd::Run => {
             let c = Config::load(&path)?;
             c.ws_base()?;
@@ -236,5 +299,69 @@ async fn main() -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// `aegiron-agent connect`: runs the desktop app's viewer without a window.
+async fn connect(path: &std::path::Path, id: &str, seconds: u64, only: Option<String>) -> Result<()> {
+    use aegiron_agent::direct::Path as Route;
+    use aegiron_agent::viewer::{Phase, Target, Viewer};
+    use std::time::{Duration, Instant};
+
+    let c = Config::load(path)?;
+    let acc = c.account.clone().context("sign in first: aegiron-agent login --email ...")?;
+    let only = only.map(|o| Route::parse(&o).context("--only must be relay, direct or p2p")).transpose()?;
+    if !c.direct_enabled && only.is_some_and(|o| o != Route::Relay) {
+        bail!("direct connections are turned off on this device (direct_enabled = false)");
+    }
+    let password = match std::env::var("AEGIRON_REMOTE_PASSWORD") {
+        Ok(p) if !p.is_empty() => p,
+        _ => rpassword::prompt_password(format!("Password of {id}: "))?,
+    };
+    let id = id.replace(' ', "");
+    let target = Target {
+        server: c.server_url.clone(),
+        token: acc.token,
+        insecure: c.allow_insecure_transport,
+        device_id: id.clone(),
+        name: id.clone(),
+        direct: c.direct_enabled,
+        only,
+    };
+    let viewer = Viewer::connect(target, std::sync::Arc::new(|| {}));
+    let started = Instant::now();
+    let (mut sent, mut shown) = (false, None::<Instant>);
+    loop {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (phase, error, path, w, h) = {
+            let st = viewer.state.lock().unwrap();
+            (st.phase.clone(), st.error.clone(), st.path, st.fb.w, st.fb.h)
+        };
+        match phase {
+            Phase::Closed => bail!("connection closed: {}", error.unwrap_or_default()),
+            Phase::Password if sent && error.is_some() => bail!("{}", error.unwrap_or_default()),
+            Phase::Password if !sent => {
+                viewer.submit_password(&password);
+                sent = true;
+            }
+            Phase::Connected if w > 0 && shown.is_none() => {
+                println!("connected to {id} via {} — screen {w}x{h}", path.map(|p| p.as_str()).unwrap_or("?"));
+                shown = Some(Instant::now());
+            }
+            _ => {}
+        }
+        if shown.is_some_and(|t| t.elapsed() >= Duration::from_secs(seconds)) {
+            break;
+        }
+        if started.elapsed() > Duration::from_secs(90) {
+            bail!("timed out (phase {phase:?})");
+        }
+    }
+    {
+        let st = viewer.state.lock().unwrap();
+        println!("path={} fps={} kbps={} codec={}", st.path.map(|p| p.as_str()).unwrap_or("?"), st.fps, st.kbps, st.codec);
+    }
+    viewer.close();
+    tokio::time::sleep(Duration::from_millis(500)).await;
     Ok(())
 }
