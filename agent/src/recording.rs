@@ -1,8 +1,9 @@
 //! Session recording (docs/PROTOCOL.md §7).
 //!
 //! Sessions are end-to-end encrypted, so only an endpoint can record them. The controlled
-//! machine records what it streams: the already-encoded H.264 frames or JPEG rectangles plus
-//! pointer positions, with timestamps, into a simple container (`.aerec`). After the session the
+//! machine records what it streams: the already-encoded H.264 frames or JPEG rectangles,
+//! pointer positions and, when the session streams sound, the Opus audio packets, with
+//! timestamps, into a simple container (`.aerec`). After the session the
 //! file is uploaded to the server over verified HTTPS, authenticated by the one-time token the
 //! server sent with the session request and signed with the device key. Files that could not be
 //! uploaded yet stay in `<config dir>/recordings` and are retried whenever the agent reconnects.
@@ -70,11 +71,13 @@ fn private_dir(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Whether a streamed message belongs in the recording: video and the pointer, not the
-/// clipboard, file chunks or other control traffic.
+/// Whether a streamed message belongs in the recording: video, audio and the pointer, not the
+/// clipboard, file chunks or other control traffic. Audio only reaches the recorder when the
+/// session streams it (the device allows audio and the viewer has not muted it).
 fn wanted(plain: &[u8]) -> bool {
     match plain.first() {
         Some(&proto::MSG_FRAME) | Some(&proto::MSG_VIDEO) => true,
+        Some(&proto::MSG_AUDIO) => proto::parse_audio(plain).is_some(),
         Some(&proto::MSG_JSON) => {
             let head = &plain[1..plain.len().min(40)];
             head.windows(12).any(|w| w == br#""t":"cursor""#)
@@ -340,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn records_video_and_pointer_only() {
+    fn records_video_audio_and_pointer_only() {
         let root = std::env::temp_dir().join(format!("aegiron-rec-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let dir = dir_for(&root.join("agent.toml"));
@@ -349,6 +352,8 @@ mod tests {
         r.record(&proto::json(&serde_json::json!({"t": "clip", "s": "secret"})));
         r.record(&proto::file_chunk(1, b"file data"));
         r.record(&proto::json(&serde_json::json!({"t": "cursor", "x": 0.5, "y": 0.5, "visible": true})));
+        r.record(&proto::audio(proto::AUDIO_OPUS, 7, &[0xfc, 0xff, 0xfe]));
+        r.record(&[proto::MSG_AUDIO, proto::AUDIO_OPUS, 0, 0]); // malformed: not recorded
         let mut jpeg = proto::frame_header(0, 0, 64, 48);
         jpeg.extend_from_slice(&[0xff, 0xd8]);
         r.record(&jpeg);
@@ -362,8 +367,10 @@ mod tests {
         assert_eq!(header["device_id"], "123456789");
         let recs = records(&bytes);
         let types: Vec<u8> = recs.iter().map(|(_, p)| p[0]).collect();
-        assert_eq!(types, vec![proto::MSG_VIDEO, proto::MSG_JSON, proto::MSG_FRAME, proto::MSG_JSON]);
-        assert!(String::from_utf8_lossy(&recs[3].1).contains("\"end\""));
+        assert_eq!(types, vec![proto::MSG_VIDEO, proto::MSG_JSON, proto::MSG_AUDIO, proto::MSG_FRAME, proto::MSG_JSON]);
+        assert!(recs.windows(2).all(|w| w[0].0 <= w[1].0));
+        assert_eq!(proto::parse_audio(&recs[2].1), Some((proto::AUDIO_OPUS, 7, &[0xfc, 0xff, 0xfe][..])));
+        assert!(String::from_utf8_lossy(&recs[4].1).contains("\"end\""));
         assert!(!bytes.windows(6).any(|w| w == b"secret"));
 
         // A crash mid-record: salvage keeps the complete records only.
@@ -372,7 +379,7 @@ mod tests {
         fs::write(dir.join("sid_2.json"), b"{}").unwrap();
         recover(&root.join("agent.toml"));
         let salvaged = fs::read(dir.join("sid_2.aerec")).unwrap();
-        assert_eq!(records(&salvaged).len(), 3);
+        assert_eq!(records(&salvaged).len(), 4);
         fs::remove_dir_all(&root).unwrap();
     }
 }

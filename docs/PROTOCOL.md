@@ -203,7 +203,13 @@ u32 BE header length, JSON header {"v":1,"sid","device_id","hostname","os","star
 records until EOF: u32 BE milliseconds since start, u32 BE payload length (1..32 MiB), payload
 ```
 
-A payload is a plaintext channel message exactly as streamed: `0x04` H.264 frames, `0x02` JPEG rectangles (a session can switch from H.264 to JPEG), and `0x01` `cursor` messages. Clipboard, file chunks and other control traffic are not recorded. The last record is `{"t":"end"}` so idle time at the end counts. The browser plays it with WebCodecs (H.264) and `createImageBitmap` (JPEG), seeking from the nearest H.264 keyframe or full-screen JPEG rectangle.
+A payload is a plaintext channel message exactly as streamed: `0x04` H.264 frames, `0x02` JPEG rectangles (a session can switch from H.264 to JPEG), `0x01` `cursor` messages and `0x05` audio packets. Clipboard, file chunks and other control traffic are not recorded. The last record is `{"t":"end"}` so idle time at the end counts. The browser plays it with WebCodecs (H.264) and `createImageBitmap` (JPEG), seeking from the nearest H.264 keyframe or full-screen JPEG rectangle.
+
+Audio (recordings made before audio was recorded have no `0x05` records and play as before):
+
+- The agent records exactly the `0x05` packets it sends to the viewer, timestamped like video when they are sent. A session without audio (`info.audio` false: the viewer did not ask for it, the device does not allow it with `allow_audio`, or the platform cannot capture) records none. While the viewer has muted audio (`{"t":"audio","on":false}`), no packets are captured or sent, so that stretch of the recording is silent. Packets the agent drops under congestion are missing from the recording too.
+- The container stays `AEGREC1` / header `v:1`: readers skip record types they do not know, so older servers accept these files and older consoles play them without sound. The server validates `0x05` records (codec byte, sequence, at least one byte of Opus) and stores `audio = "opus"` on the recording when it has any (`GET /api/recordings` field `audio`, `""` otherwise).
+- Playback: the browser places consecutive packets 20 ms apart by sequence number while that stays within 100 ms of their record time (a sequence gap or larger drift starts again at the record time), decodes them with WebCodecs `AudioDecoder` about 400 ms ahead of the playback position and schedules each block in Web Audio at the time that matches the video clock. Seeking, pausing and changing speed drop everything scheduled and restart from the new position, so audio and video cannot drift apart. Sound plays at 1× and 2× (`playbackRate`, pitch not corrected) and is silent at 4× and 8×. The player has a mute button (key `m`); if the browser blocks autoplay, the button asks for a click. The desktop app has no recording player.
 
 ## 8. Whiteboard (annotations)
 

@@ -23,6 +23,7 @@ type Recording struct {
 	SHA256     string     `json:"sha256"`
 	Codec      string     `json:"codec"`
 	Frames     int        `json:"frames"`
+	Audio      string     `json:"audio"` // "opus" or "" (no sound recorded)
 }
 
 // RecordingMeta is what the server learns from a validated upload.
@@ -32,17 +33,18 @@ type RecordingMeta struct {
 	SHA256     string
 	Codec      string
 	Frames     int
+	Audio      string
 }
 
 const recordingCols = `r.id, r.sid, r.device_id, COALESCE(NULLIF(d.alias, ''), d.hostname, ''), r.user_id, u.email, r.viewer_ip,
-	r.status, r.created_at, r.uploaded_at, r.duration_ms, r.size_bytes, r.sha256, r.codec, r.frames`
+	r.status, r.created_at, r.uploaded_at, r.duration_ms, r.size_bytes, r.sha256, r.codec, r.frames, r.audio`
 
 const recordingFrom = ` FROM session_recordings r LEFT JOIN users u ON u.id=r.user_id LEFT JOIN devices d ON d.id=r.device_id`
 
 func scanRecording(row scanner) (*Recording, error) {
 	var r Recording
 	err := row.Scan(&r.ID, &r.SID, &r.DeviceID, &r.DeviceName, &r.UserID, &r.UserEmail, &r.ViewerIP,
-		&r.Status, &r.CreatedAt, &r.UploadedAt, &r.DurationMS, &r.SizeBytes, &r.SHA256, &r.Codec, &r.Frames)
+		&r.Status, &r.CreatedAt, &r.UploadedAt, &r.DurationMS, &r.SizeBytes, &r.SHA256, &r.Codec, &r.Frames, &r.Audio)
 	if err != nil {
 		return nil, notFound(err)
 	}
@@ -88,8 +90,8 @@ func (s *Store) MarkRecordingStarted(ctx context.Context, sid, deviceID string) 
 // CompleteRecording marks an upload as stored and burns its token.
 func (s *Store) CompleteRecording(ctx context.Context, id int64, m RecordingMeta) error {
 	tag, err := s.DB.Exec(ctx, `UPDATE session_recordings SET status='ready', token_hash=NULL, uploaded_at=now(),
-		duration_ms=$2, size_bytes=$3, sha256=$4, codec=$5, frames=$6 WHERE id=$1 AND status='pending'`,
-		id, m.DurationMS, m.SizeBytes, m.SHA256, m.Codec, m.Frames)
+		duration_ms=$2, size_bytes=$3, sha256=$4, codec=$5, frames=$6, audio=$7 WHERE id=$1 AND status='pending'`,
+		id, m.DurationMS, m.SizeBytes, m.SHA256, m.Codec, m.Frames, m.Audio)
 	if err == nil && tag.RowsAffected() == 0 {
 		return ErrNotFound
 	}

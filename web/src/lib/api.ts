@@ -279,6 +279,8 @@ export interface Recording {
 	sha256: string;
 	codec: string;
 	frames: number;
+	/** "opus" when the recording has sound, "" for silent sessions and older servers. */
+	audio?: string;
 }
 
 export interface RecordingSettings {

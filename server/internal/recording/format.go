@@ -5,7 +5,8 @@
 //	records until EOF:                   u32 BE t_ms since start, u32 BE length, payload
 //
 // A payload is one plaintext message exactly as the agent streamed it inside the encrypted
-// channel (type byte first: 0x01 JSON, 0x02 JPEG rectangle, 0x04 video frame).
+// channel (type byte first: 0x01 JSON, 0x02 JPEG rectangle, 0x04 video frame, 0x05 audio
+// packet). Recordings made before audio was recorded simply have no 0x05 records.
 package recording
 
 import (
@@ -24,7 +25,9 @@ const (
 	msgJSON   = 0x01
 	msgFrame  = 0x02
 	msgVideo  = 0x04
+	msgAudio  = 0x05
 	videoH264 = 1
+	audioOpus = 1
 )
 
 // Header is the JSON header the agent writes at the start of a recording.
@@ -37,10 +40,12 @@ type Header struct {
 
 // Info summarises a valid recording.
 type Info struct {
-	Header     Header
-	DurationMS int64
-	Frames     int
-	Codec      string // "h264", "jpeg", "h264+jpeg" or "" (no video)
+	Header       Header
+	DurationMS   int64
+	Frames       int
+	Codec        string // "h264", "jpeg", "h264+jpeg" or "" (no video)
+	Audio        string // "opus" or "" (no sound recorded)
+	AudioPackets int
 }
 
 // Scan reads a whole recording and checks its structure.
@@ -100,6 +105,20 @@ func Scan(r io.Reader) (*Info, error) {
 			}
 			rest--
 			h264 = h264 || codec[0] == videoH264
+		case msgAudio:
+			// codec u8, sequence u32 BE, then at least one byte of Opus.
+			var codec [1]byte
+			if rest < 6 {
+				return nil, fmt.Errorf("record %d: short audio packet", i)
+			}
+			if _, err := io.ReadFull(br, codec[:]); err != nil {
+				return nil, fmt.Errorf("record %d: truncated", i)
+			}
+			rest--
+			info.AudioPackets++
+			if codec[0] == audioOpus {
+				info.Audio = "opus"
+			}
 		}
 		if _, err := br.Discard(int(rest)); err != nil {
 			return nil, fmt.Errorf("record %d: truncated", i)

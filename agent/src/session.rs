@@ -236,7 +236,12 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
                 return Ok(());
             }
             pkt = audio_rx.recv(), if audio_open => match pkt {
-                Some(plain) => tx.send(Message::Binary(ch.seal(&plain)?.into())).await?,
+                Some(plain) => {
+                    if let Some(r) = recorder.rec.as_mut() {
+                        r.record(&plain);
+                    }
+                    tx.send(Message::Binary(ch.seal(&plain)?.into())).await?;
+                }
                 None => audio_open = false,
             },
             out = out_rx.recv() => {
