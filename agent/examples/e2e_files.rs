@@ -74,7 +74,7 @@ fn main() -> Result<()> {
     };
     let token = std::env::var("AEGIRON_TOKEN")?;
     let v = Viewer::connect(
-        Target { server: server.clone(), token, insecure: true, device_id: device.clone(), name: "e2e".into(), direct: false, only: None },
+        Target { server: server.clone(), token, insecure: true, device_id: device.clone(), name: "e2e".into(), direct: false, only: None, codec: aegiron_agent::codec::Codec::H264 },
         Arc::new(|| {}),
     );
     wait(&v, "password prompt", 30, |st| st.phase == Phase::Password)?;

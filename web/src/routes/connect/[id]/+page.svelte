@@ -108,6 +108,11 @@
 	});
 	const peerName = $derived(viewer.device?.alias || viewer.info?.hostname || viewer.device?.hostname || formatId(viewer.deviceId));
 	const codecLabel = $derived((viewer.info?.codec ?? 'jpeg').toUpperCase());
+	const webCodecs = $derived(viewer.info?.codec === 'h264' || viewer.info?.codec === 'av1');
+	// AV1 needs WebCodecs support here and an AV1 encoder on the remote machine (info.codecs, agents from 0.6).
+	const av1Hint = $derived(
+		!viewer.decodable.includes('av1') ? 'เบราว์เซอร์ไม่รองรับ' : !viewer.info?.codecs?.includes('av1') ? 'ปลายทางไม่รองรับ' : ''
+	);
 	const encoderNames: Record<string, string> = {
 		videotoolbox: 'VideoToolbox (ฮาร์ดแวร์)',
 		mediafoundation: 'Media Foundation (ฮาร์ดแวร์)',
@@ -519,6 +524,24 @@
 										</button>
 									{/each}
 									<div class="my-1 border-t border-line"></div>
+									<p class="px-3 pt-1 pb-1 text-xs font-medium text-muted">Codec วิดีโอ</p>
+									{#each [['h264', 'H.264', ''], ['av1', 'AV1', av1Hint]] as const as [c, label, hint] (c)}
+										<button
+											class="{mi} disabled:pointer-events-none disabled:opacity-50"
+											role="menuitemradio"
+											aria-checked={viewer.wantCodec === c}
+											disabled={!!hint}
+											title={c === 'av1' ? 'ใช้แบนด์วิดท์น้อยกว่า เมื่อเครื่องปลายทางมีตัวเข้ารหัส AV1 ฮาร์ดแวร์' : 'ค่าเริ่มต้น ใช้ได้กับทุกเครื่อง'}
+											onclick={() => act(() => viewer.setCodec(c))}
+										>
+											<span class="grid size-[15px] place-items-center">
+												<span class="size-2 rounded-full {viewer.wantCodec === c ? 'bg-accent ring-2 ring-surface' : ''}"></span>
+											</span>
+											<span class="flex-1">{label}</span>
+											{#if hint}<span class="text-[11px] text-muted">{hint}</span>{/if}
+										</button>
+									{/each}
+									<div class="my-1 border-t border-line"></div>
 									<button class={mi} role="menuitemcheckbox" aria-checked={showMonitor} onclick={() => act(toggleMonitor)}>
 										<Icon name="activity" size={15} /> <span class="flex-1">แสดงตัวตรวจวัดคุณภาพ</span>
 										{#if showMonitor}<Icon name="check" size={15} />{/if}
@@ -526,7 +549,7 @@
 									<div class="my-1 border-t border-line"></div>
 									<div class="flex items-center justify-between px-3 py-1.5 text-sm">
 										<span class="text-muted">Codec</span>
-										<span class="mono text-xs">{codecLabel}{viewer.info?.codec === 'h264' ? ' · WebCodecs' : ''}</span>
+										<span class="mono text-xs">{codecLabel}{webCodecs ? ' · WebCodecs' : ''}</span>
 									</div>
 									<div class="flex items-center justify-between px-3 py-1.5 text-sm">
 										<span class="text-muted">ตัวเข้ารหัส</span>

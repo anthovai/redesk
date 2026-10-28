@@ -7,7 +7,7 @@ use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use clap::{Parser, Subcommand};
 use tokio::io::AsyncBufReadExt;
 
-use aegiron_agent::config::{ApproveMode, Config, EncoderPref, Verification};
+use aegiron_agent::config::{ApproveMode, Config, EncoderPref, Verification, ViewerCodec};
 use aegiron_agent::net::ProxyConfig;
 use aegiron_agent::{fingerprint, identity, service, signal};
 
@@ -112,6 +112,9 @@ enum Cmd {
         /// Use only this path, without fallback: relay, direct or p2p
         #[arg(long)]
         only: Option<String>,
+        /// Video codec to ask for (default: viewer_codec in the config, else h264)
+        #[arg(long, value_enum)]
+        codec: Option<ViewerCodec>,
     },
     /// Show this device's id and key fingerprint.
     Info,
@@ -314,7 +317,7 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Uninstall => service::uninstall()?,
-        Cmd::Connect { id, seconds, only } => connect(&path, &id, seconds, only).await?,
+        Cmd::Connect { id, seconds, only, codec } => connect(&path, &id, seconds, only, codec).await?,
         Cmd::Run => {
             let c = Config::load(&path)?;
             c.ws_base()?;
@@ -341,7 +344,7 @@ async fn main() -> Result<()> {
 }
 
 /// `aegiron-agent connect`: runs the desktop app's viewer without a window.
-async fn connect(path: &std::path::Path, id: &str, seconds: u64, only: Option<String>) -> Result<()> {
+async fn connect(path: &std::path::Path, id: &str, seconds: u64, only: Option<String>, codec: Option<ViewerCodec>) -> Result<()> {
     use aegiron_agent::direct::Path as Route;
     use aegiron_agent::viewer::{Phase, Target, Viewer};
     use std::time::{Duration, Instant};
@@ -365,6 +368,7 @@ async fn connect(path: &std::path::Path, id: &str, seconds: u64, only: Option<St
         name: id.clone(),
         direct: c.direct_enabled,
         only,
+        codec: codec.unwrap_or(c.viewer_codec).codec(),
     };
     let viewer = Viewer::connect(target, std::sync::Arc::new(|| {}));
     let started = Instant::now();

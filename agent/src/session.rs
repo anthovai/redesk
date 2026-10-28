@@ -69,7 +69,7 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
     send_json(&mut tx, &mut ch, json!({"t": "auth_required", "password": need_password, "click": need_click})).await?;
 
     let mut attempts = 0;
-    let mut codec;
+    let mut viewer_codecs;
     let mut viewer_features;
     let mut wants_audio;
     loop {
@@ -77,7 +77,7 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
             bail!("expected auth message")
         };
         attempts += 1;
-        codec = Codec::negotiate(&codecs);
+        viewer_codecs = codecs;
         viewer_features = features;
         // Viewers that do not list an audio codec never get 0x05 packets.
         wants_audio = audio.iter().any(|c| c == "opus");
@@ -164,13 +164,31 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
         agent.status.lock().unwrap().boards.push(Board::new(sid, area));
     }
     let audio_on = wants_audio && cfg.allow_audio && audio::capture_supported();
-    // Which encoder this session will use (the hardware probe runs once per process and may
-    // block briefly).
-    let encoder = match codec {
-        Codec::H264 if cfg.video_encoder == EncoderPref::Auto => tokio::task::spawn_blocking(codec::preferred_encoder).await.unwrap_or("openh264"),
-        Codec::H264 => "openh264",
-        _ => "jpeg",
+    // Which encoders this session can use (the hardware probes run once per process and may
+    // block briefly). AV1 is hardware only, so "software only" in the settings turns it off;
+    // it is only probed for viewers that can decode it.
+    let lists = |c: &str| viewer_codecs.iter().any(|v| v == c);
+    let auto = cfg.video_encoder == EncoderPref::Auto;
+    let av1 = match lists("av1") && auto {
+        true => tokio::task::spawn_blocking(codec::av1_available).await.unwrap_or(None),
+        false => None,
     };
+    let codec = Codec::negotiate(&viewer_codecs, av1.is_some());
+    let h264 = match codec.is_video() && auto {
+        true => tokio::task::spawn_blocking(codec::preferred_encoder).await.unwrap_or("openh264"),
+        false => "openh264",
+    };
+    let encoder = match codec {
+        Codec::Av1 => av1.unwrap_or("jpeg"),
+        Codec::H264 => h264,
+        Codec::Jpeg => "jpeg",
+    };
+    // Codecs the viewer may switch to with `cfg {codec}` (its list, limited to what this
+    // machine encodes).
+    let switchable: Vec<Codec> = [(Codec::Av1, av1.is_some() && lists("av1")), (Codec::H264, lists("h264")), (Codec::Jpeg, true)]
+        .into_iter()
+        .filter_map(|(c, ok)| ok.then_some(c))
+        .collect();
     send_json(&mut tx, &mut ch, json!({
         "t": "auth_result", "ok": true,
     }))
@@ -186,6 +204,7 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
         "files": cfg.allow_file_transfer,
         "max_fps": cfg.max_fps,
         "codec": codec.name(),
+        "codecs": switchable.iter().map(|c| c.name()).collect::<Vec<_>>(),
         "recording": recording,
         "whiteboard": whiteboard,
         "features": files::FEATURES,
@@ -203,7 +222,7 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
     let _stop_guard = StopOnDrop(stop.clone());
     {
         let (out_tx, stop, force_full) = (out_tx.clone(), stop.clone(), force_full.clone());
-        std::thread::spawn(move || capture::run(params_rx, out_tx, stop, force_full, encoder));
+        std::thread::spawn(move || capture::run(params_rx, out_tx, stop, force_full, encoder, h264));
     }
     // Audio has its own small queue so it is never stuck behind a large video frame, and is
     // dropped rather than delayed when the network cannot keep up.
@@ -275,8 +294,9 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
                             }
                         });
                     }
-                    ViewerMsg::Config { fps, quality, max_width, display } => {
+                    ViewerMsg::Config { fps, quality, max_width, display, codec } => {
                         params_tx.send_modify(|p| {
+                            if let Some(c) = codec.as_deref().and_then(Codec::from_name).filter(|c| switchable.contains(c)) { p.codec = c; }
                             if let Some(f) = fps { p.fps = f.clamp(1, cfg.max_fps.max(1)); }
                             if let Some(q) = quality { p.quality = q.clamp(10, 95); }
                             if let Some(w) = max_width { p.max_width = w.clamp(320, 3840); }

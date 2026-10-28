@@ -370,6 +370,27 @@ impl App {
             self.save_config(|c| c.video_encoder = pref);
         }
 
+        card_title(ui, "Codec เมื่อควบคุมเครื่องอื่น");
+        let picked = card(ui, |ui| {
+            let mut picked = None;
+            let opts = [
+                (ViewerCodec::H264, "H.264", "ใช้ได้กับทุกเครื่อง หน่วงต่ำ (แนะนำ)"),
+                (ViewerCodec::Av1, "AV1", "ใช้แบนด์วิดท์น้อยกว่าที่คุณภาพเท่ากัน เมื่อเครื่องปลายทางมีตัวเข้ารหัส AV1 ฮาร์ดแวร์ (Windows กับ NVIDIA RTX 40, Intel Arc, AMD RX 7000 ขึ้นไป) ไม่เช่นนั้นใช้ H.264"),
+            ];
+            for (i, (pref, title, desc)) in opts.into_iter().enumerate() {
+                if i > 0 {
+                    sep(ui);
+                }
+                if radio_row(ui, c.viewer_codec == pref, true, title, desc) {
+                    picked = Some(pref);
+                }
+            }
+            picked
+        });
+        if let Some(pref) = picked {
+            self.save_config(|c| c.viewer_codec = pref);
+        }
+
         if cfg!(target_os = "macos") {
             permissions_ui::permissions_card(ui);
         }
