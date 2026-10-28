@@ -206,7 +206,7 @@ cd web && AEGIRON_PASSWORD=... bun scripts/e2e-viewer.ts <device-id> <device-pas
 ## ข้อจำกัดและแผนต่อไป
 
 - ยังไม่มี VP9/AV1 (H.264 ใช้ hardware encoder ของ VideoToolbox / Media Foundation และสำรองเป็น OpenH264); hardware encoder และเสียงบน Windows ยังไม่ได้ทดสอบกับเครื่องจริง
-- เสียงจากเครื่องปลายทางต้องใช้ macOS 13 ขึ้นไป หรือ Windows; ไม่มีเสียงในไฟล์บันทึกเซสชัน
+- เสียงจากเครื่องปลายทางต้องใช้ macOS 13 ขึ้นไป หรือ Windows
 - ยังไม่มีการควบคุมที่หน้าจอล็อกอินของ macOS (ต้องใช้ daemon ระดับ root ซึ่งตั้งใจไม่ทำ)
 - Wake-on-LAN ต้องมี agent อีกเครื่องออนไลน์ในวงแลนเดียวกัน และเครื่องเป้าหมายต้องเปิด WoL ไว้
 - ผู้ให้บริการอื่น: TeamViewer ทดสอบกับ mock เท่านั้น, AnyDesk ไม่มี API สาธารณะ, RDP ยังไม่ได้ทดสอบกับ Windows จริง
