@@ -68,6 +68,9 @@ enum Cmd {
         allow_clipboard: Option<bool>,
         #[arg(long)]
         allow_file_transfer: Option<bool>,
+        /// Let viewers draw on this screen (shown only by the desktop app)
+        #[arg(long)]
+        allow_whiteboard: Option<bool>,
         #[arg(long)]
         max_fps: Option<u32>,
         #[arg(long)]
@@ -165,7 +168,7 @@ async fn main() -> Result<()> {
             c.save(&path)?;
             println!("Permanent password saved (verification = {:?}).", c.verification);
         }
-        Cmd::Set { verification, approve_mode, allow_input, allow_clipboard, allow_file_transfer, max_fps, jpeg_quality, max_width } => {
+        Cmd::Set { verification, approve_mode, allow_input, allow_clipboard, allow_file_transfer, allow_whiteboard, max_fps, jpeg_quality, max_width } => {
             let mut c = Config::load(&path)?;
             if let Some(v) = verification {
                 if v != Verification::Temporary && c.permanent_password.is_none() {
@@ -177,6 +180,7 @@ async fn main() -> Result<()> {
             if let Some(v) = allow_input { c.allow_input = v; }
             if let Some(v) = allow_clipboard { c.allow_clipboard = v; }
             if let Some(v) = allow_file_transfer { c.allow_file_transfer = v; }
+            if let Some(v) = allow_whiteboard { c.allow_whiteboard = v; }
             if let Some(v) = max_fps { c.max_fps = v.clamp(1, 60); }
             if let Some(v) = jpeg_quality { c.jpeg_quality = v.clamp(10, 95); }
             if let Some(v) = max_width { c.max_width = v.clamp(320, 3840); }
@@ -191,7 +195,7 @@ async fn main() -> Result<()> {
             println!("Verification: {:?}, approve mode: {:?}", c.verification, c.approve_mode);
             println!("Device key:   {}", fingerprint(identity(&c)?.verifying_key().as_bytes()));
             println!("Server key:   {}", fingerprint(&B64.decode(&c.server_key)?));
-            println!("Input: {}, clipboard: {}, file transfer: {}", c.allow_input, c.allow_clipboard, c.allow_file_transfer);
+            println!("Input: {}, clipboard: {}, file transfer: {}, whiteboard: {}", c.allow_input, c.allow_clipboard, c.allow_file_transfer, c.allow_whiteboard);
             service::status()?;
         }
         Cmd::ShowPassword => {

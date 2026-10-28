@@ -28,6 +28,8 @@ type Config struct {
 	SyncInterval         int    // AEGIRON_SYNC_MINUTES: vendor API sync period (default 15)
 	// AEGIRON_PUBLIC_URL: external base URL, e.g. https://aegiron.example.com (OIDC redirect URI)
 	PublicURL string
+	// AEGIRON_RECORDING_MAX_MB: largest session recording an agent may upload (default 4096)
+	RecordingMaxMB int64
 }
 
 func Load() Config {
@@ -52,6 +54,10 @@ func Load() Config {
 	c.SyncInterval, _ = strconv.Atoi(env("AEGIRON_SYNC_MINUTES", "15"))
 	if c.SyncInterval < 1 {
 		c.SyncInterval = 15
+	}
+	c.RecordingMaxMB, _ = strconv.ParseInt(env("AEGIRON_RECORDING_MAX_MB", "4096"), 10, 64)
+	if c.RecordingMaxMB < 1 {
+		c.RecordingMaxMB = 4096
 	}
 	c.CookieSecure = envBool("AEGIRON_COOKIE_SECURE", c.TLSCert != "")
 	for _, o := range strings.Split(getenv("AEGIRON_ALLOWED_ORIGINS"), ",") {

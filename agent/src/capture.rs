@@ -61,6 +61,16 @@ pub fn geometry(display: usize) -> Option<Geometry> {
     Some(Geometry { x: m.x().ok()?, y: m.y().ok()?, width: m.width().ok()?, height: m.height().ok()? })
 }
 
+/// The display in desktop coordinates as windows are placed (logical points): x, y, w, h.
+pub fn logical_area(display: usize) -> Option<[f32; 4]> {
+    let monitors = Monitor::all().ok()?;
+    let m = monitors.get(display).or(monitors.first())?;
+    let (x, y, w, h) = (m.x().ok()? as f32, m.y().ok()? as f32, m.width().ok()? as f32, m.height().ok()? as f32);
+    // macOS reports points already; elsewhere the capture geometry is in physical pixels.
+    let s = if cfg!(target_os = "macos") { 1.0 } else { m.scale_factor().unwrap_or(1.0).max(0.5) };
+    Some([x / s, y / s, w / s, h / s])
+}
+
 /// Downsampled RGB frame.
 struct Frame {
     w: usize,

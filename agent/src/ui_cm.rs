@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 
 use super::*;
 
-const CM_SIZE: [f32; 2] = [320.0, 520.0];
+const CM_SIZE: [f32; 2] = [320.0, 580.0];
 const TAB_HEIGHT: f32 = 44.0;
 
 /// Set once the backend turns out not to support native child windows.
@@ -42,6 +42,8 @@ struct Entry {
     email: String,
     ip: String,
     kind: Kind,
+    /// The session is (or will be, if accepted) recorded.
+    recording: bool,
 }
 
 enum CmAction {
@@ -54,6 +56,7 @@ struct Perms {
     input: bool,
     clipboard: bool,
     files: bool,
+    whiteboard: bool,
 }
 
 fn split_who(who: &str) -> (String, String) {
@@ -103,6 +106,7 @@ enum Glyph {
     Keyboard,
     Clipboard,
     Folder,
+    Pen,
 }
 
 fn glyph(ui: &Ui, rect: Rect, g: Glyph, color: Color32) {
@@ -133,6 +137,10 @@ fn glyph(ui: &Ui, rect: Rect, g: Glyph, color: Color32) {
                 st,
             ));
             p.line_segment([at(1.5, 7.0), at(14.5, 7.0)], st);
+        }
+        Glyph::Pen => {
+            p.add(Shape::closed_line(vec![at(10.8, 2.2), at(13.8, 5.2), at(5.5, 13.5), at(1.8, 14.2), at(2.5, 10.5)], st));
+            p.line_segment([at(9.0, 4.0), at(12.0, 7.0)], st);
         }
     }
 }
@@ -184,9 +192,9 @@ impl App {
             .as_ref()
             .map(|a| {
                 let c = a.config.lock().unwrap();
-                Perms { input: c.allow_input, clipboard: c.allow_clipboard, files: c.allow_file_transfer }
+                Perms { input: c.allow_input, clipboard: c.allow_clipboard, files: c.allow_file_transfer, whiteboard: c.allow_whiteboard }
             })
-            .unwrap_or(Perms { input: false, clipboard: false, files: false });
+            .unwrap_or(Perms { input: false, clipboard: false, files: false, whiteboard: false });
 
         // Tabs in arrival order: live sessions, then requests waiting for an answer.
         let mut entries: Vec<Entry> = sessions
@@ -196,13 +204,14 @@ impl App {
                 name: s.name.clone(),
                 email: s.email.clone(),
                 ip: s.ip.clone(),
+                recording: s.recording,
                 kind: Kind::Session(s),
             })
             .collect();
         for (i, (req, at)) in self.pending.iter().enumerate() {
             let (name, email) = split_who(&req.who);
             let left = APPROVAL_TIMEOUT.saturating_sub(at.elapsed());
-            entries.push(Entry { key: pending_key(*at), name, email, ip: req.ip.clone(), kind: Kind::Pending(i, left) });
+            entries.push(Entry { key: pending_key(*at), name, email, ip: req.ip.clone(), kind: Kind::Pending(i, left), recording: req.recording });
         }
 
         let mut st: CmState = ctx.data(|d| d.get_temp(state_id())).unwrap_or_default();
@@ -238,9 +247,10 @@ impl App {
         let mut builder = egui::ViewportBuilder::default()
             .with_title("Aegiron — การเชื่อมต่อเข้า")
             .with_inner_size(CM_SIZE)
-            .with_min_inner_size([300.0, 460.0])
+            .with_min_inner_size([300.0, 520.0])
             .with_maximize_button(false)
             .with_always_on_top()
+            .with_transparent(false)
             // Never take focus by appearing; a new request asks for it explicitly, once.
             .with_active(false)
             .with_icon(window_icon());
@@ -322,6 +332,9 @@ impl App {
                             s.kill.notify_one();
                         }
                         ui.label(RichText::new(elapsed(s.started)).font(mono(13.0)).color(pal.muted));
+                        if s.recording {
+                            recording_chip(ui, "กำลังบันทึก");
+                        }
                     });
                 });
             });
@@ -335,6 +348,7 @@ impl App {
         let left = APPROVAL_TIMEOUT.saturating_sub(at.elapsed());
         let (name, email) = split_who(&req.who);
         let ip = req.ip.clone();
+        let recording = req.recording;
         let perms = self.agent.as_ref().map(|a| {
             let c = a.config.lock().unwrap();
             let mut p = vec![if c.allow_input { "ควบคุมเมาส์และคีย์บอร์ด" } else { "ดูหน้าจอ" }];
@@ -362,6 +376,10 @@ impl App {
                 if let Some(p) = &perms {
                     ui.add_space(6.0);
                     ui.label(RichText::new(format!("ถ้าอนุญาต จะทำได้: {p}")).size(12.5).color(pal.muted));
+                }
+                if recording {
+                    ui.add_space(6.0);
+                    recording_chip(ui, "เซสชันนี้จะถูกบันทึก");
                 }
             });
             ui.add_space(12.0);
@@ -527,6 +545,11 @@ fn details(ui: &mut Ui, e: &Entry, perms: Perms) {
         ui.painter().rect_filled(r, r.height() / 2.0, dot.gamma_multiply(0.14));
         ui.painter().circle_filled(r.left_center() + vec2(14.0, 0.0), 4.0, dot);
         ui.painter().galley(pos2(r.left() + 24.0, r.center().y - galley.size().y / 2.0), galley, pal.fg);
+        if e.recording {
+            ui.add_space(6.0);
+            let text = if matches!(e.kind, Kind::Pending(..)) { "เซสชันนี้จะถูกบันทึก" } else { "กำลังบันทึก" };
+            recording_chip(ui, text);
+        }
     });
     ui.add_space(14.0);
     let title = if matches!(e.kind, Kind::Pending(..)) { "ถ้าอนุญาต ผู้ควบคุมจะทำได้" } else { "สิทธิ์ของผู้ควบคุม" };
@@ -544,4 +567,22 @@ fn details(ui: &mut Ui, e: &Entry, perms: Perms) {
         perm_tile(ui, Glyph::Clipboard, "คลิปบอร์ด", perms.clipboard, size);
         perm_tile(ui, Glyph::Folder, "รับ-ส่งไฟล์", perms.files, size);
     });
+    ui.horizontal(|ui| {
+        perm_tile(ui, Glyph::Pen, "วาดบนหน้าจอ", perms.whiteboard, size);
+    });
+}
+
+/// Red "recording" chip: the person at this machine always sees when a session is recorded.
+pub(super) fn recording_chip(ui: &mut Ui, text: &str) -> Response {
+    let pal = Palette::of(ui);
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), semi(13.0), pal.danger);
+    let (r, resp) = ui.allocate_exact_size(galley.size() + vec2(34.0, 8.0), Sense::hover());
+    ui.painter().rect_filled(r, r.height() / 2.0, pal.danger.gamma_multiply(0.14));
+    // Pulsing dot.
+    let t = ui.input(|i| i.time);
+    let a = 0.55 + 0.45 * (t * 3.0).sin().abs() as f32;
+    ui.painter().circle_filled(r.left_center() + vec2(13.0, 0.0), 4.5, pal.danger.gamma_multiply(a));
+    ui.painter().galley(pos2(r.left() + 23.0, r.center().y - galley.size().y / 2.0), galley, pal.danger);
+    ui.ctx().request_repaint_after(Duration::from_millis(100));
+    resp.on_hover_text("องค์กรกำหนดให้บันทึกหน้าจอของเซสชันนี้ ผู้ดูแลระบบดูย้อนหลังได้ที่เว็บคอนโซล")
 }

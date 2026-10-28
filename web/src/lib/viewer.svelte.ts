@@ -24,7 +24,20 @@ export interface AgentInfo {
 	files?: boolean;
 	max_fps: number;
 	codec?: string;
+	/** The controlled machine records this session (organisation policy). */
+	recording?: boolean;
+	/** The controlled machine shows annotations drawn by the viewer. */
+	whiteboard?: boolean;
 }
+
+/** A whiteboard stroke, normalised to the remote screen. */
+export interface Stroke {
+	color: string;
+	pts: [number, number][];
+}
+
+/** Pen width as a fraction of the remote screen height (same as the desktop app). */
+export const PEN_WIDTH = 0.004;
 
 export interface RemoteEntry {
 	name: string;
@@ -224,6 +237,8 @@ export class RemoteViewer {
 					this.error = `ล็อกชั่วคราวเพราะใส่รหัสผิดบ่อย ลองใหม่ใน ${m.retry_after} วินาที`;
 				} else if (m.reason === 'denied') {
 					this.error = 'ผู้ใช้ที่เครื่องปลายทางปฏิเสธการเชื่อมต่อ';
+				} else if (m.reason === 'recording_failed') {
+					this.error = 'องค์กรกำหนดให้บันทึกเซสชันนี้ แต่เครื่องปลายทางเริ่มบันทึกไม่ได้';
 				}
 				break;
 			case 'info':
@@ -463,6 +478,52 @@ export class RemoteViewer {
 
 	refresh() {
 		this.send({ t: 'refresh' });
+	}
+
+	// --- whiteboard (only when info.whiteboard) ---
+
+	strokes = $state<Stroke[]>([]);
+	private strokeId = 0;
+	private unsent: number[] = [];
+	private flushScheduled = false;
+
+	beginStroke(color: string, x: number, y: number) {
+		this.flushStroke();
+		this.strokeId++;
+		this.strokes.push({ color, pts: [[x, y]] });
+		this.queuePoint(x, y);
+	}
+
+	extendStroke(x: number, y: number) {
+		const s = this.strokes[this.strokes.length - 1];
+		if (!s) return;
+		const [lx, ly] = s.pts[s.pts.length - 1];
+		if (Math.hypot(x - lx, y - ly) < 0.0015) return;
+		s.pts.push([x, y]);
+		this.queuePoint(x, y);
+	}
+
+	/** Sends the points of the current stroke drawn since the last message. */
+	flushStroke() {
+		if (!this.unsent.length) return;
+		const color = this.strokes[this.strokes.length - 1]?.color ?? '#ff3b30';
+		this.send({ t: 'wb', op: 'line', id: this.strokeId, c: color, w: PEN_WIDTH, p: this.unsent.splice(0) });
+	}
+
+	/** Points go out at most once per animation frame. */
+	private queuePoint(x: number, y: number) {
+		this.unsent.push(x, y);
+		if (this.flushScheduled) return;
+		this.flushScheduled = true;
+		requestAnimationFrame(() => {
+			this.flushScheduled = false;
+			this.flushStroke();
+		});
+	}
+
+	clearStrokes() {
+		this.strokes = [];
+		this.send({ t: 'wb', op: 'clear' });
 	}
 
 	close() {

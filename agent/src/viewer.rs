@@ -54,6 +54,12 @@ pub struct Info {
     pub clipboard: bool,
     #[serde(default)]
     pub files: bool,
+    /// The controlled machine records this session (organisation policy).
+    #[serde(default)]
+    pub recording: bool,
+    /// The controlled machine shows annotations drawn by the viewer.
+    #[serde(default)]
+    pub whiteboard: bool,
 }
 
 /// Video codecs this viewer decodes, best first.
@@ -215,6 +221,8 @@ impl Viewer {
             input: true,
             clipboard: true,
             files: true,
+            recording: std::env::var_os("AEGIRON_UI_DEMO_RECORDING").is_some(),
+            whiteboard: true,
         };
         Arc::new(Viewer {
             state: Mutex::new(State {
@@ -461,6 +469,7 @@ fn control(v: &Viewer, m: &Value) -> Option<Value> {
             }
             (false, "locked") => st.error = Some(format!("ล็อกชั่วคราว ลองใหม่ใน {} วินาที", m["retry_after"].as_u64().unwrap_or(60))),
             (false, "denied") => st.error = Some("ผู้ใช้ที่เครื่องปลายทางปฏิเสธการเชื่อมต่อ".into()),
+            (false, "recording_failed") => st.error = Some("องค์กรกำหนดให้บันทึกเซสชันนี้ แต่เครื่องปลายทางเริ่มบันทึกไม่ได้".into()),
             _ => {}
         },
         "info" => {

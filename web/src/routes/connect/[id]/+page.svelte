@@ -5,7 +5,7 @@
 	import { formatId } from '#lib/format.js';
 	import FilePanel from '#lib/FilePanel.svelte';
 	import Icon from '#lib/Icon.svelte';
-	import { RemoteViewer } from '#lib/viewer.svelte.js';
+	import { PEN_WIDTH, RemoteViewer } from '#lib/viewer.svelte.js';
 
 	const viewer = new RemoteViewer(page.params.id ?? '');
 	let canvas = $state<HTMLCanvasElement>();
@@ -37,7 +37,17 @@
 	}
 	let pinned = $state(pref('aegiron.viewer.pinned', true));
 	let barShown = $state(false);
-	let menu = $state<'' | 'actions' | 'display'>('');
+	let menu = $state<'' | 'actions' | 'display' | 'pen'>('');
+	// Whiteboard: while the pen is on, the mouse draws on the remote screen instead of controlling it.
+	const penColors = [
+		['#ff3b30', 'แดง'],
+		['#ffd60a', 'เหลือง'],
+		['#30d158', 'เขียว'],
+		['#0a84ff', 'ฟ้า']
+	] as const;
+	let pen = $state(false);
+	let penColor = $state<string>(penColors[0][0]);
+	const drawing = $derived(pen && viewer.phase === 'connected' && !!viewer.info?.whiteboard);
 	let showMonitor = $state(pref('aegiron.viewer.monitor', false));
 	let isFullscreen = $state(false);
 	let toolbar = $state<HTMLElement>();
@@ -64,7 +74,7 @@
 		clearTimeout(hideTimer);
 		if (!pinned) hideTimer = setTimeout(() => (barShown = false), 700);
 	}
-	function toggleMenu(m: 'actions' | 'display') {
+	function toggleMenu(m: 'actions' | 'display' | 'pen') {
 		menu = menu === m ? '' : m;
 	}
 	/** Run a toolbar action, close the menu and give the keyboard back to the remote screen. */
@@ -86,6 +96,14 @@
 		if (!w || !h || !stageW || !stageH) return '';
 		const k = Math.min(stageW / w, stageH / h);
 		return `width: ${Math.floor(w * k)}px; height: ${Math.floor(h * k)}px;`;
+	});
+	// Where the remote screen is drawn inside the stage (the canvas is centered), for annotations.
+	const shown = $derived.by(() => {
+		const { w, h } = viewer.frame;
+		if (!w || !h || !stageW || !stageH) return { x: 0, y: 0, w: 0, h: 0 };
+		const k = Math.min(stageW / w, stageH / h);
+		const [sw, sh] = [Math.floor(w * k), Math.floor(h * k)];
+		return { x: (stageW - sw) / 2, y: (stageH - sh) / 2, w: sw, h: sh };
 	});
 	const peerName = $derived(viewer.device?.alias || viewer.info?.hostname || viewer.device?.hostname || formatId(viewer.deviceId));
 	const codecLabel = $derived((viewer.info?.codec ?? 'jpeg').toUpperCase());
@@ -121,9 +139,22 @@
 	const live = $derived(viewer.phase === 'connected' && viewer.info?.input !== false);
 
 	function onPointerMove(ev: PointerEvent) {
+		if (drawing) {
+			if (ev.buttons & 1) viewer.extendStroke(...norm(ev));
+			return;
+		}
 		if (live) viewer.mouseMove(...norm(ev));
 	}
 	function onPointerButton(ev: PointerEvent, down: boolean) {
+		if (drawing) {
+			ev.preventDefault();
+			if (ev.button !== 0) return;
+			if (down) {
+				canvas?.setPointerCapture(ev.pointerId);
+				viewer.beginStroke(penColor, ...norm(ev));
+			} else viewer.flushStroke();
+			return;
+		}
 		if (!live) return;
 		ev.preventDefault();
 		if (down) {
@@ -259,7 +290,7 @@
 		<canvas
 			bind:this={canvas}
 			tabindex="0"
-			class="outline-none {viewer.phase === 'connected' && viewer.frame.w ? '' : 'opacity-0'} {live ? 'cursor-default' : ''}"
+			class="outline-none {viewer.phase === 'connected' && viewer.frame.w ? '' : 'opacity-0'} {drawing ? 'cursor-crosshair' : live ? 'cursor-default' : ''}"
 			style="image-rendering: auto; {fit}"
 			onpointermove={onPointerMove}
 			onpointerenter={() => (pointerOver = true)}
@@ -273,6 +304,39 @@
 				releaseAll();
 			}}
 		></canvas>
+
+		{#if viewer.strokes.length && shown.w}
+			<!-- Our annotations; the remote machine shows the same strokes in an overlay. -->
+			<svg
+				class="pointer-events-none absolute"
+				style="left: {shown.x}px; top: {shown.y}px; width: {shown.w}px; height: {shown.h}px"
+				viewBox="0 0 1 1"
+				preserveAspectRatio="none"
+				aria-hidden="true"
+			>
+				{#each viewer.strokes as s, i (i)}
+					<polyline
+						points={s.pts.map((p) => p.join(',')).join(' ')}
+						fill="none"
+						stroke={s.color}
+						stroke-width={Math.max(1.5, PEN_WIDTH * shown.h)}
+						stroke-linecap="round"
+						stroke-linejoin="round"
+						vector-effect="non-scaling-stroke"
+					/>
+				{/each}
+			</svg>
+		{/if}
+
+		{#if viewer.phase === 'connected' && viewer.info?.recording}
+			<div
+				class="pointer-events-none absolute top-3 right-3 flex items-center gap-1.5 rounded-full bg-black/65 px-3 py-1 text-xs font-medium text-white shadow-lg backdrop-blur-sm"
+				title="องค์กรกำหนดให้บันทึกหน้าจอของเซสชันนี้"
+				role="status"
+			>
+				<span class="size-2 animate-pulse rounded-full bg-[#ff453a]"></span> กำลังบันทึก
+			</div>
+		{/if}
 
 		{#if viewer.cursor && canvas && !pointerOver}
 			<!-- Remote pointer: screen captures do not include it. -->
@@ -432,6 +496,45 @@
 								</div>
 							{/if}
 						</div>
+
+						{#if viewer.info?.whiteboard}
+							<div class="relative">
+								<button
+									class={tb(pen || menu === 'pen')}
+									title="วาดบนหน้าจอ"
+									aria-haspopup="menu"
+									aria-expanded={menu === 'pen'}
+									onclick={() => toggleMenu('pen')}
+								>
+									<Icon name="pen" />
+								</button>
+								{#if menu === 'pen'}
+									<div class="absolute top-full left-1/2 mt-2 w-60 -translate-x-1/2 rounded-lg bg-surface py-1 text-fg shadow-[0_10px_30px_rgb(0_0_0/0.35)] ring-1 ring-line" role="menu">
+										<p class="px-3 pt-1 pb-1 text-xs font-medium text-muted">วาดบนหน้าจอปลายทาง</p>
+										<button class={mi} role="menuitemcheckbox" aria-checked={pen} onclick={() => act(() => (pen = !pen))}>
+											<Icon name="pen" size={15} /> <span class="flex-1">ปากกา</span>
+											{#if pen}<Icon name="check" size={15} />{/if}
+										</button>
+										<div class="flex items-center gap-2 px-3 py-2">
+											{#each penColors as [c, name] (c)}
+												<button
+													class="size-6 rounded-full ring-offset-2 ring-offset-surface {penColor === c ? 'ring-2 ring-accent' : ''}"
+													style="background: {c}"
+													title={name}
+													aria-label={name}
+													onclick={() => act(() => ((penColor = c), (pen = true)))}
+												></button>
+											{/each}
+										</div>
+										<div class="my-1 border-t border-line"></div>
+										<button class={mi} role="menuitem" disabled={!viewer.strokes.length} onclick={() => act(() => viewer.clearStrokes())}>
+											<Icon name="trash" size={15} /> ล้างทั้งหมด
+										</button>
+										<p class="px-3 pt-1 pb-1.5 text-[11px] text-muted">เส้นจะหายไปเมื่อจบการเชื่อมต่อ</p>
+									</div>
+								{/if}
+							</div>
+						{/if}
 
 						<button class={tb()} title={isFullscreen ? 'ออกจากเต็มจอ' : 'เต็มจอ'} onclick={() => act(fullscreen)}>
 							<Icon name={isFullscreen ? 'minimize' : 'maximize'} />

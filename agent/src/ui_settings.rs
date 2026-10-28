@@ -358,13 +358,15 @@ impl App {
         let pal = Palette::of(ui);
 
         card_title(ui, "สิทธิ์ของผู้ควบคุม");
-        let (mut input, mut clip, mut files) = (c.allow_input, c.allow_clipboard, c.allow_file_transfer);
+        let (mut input, mut clip, mut files, mut board) = (c.allow_input, c.allow_clipboard, c.allow_file_transfer, c.allow_whiteboard);
         let changed = card(ui, |ui| {
             let mut changed = check_row(ui, "ควบคุมเมาส์และคีย์บอร์ด", "ถ้าปิด ผู้เชื่อมต่อจะดูหน้าจอได้อย่างเดียว", &mut input);
             sep(ui);
             changed |= check_row(ui, "คลิปบอร์ด", "คัดลอกและวางข้อความระหว่างสองเครื่อง", &mut clip);
             sep(ui);
             changed |= check_row(ui, "รับ-ส่งไฟล์", "ไฟล์ที่ได้รับจะอยู่ในโฟลเดอร์ Downloads/Aegiron", &mut files);
+            sep(ui);
+            changed |= check_row(ui, "วาดบนหน้าจอ", "ผู้ควบคุมขีดเขียนชี้จุดบนหน้าจอนี้ได้ (คลิกทะลุ ไม่บังหน้าจอ หายไปเมื่อจบเซสชัน)", &mut board);
             changed
         });
         if changed {
@@ -372,6 +374,7 @@ impl App {
                 c.allow_input = input;
                 c.allow_clipboard = clip;
                 c.allow_file_transfer = files;
+                c.allow_whiteboard = board;
             });
         }
 

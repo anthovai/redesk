@@ -101,3 +101,43 @@ app  → POST /api/agent/login {email, password, totp?, device}      (HTTPS, cer
 - Clients check with `GET /api/agent/update?os=&arch=&version=`, which returns the newest enabled release that is newer by semver.
 - Clients download from `GET /api/agent/releases/{id}/download`, served with `X-Checksum-SHA256`.
 - The app downloads only after the user asks, from the same server only. It keeps the file only if the size and SHA-256 match, and never installs it by itself.
+
+## 7. Session recording
+
+Sessions are end-to-end encrypted, so the server cannot record them. The **controlled device** records what it streams and uploads the file afterwards.
+
+- Policy (admin, web console → บันทึกเซสชัน): `GET/PUT /api/recordings/settings` `{mode: "off"|"all"|"groups", group_ids[], retention_days}` (0 = keep until deleted). Stored in `settings` under key `recording`.
+- When a session must be recorded, the server creates a `pending` row in `session_recordings` and adds `"record": {"token", "upload"}` to the agent's `session` message. The token is single-use (only its SHA-256 is stored) and valid for 7 days. Agents that predate recording ignore the field and stream unrecorded.
+- After authentication the agent starts the recorder and reports `{"t":"event","kind":"recording_started"}` (or `recording_failed`; if the recorder cannot start, the session is refused with `auth_result {ok:false, reason:"recording_failed"}` rather than run unrecorded). The approval prompt says the session will be recorded; `info` carries `"recording": true` so viewers show **กำลังบันทึก**, and the connection-manager window on the controlled machine shows the same badge for the whole session.
+- Upload, after the session ends (and retried whenever the agent reconnects; files cut off by a crash are truncated to the last complete record and uploaded too):
+
+  ```
+  POST /api/agent/recordings/{sid}
+  Authorization: Bearer <record.token>
+  X-Aegiron: 1
+  X-Aegiron-Signature: base64 Ed25519(device key, "aegiron-recording-v1\n" + device_id + "\n" + sid + "\n" + hex(SHA-256(body)))
+  body: the .aerec file
+  ```
+
+  Only over HTTPS with a verified certificate, or plain HTTP to loopback; `allow_insecure_transport` does not apply. The server checks the token, the signature against the device's registered key, and the file structure (header `sid`/`device_id` must match), then stores it as `<AEGIRON_DATA_DIR>/recordings/<sid>.aerec` (limit `AEGIRON_RECORDING_MAX_MB`, default 4096). 400/401/404/409/413 are final (the agent deletes its copy); anything else is retried.
+- Admin only: `GET /api/recordings[?device=]`, `GET /api/recordings/{id}`, `GET /api/recordings/{id}/file` (Range supported), `DELETE /api/recordings/{id}`. Audit: `recording.uploaded`, `recording.rejected`, `recording.viewed`, `recording.deleted`, `recording.purged`, `recording.settings_updated`, plus `agent.recording_started` / `agent.recording_failed`. Retention runs at start-up and hourly.
+
+### Container (`.aerec`)
+
+```
+"AEGREC1\n"
+u32 BE header length, JSON header {"v":1,"sid","device_id","hostname","os","started_ms"}
+records until EOF: u32 BE milliseconds since start, u32 BE payload length (1..32 MiB), payload
+```
+
+A payload is a plaintext channel message exactly as streamed: `0x04` H.264 frames, `0x02` JPEG rectangles (a session can switch from H.264 to JPEG), and `0x01` `cursor` messages. Clipboard, file chunks and other control traffic are not recorded. The last record is `{"t":"end"}` so idle time at the end counts. The browser plays it with WebCodecs (H.264) and `createImageBitmap` (JPEG), seeking from the nearest H.264 keyframe or full-screen JPEG rectangle.
+
+## 8. Whiteboard (annotations)
+
+The viewer draws on the remote screen; the controlled machine shows the strokes in a transparent, click-through, always-on-top window over the streamed display. Only the desktop app (`aegiron`) can show it; the headless `aegiron-agent` never offers it.
+
+- Negotiation: `info.whiteboard: true` when the agent allows it (`allow_whiteboard`, default on; app Settings → ความปลอดภัย, or `aegiron-agent set --allow-whiteboard false`) and a desktop UI is attached. Viewers show the pen only then; older agents never set it, older viewers never send strokes.
+- viewer→agent (JSON inside the encrypted channel):
+  - `wb {op:"line", id, c:"#rrggbb", w, p:[x0,y0,x1,y1,...]}` appends points to stroke `id` (created on first use with color `c` and width `w`, a fraction of the display height). Points are normalised 0–1 over the displayed frame, like pointer input.
+  - `wb {op:"clear"}` removes all strokes.
+- Limits on the agent: 1024 points per message, 300 strokes, 60 000 points (oldest strokes go first). Strokes stay until cleared; they disappear when the session ends or the viewer switches display. The overlay is part of the screen, so the stream (and a recording) shows it too.

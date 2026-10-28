@@ -48,6 +48,7 @@ func New(cfg config.Config, s *store.Store, h *hub.Hub, key ed25519.PrivateKey, 
 		}
 		return 0
 	}
+	h.RecordingToken = a.recordingToken
 	return a
 }
 
@@ -100,6 +101,14 @@ func (a *API) Handler() http.Handler {
 	user("POST /api/sessions", a.createSession)
 	admin("GET /api/sessions", a.listSessions)
 	admin("GET /api/sessions/active", a.activeSessions)
+
+	pub("POST /api/agent/recordings/{sid}", a.uploadRecording)
+	admin("GET /api/recordings", a.listRecordings)
+	admin("GET /api/recordings/settings", a.getRecordingSettings)
+	admin("PUT /api/recordings/settings", a.putRecordingSettings)
+	admin("GET /api/recordings/{id}", a.getRecording)
+	admin("GET /api/recordings/{id}/file", a.recordingFile)
+	admin("DELETE /api/recordings/{id}", a.deleteRecording)
 
 	admin("GET /api/audit", a.listAudit)
 	admin("GET /api/users", a.listUsers)

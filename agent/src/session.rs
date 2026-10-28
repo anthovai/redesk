@@ -21,7 +21,9 @@ use crate::crypto::{self, Channel};
 use crate::files;
 use crate::input;
 use crate::proto::{self, ViewerMsg};
+use crate::recording::{RecordRequest, Recorder};
 use crate::signal::{Agent, Viewer};
+use crate::whiteboard::Board;
 use crate::status::{ApprovalRequest, SessionInfo};
 
 const MAX_ATTEMPTS: u32 = 3;
@@ -35,7 +37,7 @@ struct Hello {
     epk: String,
 }
 
-pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer: Viewer) -> Result<()> {
+pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer: Viewer, record: Option<RecordRequest>) -> Result<()> {
     let base = agent.config.lock().unwrap().ws_base()?;
     let url = format!("{base}{relay}?sid={sid}&token={token}");
     let (ws, _) = connect_async(url.as_str()).await.context("relay connect")?;
@@ -96,7 +98,7 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
         }
         if need_click {
             send_json(&mut tx, &mut ch, json!({"t": "auth_pending"})).await?;
-            if !ask_local_user(&agent, &viewer).await {
+            if !ask_local_user(&agent, &viewer, record.is_some()).await {
                 agent.report(sid, "denied", json!({}));
                 send_json(&mut tx, &mut ch, json!({"t": "auth_result", "ok": false, "reason": "denied"})).await?;
                 bail!("denied by local user");
@@ -109,6 +111,30 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
         agent.rotate_temp_password(); // one-time: the password just used is now dead
     }
     tracing::info!("session {sid}: {} ({}) is now controlling this machine", viewer.email, viewer.ip);
+
+    // Recording required by the organisation's policy: the session does not go ahead unrecorded.
+    let mut recorder = RecordingGuard { agent: agent.clone(), rec: None };
+    if let Some(req) = &record {
+        let device_id = agent.config.lock().unwrap().id.clone();
+        match Recorder::start(&crate::recording::dir_for(&agent.config_path), sid, &device_id, &req.token) {
+            Ok(r) => {
+                recorder.rec = Some(r);
+                agent.report(sid, "recording_started", json!({}));
+                tracing::info!("session {sid} is being recorded (organisation policy)");
+                if std::io::stdout().is_terminal() {
+                    println!("  >>> This session is being recorded (กำลังบันทึก).");
+                }
+            }
+            Err(e) => {
+                tracing::error!("session {sid}: cannot start the required recording: {e:#}");
+                agent.report(sid, "recording_failed", json!({"stage": "start", "error": format!("{e:#}")}));
+                send_json(&mut tx, &mut ch, json!({"t": "auth_result", "ok": false, "reason": "recording_failed"})).await?;
+                bail!("recording required but unavailable");
+            }
+        }
+    }
+    let recording = recorder.rec.is_some();
+
     let kill = Arc::new(tokio::sync::Notify::new());
     agent.status.lock().unwrap().sessions.push(SessionInfo {
         sid: sid.to_string(),
@@ -117,6 +143,7 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
         ip: viewer.ip.clone(),
         started: std::time::SystemTime::now(),
         kill: kill.clone(),
+        recording,
     });
     agent.changed();
     let _registered = Registered { agent: agent.clone(), sid: sid.to_string() };
@@ -126,6 +153,12 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
     // 4. Stream.
     let cfg = agent.config.lock().unwrap().clone();
     let displays = capture::displays();
+    // Annotations need the desktop app's overlay window; the headless agent ignores them.
+    let whiteboard = cfg.allow_whiteboard && agent.ui.lock().unwrap().is_some();
+    if whiteboard {
+        let area = capture::logical_area(0).unwrap_or_default();
+        agent.status.lock().unwrap().boards.push(Board::new(sid, area));
+    }
     send_json(&mut tx, &mut ch, json!({
         "t": "auth_result", "ok": true,
     }))
@@ -141,6 +174,8 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
         "files": cfg.allow_file_transfer,
         "max_fps": cfg.max_fps,
         "codec": codec.name(),
+        "recording": recording,
+        "whiteboard": whiteboard,
     }))
     .await?;
 
@@ -171,6 +206,9 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
             }
             out = out_rx.recv() => {
                 let Some(plain) = out else { bail!("capture stopped") };
+                if let Some(r) = recorder.rec.as_mut() {
+                    r.record(&plain);
+                }
                 tx.send(Message::Binary(ch.seal(&plain)?.into())).await?;
             }
             msg = read_viewer(&mut rx, &mut ch, Duration::from_secs(300)) => {
@@ -210,6 +248,14 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
                             if let Some(d) = display.filter(|d| *d < displays.len()) {
                                 p.display = d;
                                 if let Some(g) = capture::geometry(d) { send_input(input::Event::Geometry(g)); }
+                                if whiteboard {
+                                    // Strokes belong to the display they were drawn on.
+                                    let area = capture::logical_area(d).unwrap_or_default();
+                                    if let Some(b) = agent.status.lock().unwrap().boards.iter_mut().find(|b| b.sid == sid) {
+                                        *b = Board::new(sid, area);
+                                    }
+                                    agent.changed();
+                                }
                             }
                         });
                         force_full.store(true, Ordering::Relaxed);
@@ -238,6 +284,20 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
                     ViewerMsg::Cancel { id } => files.cancel(id),
                     ViewerMsg::List { .. } | ViewerMsg::Put { .. } | ViewerMsg::Get { .. } => {
                         send_json(&mut tx, &mut ch, json!({"t": "fs_error", "message": "file transfer is disabled on this device"})).await?;
+                    }
+                    ViewerMsg::Whiteboard { op, id, c, w, p } if whiteboard => {
+                        tracing::debug!("whiteboard {op} id={id} points={}", p.len() / 2);
+                        let changed = agent
+                            .status
+                            .lock()
+                            .unwrap()
+                            .boards
+                            .iter_mut()
+                            .find(|b| b.sid == sid)
+                            .is_some_and(|b| b.apply(&op, id, &c, w, &p));
+                        if changed {
+                            agent.changed();
+                        }
                     }
                     ViewerMsg::Refresh => force_full.store(true, Ordering::Relaxed),
                     ViewerMsg::Bye => return Ok(()),
@@ -282,8 +342,29 @@ struct Registered {
 }
 impl Drop for Registered {
     fn drop(&mut self) {
-        self.agent.status.lock().unwrap().sessions.retain(|s| s.sid != self.sid);
+        {
+            let mut st = self.agent.status.lock().unwrap();
+            st.sessions.retain(|s| s.sid != self.sid);
+            // Annotations disappear with the session.
+            st.boards.retain(|b| b.sid != self.sid);
+        }
         self.agent.changed();
+    }
+}
+
+/// Closes the session's recording however the session ends, then uploads it in the background.
+struct RecordingGuard {
+    agent: Arc<Agent>,
+    rec: Option<Recorder>,
+}
+impl Drop for RecordingGuard {
+    fn drop(&mut self) {
+        let Some(rec) = self.rec.take() else { return };
+        let agent = self.agent.clone();
+        std::thread::spawn(move || match rec.finish() {
+            Ok(_) => crate::recording::upload_pending(&agent),
+            Err(e) => tracing::error!("cannot finish session recording: {e:#}"),
+        });
     }
 }
 
@@ -365,21 +446,22 @@ fn record_failure(agent: &Agent) {
 /// Asks the person at the machine to accept the connection. Shows a desktop dialog
 /// (macOS osascript / Linux zenity) and, when attached to a terminal, a y/N prompt;
 /// whichever is answered first wins. No answer within 30s means deny.
-async fn ask_local_user(agent: &Agent, viewer: &Viewer) -> bool {
+async fn ask_local_user(agent: &Agent, viewer: &Viewer, recorded: bool) -> bool {
     let who = if viewer.name.is_empty() { viewer.email.clone() } else { format!("{} <{}>", viewer.name, viewer.email) };
 
     // Desktop app running: ask in its window instead of a separate dialog.
     let ui_tx = agent.ui.lock().unwrap().as_ref().map(|u| (u.approvals.clone(), u.repaint.clone()));
     if let Some((tx, repaint)) = ui_tx {
         let (reply, answer) = tokio::sync::oneshot::channel();
-        let req = ApprovalRequest { sid: String::new(), who: who.clone(), ip: viewer.ip.clone(), reply };
+        let req = ApprovalRequest { sid: String::new(), who: who.clone(), ip: viewer.ip.clone(), recording: recorded, reply };
         if tx.send(req).is_ok() {
             repaint();
             return matches!(tokio::time::timeout(Duration::from_secs(30), answer).await, Ok(Ok(true)));
         }
     }
 
-    let question = format!("{who} ({}) ขอควบคุมเครื่องนี้ผ่าน Aegiron\nอนุญาตหรือไม่?", viewer.ip);
+    let note = if recorded { "\nเซสชันนี้จะถูกบันทึกตามนโยบายขององค์กร" } else { "" };
+    let question = format!("{who} ({}) ขอควบคุมเครื่องนี้ผ่าน Aegiron{note}\nอนุญาตหรือไม่?", viewer.ip);
 
     let terminal = async {
         if !std::io::stdin().is_terminal() {
@@ -387,7 +469,8 @@ async fn ask_local_user(agent: &Agent, viewer: &Viewer) -> bool {
         }
         let mut lines = agent.stdin_lines.lock().await;
         while lines.try_recv().is_ok() {}
-        println!("\n  >>> Remote control requested by {who} from {}. Allow? [y/N] (30s)", viewer.ip);
+        let rec = if recorded { " The session will be recorded." } else { "" };
+        println!("\n  >>> Remote control requested by {who} from {}.{rec} Allow? [y/N] (30s)", viewer.ip);
         match lines.recv().await {
             Some(l) => matches!(l.trim().to_lowercase().as_str(), "y" | "yes"),
             None => std::future::pending::<bool>().await,
