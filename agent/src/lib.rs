@@ -6,6 +6,8 @@ pub mod config;
 pub mod crypto;
 pub mod files;
 pub mod input;
+pub mod permissions;
+pub mod power;
 pub mod proto;
 pub mod service;
 pub mod session;

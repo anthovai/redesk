@@ -118,6 +118,7 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
     agent.changed();
     let _registered = Registered { agent: agent.clone(), sid: sid.to_string() };
     agent.report(sid, "auth_ok", json!({"method": if need_password { "password" } else { "click" }, "approved_locally": need_click}));
+    let _awake = crate::power::KeepAwake::new("ReDesk remote session");
 
     // 4. Stream.
     let cfg = agent.config.lock().unwrap().clone();

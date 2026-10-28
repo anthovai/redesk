@@ -6,6 +6,7 @@
 # Output (dist/):
 #   redesk-server-macos-<version>.tar.gz   server kit: universal binary, web console, installer
 #   redesk-agent-macos-<version>.tar.gz    agent for controlled Macs (universal if the x86_64 target is installed)
+#   ReDesk-<version>.dmg                   ReDesk.app for controlled Macs (see build-app.sh)
 #   SHA256SUMS
 set -euo pipefail
 
@@ -72,10 +73,12 @@ Then grant Screen Recording and Accessibility to /usr/local/bin/redesk-agent
 in System Settings > Privacy & Security.
 EOF
 
+"$ROOT/deploy/macos/build-app.sh" --bins "$AGENT_KIT"
+
 step "Archives"
 (cd "$DIST" && tar -czf "$(basename "$KIT").tar.gz" "$(basename "$KIT")" \
 	&& tar -czf "$(basename "$AGENT_KIT").tar.gz" "$(basename "$AGENT_KIT")" \
-	&& shasum -a 256 ./*-"$VERSION".tar.gz > SHA256SUMS)
+	&& shasum -a 256 ./*-"$VERSION".tar.gz ./ReDesk-"$VERSION".dmg > SHA256SUMS)
 lipo -archs "$KIT/bin/redesk-server" | sed 's/^/   server: /'
 lipo -archs "$AGENT_KIT/redesk-agent" | sed 's/^/   agent:  /'
 cat "$DIST/SHA256SUMS"

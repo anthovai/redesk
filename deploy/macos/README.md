@@ -56,14 +56,45 @@ sudo ./install.sh --domain redesk.kgarden.co.th --email it@kgarden.co.th --serve
 
 ## ติดตั้ง agent บนเครื่องที่จะถูกควบคุม (Mac)
 
-ใช้ไฟล์ `redesk-agent-macos-<version>.tar.gz` (เป็น universal binary รันได้ทั้ง Apple Silicon และ Intel) ทำตาม `README.txt` ในไฟล์นั้น สรุปคือ:
+### แบบแอป (แนะนำ): `ReDesk-<version>.dmg`
+
+1. เปิด `ReDesk-<version>.dmg` แล้วลาก **ReDesk** ไปไว้ที่ **Applications** (universal รันได้ทั้ง Apple Silicon และ Intel ต้องใช้ macOS 11 ขึ้นไป)
+2. เปิด ReDesk จาก Applications ครั้งแรก macOS จะเตือนว่าแอปไม่ได้มาจากผู้พัฒนาที่ยืนยันตัวตน ให้คลิกขวาที่แอป → **เปิด** (หรือ System Settings → Privacy & Security → **เปิดต่อไป**) หรือสั่ง `xattr -d com.apple.quarantine /Applications/ReDesk.app`
+3. ReDesk ทำงานเป็นแอปเมนูบาร์ (ไม่มีไอคอนใน Dock) หน้าต่างแรกจะให้เข้าสู่ระบบด้วยบัญชีจากเว็บคอนโซล
+4. **ให้สิทธิ์ของระบบ** ที่ ตั้งค่า → "สิทธิ์ของระบบ" (หน้าหลักจะมีแถบเตือนถ้ายังขาดสิทธิ์) กด "ขอสิทธิ์" แล้วเปิดสวิตช์ให้ ReDesk ใน System Settings → Privacy & Security:
+
+| สิทธิ์ | จำเป็น | ใช้ทำอะไร |
+|---|---|---|
+| Screen Recording | ใช่ | ส่งภาพหน้าจอ (อนุญาตแล้วต้องออกจาก ReDesk แล้วเปิดใหม่) |
+| Accessibility | ใช่ | ให้ผู้ควบคุมใช้เมาส์และคีย์บอร์ด |
+| Input Monitoring | ไม่บังคับ | ปุ่มลัดของระบบระหว่างควบคุม |
+
+ระหว่างที่มีผู้ควบคุม ReDesk จะกันเครื่องและหน้าจอไม่ให้หลับ (IOPMAssertion) และปล่อยทันทีเมื่อเซสชันจบ ในแอปยังมี `redesk-agent` (CLI) อยู่ที่ `/Applications/ReDesk.app/Contents/MacOS/redesk-agent` สำหรับสคริปต์ติดตั้ง
+
+สร้างเฉพาะแอปและ dmg ได้ด้วย `deploy/macos/build-app.sh` (`build-kit.sh` เรียกให้เองและใส่ dmg ไว้ใน `dist/` พร้อม SHA256SUMS)
+
+### แบบ command line: `redesk-agent-macos-<version>.tar.gz`
+
+เป็น universal binary เช่นกัน ทำตาม `README.txt` ในไฟล์นั้น สรุปคือ:
 
 ```sh
 redesk-agent init --server https://redesk.kgarden.co.th --key <server key> [--enroll-token rdk_...]
 redesk-agent install
 ```
 
-> agent ใช้ลายเซ็นแบบ ad-hoc ทุกครั้งที่ build ใหม่ macOS จะถามสิทธิ์ Screen Recording/Accessibility ซ้ำ ถ้าจะแจกจ่ายผ่าน MDM พร้อม PPPC profile ให้เซ็นด้วย Developer ID ขององค์กร
+### ลายเซ็นโค้ดและ MDM
+
+แอปและ agent ใช้ลายเซ็นแบบ **ad-hoc** (เปิด hardened runtime, ไม่ใช้ sandbox, entitlements: `network.client`, `device.audio-input`) macOS ผูกสิทธิ์ Screen Recording/Accessibility กับลายเซ็น ทุกครั้งที่ build ใหม่จึงต้องอนุญาตซ้ำ และ Gatekeeper จะเตือนตอนเปิดครั้งแรก
+
+ถ้าจะแจกจ่ายทั้งองค์กรผ่าน MDM พร้อม PPPC profile (ให้สิทธิ์ล่วงหน้าโดยผู้ใช้ไม่ต้องกด) ต้อง **เซ็นด้วย Developer ID Application และ notarize** ก่อน เพราะ PPPC อ้างอิง Team ID / designated requirement ซึ่งลายเซ็น ad-hoc ไม่มี:
+
+```sh
+REDESK_SIGN_ID="Developer ID Application: <องค์กร> (<TEAMID>)" deploy/macos/build-app.sh
+xcrun notarytool submit dist/ReDesk-<version>.dmg --keychain-profile <profile> --wait
+xcrun stapler staple dist/ReDesk-<version>.dmg
+```
+
+หมายเหตุ: Screen Recording ให้ล่วงหน้าผ่าน PPPC ไม่ได้ (MDM อนุญาตได้แค่ให้ผู้ใช้ที่ไม่ใช่ admin เปิดเองได้) ส่วน Accessibility ให้ผ่าน PPPC ได้ bundle ID คือ `co.redesk.app`
 
 ## ดูแลระบบ
 
