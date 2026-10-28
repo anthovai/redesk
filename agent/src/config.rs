@@ -89,6 +89,9 @@ pub struct Config {
     pub max_width: u32,
     #[serde(default)]
     pub account: Option<Account>,
+    /// Answer LAN discovery broadcasts (UDP 21120) with id, hostname and OS.
+    #[serde(default = "yes")]
+    pub lan_discovery: bool,
 }
 
 fn yes() -> bool {
@@ -119,6 +122,7 @@ impl Config {
             jpeg_quality: 70,
             max_width: 1920,
             account: None,
+            lan_discovery: true,
         })
     }
 

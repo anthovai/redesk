@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
-	import { api, type AddressEntry, type Device } from '#lib/api.js';
+	import { api, wakeDevice, type AddressEntry, type Device } from '#lib/api.js';
 	import { ago, formatId } from '#lib/format.js';
 	import Icon from '#lib/Icon.svelte';
 
@@ -73,6 +73,15 @@
 		await load();
 	}
 
+	let toast = $state<{ ok: boolean; message: string } | null>(null);
+	let waking = $state('');
+	async function wake(id: string) {
+		waking = id;
+		toast = await wakeDevice(id);
+		waking = '';
+		setTimeout(() => (toast = null), 4000);
+	}
+
 	async function toggleFavorite(e: AddressEntry) {
 		await api.put(`/api/address-book/${e.device_id}`, { alias: e.alias, tags: e.tags, favorite: !e.favorite });
 		await load();
@@ -118,6 +127,9 @@
 						<button class="btn" title="เพิ่มในสมุดที่อยู่" onclick={() => api.put(`/api/address-book/${d.id}`, { alias: '', tags: [], favorite: false }).then(load)}>
 							<Icon name="book" />
 						</button>
+					{/if}
+					{#if d.can_wake}
+						<button class="btn" disabled={waking === d.id} onclick={() => wake(d.id)}>ปลุกเครื่อง</button>
 					{/if}
 					<a class="btn btn-primary {d.online ? '' : 'pointer-events-none opacity-50'}" href="/connect/{d.id}">เชื่อมต่อ</a>
 				</div>
@@ -179,7 +191,13 @@
 					</div>
 				{/if}
 				<div class="mt-4 flex gap-2 pt-1">
-					<a class="btn btn-primary flex-1 {d?.online ? '' : 'pointer-events-none opacity-50'}" href="/connect/{e.device_id}">เชื่อมต่อ</a>
+					{#if d?.can_wake}
+						<button class="btn flex-1" title="ส่ง Wake-on-LAN ผ่านเครื่องที่ออนไลน์ในเครือข่ายเดียวกัน" disabled={waking === d.id} onclick={() => wake(e.device_id)}>
+							ปลุกเครื่อง
+						</button>
+					{:else}
+						<a class="btn btn-primary flex-1 {d?.online ? '' : 'pointer-events-none opacity-50'}" href="/connect/{e.device_id}">เชื่อมต่อ</a>
+					{/if}
 					<button
 						class="btn"
 						title="แก้ไข"
@@ -191,6 +209,12 @@
 				</div>
 			</article>
 		{/each}
+	</div>
+{/if}
+
+{#if toast}
+	<div class="fixed bottom-5 left-1/2 z-30 -translate-x-1/2 rounded-lg border border-line bg-surface px-4 py-2 text-sm shadow-lg {toast.ok ? '' : 'text-danger'}" role="status">
+		{toast.message}
 	</div>
 {/if}
 

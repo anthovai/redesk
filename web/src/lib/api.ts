@@ -25,6 +25,18 @@ export interface Device {
 	created_at: string;
 	group_id: number | null;
 	online: boolean;
+	/** Offline, MAC known and an online agent on its LAN can send Wake-on-LAN. */
+	can_wake: boolean;
+	/** Admin only. */
+	macs?: string[];
+	/** Admin only: IPv4 addresses reported by the agent. */
+	lan?: { ip: string; prefix: number }[];
+}
+
+export interface WakeResult {
+	ok: boolean;
+	/** Admin only: device id of the agent that sent the packet. */
+	helper?: string;
 }
 
 export interface Group {
@@ -105,7 +117,8 @@ export interface SessionTicket {
 export class ApiError extends Error {
 	constructor(
 		public status: number,
-		message: string
+		message: string,
+		public code?: string
 	) {
 		super(message);
 	}
@@ -122,7 +135,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 		body: body !== undefined ? JSON.stringify(body) : undefined
 	});
 	const data = await res.json().catch(() => ({}));
-	if (!res.ok) throw new ApiError(res.status, data.error ?? res.statusText);
+	if (!res.ok) throw new ApiError(res.status, data.error ?? res.statusText, data.code);
 	return data as T;
 }
 
@@ -180,4 +193,22 @@ export interface Integration {
 	group_id: number | null;
 	last_sync_at: string | null;
 	last_error: string;
+}
+
+/** Sends Wake-on-LAN via an online agent on the device's LAN; returns a Thai message for a toast. */
+export async function wakeDevice(id: string): Promise<{ ok: boolean; message: string }> {
+	try {
+		await api.post<WakeResult>(`/api/devices/${id}/wake`);
+		return { ok: true, message: 'ส่งคำสั่งปลุกเครื่องแล้ว เครื่องอาจใช้เวลาสักครู่ก่อนออนไลน์' };
+	} catch (e) {
+		const err = e as ApiError;
+		const known: Record<string, string> = {
+			online_already: 'เครื่องนี้ออนไลน์อยู่แล้ว',
+			no_mac: 'ยังไม่ทราบ MAC address ของเครื่องนี้',
+			no_helper: 'ไม่มีเครื่องที่ออนไลน์ในเครือข่ายเดียวกันเพื่อช่วยปลุก',
+			helper_busy: 'เครื่องที่ช่วยปลุกไม่ว่าง กรุณาลองใหม่',
+			rate_limited: 'ส่งคำสั่งปลุกบ่อยเกินไป กรุณารอสักครู่'
+		};
+		return { ok: false, message: (err.code && known[err.code]) || `ปลุกเครื่องไม่สำเร็จ: ${err.message}` };
+	}
 }

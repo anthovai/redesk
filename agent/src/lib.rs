@@ -6,6 +6,7 @@ pub mod config;
 pub mod crypto;
 pub mod files;
 pub mod input;
+pub mod lan;
 pub mod proto;
 pub mod service;
 pub mod session;

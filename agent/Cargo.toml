@@ -20,10 +20,12 @@ getrandom = "0.3"
 hkdf = "0.12.4"
 hostname = "0.4.2"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "ico"] }
+netdev = { version = "0.47", default-features = false }
 rpassword = "7.5.4"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.10.9"
+socket2 = { version = "0.6", features = ["all"] }
 tokio = { version = "1.54.1", features = ["full"] }
 tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-native-roots"] }
 toml = "1.1.8"

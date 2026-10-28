@@ -113,6 +113,13 @@ enum ServerMsg {
     Pong,
     #[serde(rename = "session")]
     Session { sid: String, token: String, relay: String, viewer: Viewer },
+    /// Wake-on-LAN request: send magic packets for these MACs on our LAN.
+    #[serde(rename = "wol")]
+    Wol {
+        macs: Vec<String>,
+        #[serde(default)]
+        target: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -144,6 +151,9 @@ where
 
 /// Keeps the signaling connection alive forever, reconnecting with backoff.
 pub async fn run_forever(agent: Arc<Agent>) {
+    if agent.config.lock().unwrap().lan_discovery {
+        tokio::spawn(crate::lan::listen(agent.clone(), crate::lan::DISCOVERY_PORT));
+    }
     let mut backoff = Duration::from_secs(1);
     loop {
         let started = Instant::now();
@@ -180,6 +190,7 @@ async fn run_once(agent: &Arc<Agent>) -> Result<()> {
     let ServerMsg::Challenge { nonce: server_nonce } = next_msg(&mut rx).await? else { bail!("expected challenge") };
     let my_nonce = B64.encode(crypto::random_bytes::<32>());
     let sig = agent.identity.sign(format!("redesk-register-v1\n{id}\n{server_nonce}\n{my_nonce}").as_bytes());
+    let net = tokio::task::spawn_blocking(crate::lan::local_facts).await.unwrap_or_default();
     let reg = json!({
         "t": "register",
         "id": id,
@@ -190,6 +201,8 @@ async fn run_once(agent: &Arc<Agent>) -> Result<()> {
         "os": format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
         "version": env!("CARGO_PKG_VERSION"),
         "enroll_token": enroll,
+        "macs": net.macs,
+        "lan": net.lan,
     });
     tx.send(Message::Text(reg.to_string().into())).await?;
 
@@ -244,6 +257,9 @@ async fn run_once(agent: &Arc<Agent>) -> Result<()> {
                                 agent.send_server(json!({"t": "session_reject", "sid": sid, "reason": format!("{e}")}));
                             }
                         });
+                    }
+                    Some(ServerMsg::Wol { macs, target }) => {
+                        tokio::spawn(crate::lan::handle_wol(agent.clone(), macs, target));
                     }
                     Some(ServerMsg::Pong) | None => {}
                     Some(other) => tracing::debug!("ignoring {other:?}"),
