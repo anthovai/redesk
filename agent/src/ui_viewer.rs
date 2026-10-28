@@ -100,6 +100,9 @@ struct Frame1<'a> {
     fps: u32,
     kbps: u32,
     codec: &'a str,
+    encoder: &'a str,
+    muted: bool,
+    audio_level: Option<f32>,
     fb: (usize, usize),
     path: Option<crate::direct::Path>,
 }
@@ -136,7 +139,7 @@ impl ViewerWindow {
         self.demo_state(&ctx, w);
 
         // Pull new screen regions into the GPU texture and pick up state for this frame.
-        let (phase, error, name, fp, info, fps, kbps, clip, transfers, fb_size, cursor, codec, path, browser, clip_offer, notice) = {
+        let (phase, error, name, fp, info, fps, kbps, clip, transfers, fb_size, cursor, codec, path, browser, clip_offer, notice, encoder, muted, audio_level) = {
             let mut st = self.viewer.state.lock().unwrap();
             if st.fb.w > 0 {
                 let opts = egui::TextureOptions::LINEAR;
@@ -177,6 +180,9 @@ impl ViewerWindow {
                 st.browser.clone(),
                 st.clip_offer.clone(),
                 st.notice.take(),
+                st.encoder.clone(),
+                st.muted,
+                st.audio_level,
             )
         };
         let connected = phase == Phase::Connected;
@@ -272,7 +278,7 @@ impl ViewerWindow {
         });
 
         if connected {
-            let f = Frame1 { name: &name, id: &self.device_id, fp: &fp, info: info.as_ref(), fps, kbps, codec: &codec, fb: fb_size, path };
+            let f = Frame1 { name: &name, id: &self.device_id, fp: &fp, info: info.as_ref(), fps, kbps, codec: &codec, encoder: &encoder, muted, audio_level, fb: fb_size, path };
             if w.show_quality {
                 self.quality_monitor(&ctx, &f);
             }
@@ -487,7 +493,7 @@ impl ViewerWindow {
                 w.show_quality = !w.show_quality;
             }
             menu_separator(ui);
-            menu_footer(ui, &format!("Codec ที่ใช้: {}", codec_label(f.codec)));
+            menu_footer(ui, &format!("Codec ที่ใช้: {}", codec_label(f.codec, f.encoder)));
         });
 
         // Keyboard: how ⌘/Ctrl reach the remote OS.
@@ -544,6 +550,14 @@ impl ViewerWindow {
                 }
                 menu_footer(ui, "เส้นจะหายไปเมื่อจบการเชื่อมต่อ");
             });
+        }
+
+        // Speaker: only when the agent streams audio to us.
+        if f.info.is_some_and(|i| i.audio) {
+            let (g, tip) = if f.muted { (Glyph::SpeakerOff, "เปิดเสียง") } else { (Glyph::Speaker, "ปิดเสียง") };
+            if bar_button(ui, g, tip, if f.muted { Tone::Neutral } else { Tone::Accent }, false).clicked() {
+                self.viewer.set_muted(!f.muted);
+            }
         }
 
         // Fullscreen
@@ -652,7 +666,13 @@ impl ViewerWindow {
                         ui.label(val(f.fps.to_string()));
                         ui.end_row();
                         ui.label(key("Codec"));
-                        ui.label(val(codec_label(f.codec)));
+                        ui.label(val(codec_label(f.codec, "")));
+                        ui.end_row();
+                        ui.label(key("ตัวเข้ารหัส"));
+                        ui.label(val(encoder_label(f.encoder)));
+                        ui.end_row();
+                        ui.label(key("เสียง"));
+                        ui.label(val(audio_label(f.info.is_some_and(|i| i.audio), f.muted, f.audio_level)));
                         ui.end_row();
                         ui.label(key("ความละเอียด"));
                         ui.label(val(if f.fb.0 > 0 { format!("{} × {}", f.fb.0, f.fb.1) } else { "–".into() }));
@@ -891,6 +911,7 @@ impl ViewerWindow {
         let mut st = self.viewer.state.lock().unwrap();
         if st.codec.is_empty() {
             st.codec = "h264".into();
+            st.encoder = "videotoolbox".into();
         }
         for flag in spec.split(',').map(str::trim) {
             match flag {
@@ -953,8 +974,33 @@ impl ViewerWindow {
     }
 }
 
-fn codec_label(codec: &str) -> String {
-    if codec.is_empty() { "–".into() } else { codec.to_uppercase() }
+fn codec_label(codec: &str, encoder: &str) -> String {
+    match (codec, encoder) {
+        ("", _) => "–".into(),
+        ("h264", e) if !e.is_empty() => format!("H264 · {}", encoder_label(e)),
+        (c, _) => c.to_uppercase(),
+    }
+}
+
+fn encoder_label(encoder: &str) -> String {
+    match encoder {
+        "" => "–".into(),
+        "videotoolbox" => "VideoToolbox (ฮาร์ดแวร์)".into(),
+        "mediafoundation" => "Media Foundation (ฮาร์ดแวร์)".into(),
+        "openh264" => "OpenH264 (ซอฟต์แวร์)".into(),
+        "jpeg" => "JPEG".into(),
+        e => e.to_string(),
+    }
+}
+
+fn audio_label(on: bool, muted: bool, level: Option<f32>) -> String {
+    match (on, muted, level) {
+        (false, _, _) => "ไม่มี".into(),
+        (true, true, _) => "Opus · ปิดเสียงอยู่".into(),
+        (true, false, None) => "Opus".into(),
+        // RMS -> rough dBFS so quiet sound still shows.
+        (true, false, Some(l)) => format!("Opus · {:.0} dB", 20.0 * l.max(1e-5).log10()),
+    }
 }
 
 fn os_label(os: &str) -> &str {
@@ -1157,6 +1203,8 @@ enum Glyph {
     FolderPlus,
     Up,
     File,
+    Speaker,
+    SpeakerOff,
 }
 
 fn glyph(ui: &Ui, rect: Rect, g: Glyph, color: Color32) {
@@ -1275,6 +1323,20 @@ fn glyph(ui: &Ui, rect: Rect, g: Glyph, color: Color32) {
         Glyph::File => {
             line(&[(3.0, 1.5), (9.5, 1.5), (13.0, 5.0), (13.0, 14.5), (3.0, 14.5), (3.0, 1.5)]);
             line(&[(9.5, 1.5), (9.5, 5.0), (13.0, 5.0)]);
+        }
+        Glyph::Speaker | Glyph::SpeakerOff => {
+            p.add(Shape::convex_polygon(
+                [(1.5, 5.8), (4.5, 5.8), (8.5, 2.2), (8.5, 13.8), (4.5, 10.2), (1.5, 10.2)].iter().map(|&(x, y)| at(x, y)).collect(),
+                color,
+                Stroke::NONE,
+            ));
+            if g == Glyph::Speaker {
+                p.add(Shape::line(arc(at(8.5, 8.0), 3.2 * s, -0.16 * TAU, 0.16 * TAU), st));
+                p.add(Shape::line(arc(at(8.5, 8.0), 6.0 * s, -0.16 * TAU, 0.16 * TAU), st));
+            } else {
+                line(&[(10.8, 5.7), (15.0, 10.3)]);
+                line(&[(15.0, 5.7), (10.8, 10.3)]);
+            }
         }
         Glyph::Info | Glyph::Warn => {
             p.circle_stroke(at(8.0, 8.0), 6.6 * s, st);

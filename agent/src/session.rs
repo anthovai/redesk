@@ -15,9 +15,10 @@ use serde_json::json;
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::audio;
 use crate::capture::{self, Params};
-use crate::codec::Codec;
-use crate::config::{ApproveMode, Verification};
+use crate::codec::{self, Codec};
+use crate::config::{ApproveMode, EncoderPref, Verification};
 use crate::crypto::{self, Channel};
 use crate::files;
 use crate::input;
@@ -70,13 +71,16 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
     let mut attempts = 0;
     let mut codec;
     let mut viewer_features;
+    let mut wants_audio;
     loop {
-        let Incoming::Msg(ViewerMsg::Auth { password, codecs, features }) = read_viewer(&mut rx, &mut ch, Duration::from_secs(120)).await? else {
+        let Incoming::Msg(ViewerMsg::Auth { password, codecs, features, audio }) = read_viewer(&mut rx, &mut ch, Duration::from_secs(120)).await? else {
             bail!("expected auth message")
         };
         attempts += 1;
         codec = Codec::negotiate(&codecs);
         viewer_features = features;
+        // Viewers that do not list an audio codec never get 0x05 packets.
+        wants_audio = audio.iter().any(|c| c == "opus");
 
         if need_password {
             if let Some(wait) = locked_for(&agent) {
@@ -159,6 +163,14 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
         let area = capture::logical_area(0).unwrap_or_default();
         agent.status.lock().unwrap().boards.push(Board::new(sid, area));
     }
+    let audio_on = wants_audio && cfg.allow_audio && audio::capture_supported();
+    // Which encoder this session will use (the hardware probe runs once per process and may
+    // block briefly).
+    let encoder = match codec {
+        Codec::H264 if cfg.video_encoder == EncoderPref::Auto => tokio::task::spawn_blocking(codec::preferred_encoder).await.unwrap_or("openh264"),
+        Codec::H264 => "openh264",
+        _ => "jpeg",
+    };
     send_json(&mut tx, &mut ch, json!({
         "t": "auth_result", "ok": true,
     }))
@@ -177,6 +189,9 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
         "recording": recording,
         "whiteboard": whiteboard,
         "features": files::FEATURES,
+        "encoder": encoder,
+        "audio": audio_on,
+        "audio_codec": if audio_on { Some("opus") } else { None },
     }))
     .await?;
 
@@ -188,7 +203,18 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
     let _stop_guard = StopOnDrop(stop.clone());
     {
         let (out_tx, stop, force_full) = (out_tx.clone(), stop.clone(), force_full.clone());
-        std::thread::spawn(move || capture::run(params_rx, out_tx, stop, force_full));
+        std::thread::spawn(move || capture::run(params_rx, out_tx, stop, force_full, encoder));
+    }
+    // Audio has its own small queue so it is never stuck behind a large video frame, and is
+    // dropped rather than delayed when the network cannot keep up.
+    let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<u8>>(16);
+    let audio_enabled = Arc::new(AtomicBool::new(true));
+    let mut audio_open = audio_on;
+    if audio_on {
+        let (enabled, stop) = (audio_enabled.clone(), stop.clone());
+        std::thread::spawn(move || audio::stream(audio_tx, enabled, stop));
+    } else {
+        drop(audio_tx);
     }
     let last_clip = Arc::new(Mutex::new(String::new()));
     // Clipboard file lists need both permissions and a viewer that asked for them.
@@ -209,6 +235,10 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
                 agent.report(sid, "denied", json!({"stage": "during_session"}));
                 return Ok(());
             }
+            pkt = audio_rx.recv(), if audio_open => match pkt {
+                Some(plain) => tx.send(Message::Binary(ch.seal(&plain)?.into())).await?,
+                None => audio_open = false,
+            },
             out = out_rx.recv() => {
                 let Some(plain) = out else { bail!("capture stopped") };
                 if let Some(r) = recorder.rec.as_mut() {
@@ -346,6 +376,7 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
                         }
                     }
                     ViewerMsg::Refresh => force_full.store(true, Ordering::Relaxed),
+                    ViewerMsg::Audio { on } => audio_enabled.store(on, Ordering::Relaxed),
                     ViewerMsg::Bye => return Ok(()),
                     _ => {}
                 }

@@ -6,6 +6,8 @@
 //!   0x03  file chunk: transfer id (u32 BE) followed by raw bytes
 //!   0x04  video frame: codec (u8, 1 = H.264), flags (u8, bit 0 = keyframe), width, height
 //!         (u16 BE) followed by the encoded access unit (H.264: Annex B)
+//!   0x05  audio packet: codec (u8, 1 = Opus 48 kHz stereo), sequence (u32 BE, one per 20 ms
+//!         frame) followed by one Opus packet. Only sent to viewers that asked for audio.
 
 use serde::Deserialize;
 
@@ -13,6 +15,9 @@ pub const MSG_JSON: u8 = 0x01;
 pub const MSG_FRAME: u8 = 0x02;
 pub const MSG_FILE: u8 = 0x03;
 pub const MSG_VIDEO: u8 = 0x04;
+pub const MSG_AUDIO: u8 = 0x05;
+
+pub const AUDIO_OPUS: u8 = 1;
 
 pub const VIDEO_KEYFRAME: u8 = 0x01;
 
@@ -48,6 +53,22 @@ pub fn video(codec: u8, keyframe: bool, w: u16, h: u16, data: &[u8]) -> Vec<u8> 
     out
 }
 
+pub fn audio(codec: u8, seq: u32, data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(6 + data.len());
+    out.extend_from_slice(&[MSG_AUDIO, codec]);
+    out.extend_from_slice(&seq.to_be_bytes());
+    out.extend_from_slice(data);
+    out
+}
+
+/// Splits a MSG_AUDIO message into (codec, sequence, payload).
+pub fn parse_audio(msg: &[u8]) -> Option<(u8, u32, &[u8])> {
+    if msg.len() < 7 || msg[0] != MSG_AUDIO {
+        return None;
+    }
+    Some((msg[1], u32::from_be_bytes(msg[2..6].try_into().ok()?), &msg[6..]))
+}
+
 /// Messages the viewer may send after the handshake.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "t")]
@@ -61,7 +82,13 @@ pub enum ViewerMsg {
         /// Optional viewer capabilities, e.g. ["clipfiles"] (absent on older viewers).
         #[serde(default)]
         features: Vec<String>,
+        /// Audio codecs the viewer can play, e.g. ["opus"]; absent = no audio is sent.
+        #[serde(default)]
+        audio: Vec<String>,
     },
+    /// Viewer muted (`on: false`) or unmuted its speaker; the agent stops/resumes 0x05 packets.
+    #[serde(rename = "audio")]
+    Audio { on: bool },
     /// Pointer move; x, y are normalised to [0, 1] across the displayed frame.
     #[serde(rename = "mm")]
     MouseMove { x: f64, y: f64 },

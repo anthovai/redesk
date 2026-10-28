@@ -10,7 +10,7 @@ use image::codecs::jpeg::JpegEncoder;
 use tokio::sync::{mpsc, watch};
 use xcap::Monitor;
 
-use crate::codec::{Codec, H264Encoder};
+use crate::codec::{self, Codec, VideoEncoder};
 use crate::proto;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -183,11 +183,16 @@ impl Pointer {
 /// Runs on a dedicated thread until `stop` is set or the receiver goes away.
 /// `blocking_send` on a tiny channel paces capture to what the network can carry.
 /// `force_full` asks for a full JPEG frame or an H.264 keyframe.
-pub fn run(params: watch::Receiver<Params>, out: mpsc::Sender<Vec<u8>>, stop: Arc<AtomicBool>, force_full: Arc<AtomicBool>) {
+/// `reported` is the encoder named in `info`; a different one in use is announced with an
+/// `encoder` message (e.g. after the hardware encoder failed and OpenH264 took over).
+pub fn run(params: watch::Receiver<Params>, out: mpsc::Sender<Vec<u8>>, stop: Arc<AtomicBool>, force_full: Arc<AtomicBool>, reported: &'static str) {
     let mut prev: Option<Frame> = None;
     let mut last_params = *params.borrow();
-    let mut h264: Option<H264Encoder> = None;
+    let mut h264: Option<Box<dyn VideoEncoder>> = None;
     let mut h264_failed = false;
+    // Hardware is only tried when the session's probe picked it (and the settings allow it).
+    let mut hw_failed = !codec::is_hardware(reported);
+    let mut reported = reported;
     let mut pointer = Pointer::new();
     let mut warned = false;
     while !stop.load(Ordering::Relaxed) {
@@ -234,7 +239,16 @@ pub fn run(params: watch::Receiver<Params>, out: mpsc::Sender<Vec<u8>>, stop: Ar
         };
         if let Some(r) = rect {
             let msg = if video {
-                encode_video(&mut h264, &cur, p, full || prev.is_none()).unwrap_or_else(|e| {
+                let key = full || prev.is_none();
+                let mut res = encode_video(&mut h264, &cur, p, key, !hw_failed);
+                if res.is_err() && h264.as_ref().is_some_and(|e| e.name() != "openh264") {
+                    // Hardware encoder broke mid-session: carry on in software.
+                    tracing::warn!("{:#}; switching to OpenH264", res.as_ref().err().unwrap());
+                    hw_failed = true;
+                    h264 = None;
+                    res = encode_video(&mut h264, &cur, p, true, false);
+                }
+                res.unwrap_or_else(|e| {
                     // The viewer decodes JPEG rectangles too, so degrade instead of going dark.
                     tracing::error!("{e:#}; falling back to JPEG");
                     h264_failed = true;
@@ -244,6 +258,18 @@ pub fn run(params: watch::Receiver<Params>, out: mpsc::Sender<Vec<u8>>, stop: Ar
             } else {
                 Some(encode_rect(&cur, r, p.quality))
             };
+            let active = match &h264 {
+                Some(e) if video => e.name(),
+                _ => "jpeg",
+            };
+            if active != reported {
+                reported = active;
+                tracing::info!("video encoder: {active}");
+                let note = serde_json::json!({"t": "encoder", "encoder": active, "codec": if video { "h264" } else { "jpeg" }});
+                if out.blocking_send(proto::json(&note)).is_err() {
+                    return;
+                }
+            }
             if let Some(msg) = msg {
                 if out.blocking_send(msg).is_err() {
                     return;
@@ -258,11 +284,13 @@ pub fn run(params: watch::Receiver<Params>, out: mpsc::Sender<Vec<u8>>, stop: Ar
     }
 }
 
-/// Encodes a whole frame as H.264, (re)creating the encoder when the size changes.
-/// Ok(None) means the encoder dropped the frame.
-fn encode_video(enc: &mut Option<H264Encoder>, f: &Frame, p: Params, keyframe: bool) -> anyhow::Result<Option<Vec<u8>>> {
-    if enc.as_ref().is_none_or(|e| e.w != f.w || e.h != f.h) {
-        *enc = Some(H264Encoder::new(f.w, f.h, p.fps, p.quality)?);
+/// Encodes a whole frame as H.264, (re)creating the encoder when the size or settings change
+/// (a new encoder always starts with a keyframe). Ok(None) means the encoder dropped the frame.
+fn encode_video(enc: &mut Option<Box<dyn VideoEncoder>>, f: &Frame, p: Params, keyframe: bool, allow_hw: bool) -> anyhow::Result<Option<Vec<u8>>> {
+    let mut keyframe = keyframe;
+    if enc.as_ref().is_none_or(|e| e.size() != (f.w, f.h)) {
+        *enc = Some(codec::h264_encoder(f.w, f.h, p.fps, p.quality, allow_hw)?);
+        keyframe = true;
     }
     let e = enc.as_mut().unwrap();
     Ok(e.encode(&f.rgb, keyframe)?.map(|(data, key)| proto::video(Codec::H264.id(), key, f.w as u16, f.h as u16, &data)))

@@ -17,6 +17,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::audio::{self, OpusDecoder, Player};
 use crate::codec::H264Decoder;
 use crate::crypto::{Channel, ViewerKeys};
 use crate::files::{self, ensure_dirs, rel_components, unique_path};
@@ -66,6 +67,9 @@ pub struct Info {
     /// Optional capabilities of the agent ("fs2", "clipfiles"); empty on older agents.
     #[serde(default)]
     pub features: Vec<String>,
+    /// The agent streams its audio to this viewer.
+    #[serde(default)]
+    pub audio: bool,
 }
 
 impl Info {
@@ -92,6 +96,11 @@ const FEATURES: [&str; 1] = ["clipfiles"];
 fn clip_tmp_dir() -> PathBuf {
     static N: AtomicU32 = AtomicU32::new(0);
     std::env::temp_dir().join(format!("{}{}-{}", files::CLIP_TMP_PREFIX, std::process::id(), N.fetch_add(1, Ordering::Relaxed)))
+}
+
+/// Audio codecs this viewer plays (none where there is no playback backend).
+fn audio_codecs() -> &'static [&'static str] {
+    if audio::playback_supported() { &["opus"] } else { &[] }
 }
 
 /// Remote screen; `dirty` lists rectangles (x, y, w, h) not yet uploaded to the GPU.
@@ -213,6 +222,12 @@ pub struct State {
     pub cursor: Option<(f32, f32)>,
     /// Codec the agent chose ("h264" or "jpeg").
     pub codec: String,
+    /// Encoder the agent uses ("videotoolbox", "mediafoundation", "openh264", "jpeg").
+    pub encoder: String,
+    /// Speaker muted by the user (the agent is asked to stop sending audio).
+    pub muted: bool,
+    /// Loudest decoded 20 ms block of the last second (RMS, 0–1); None before any audio.
+    pub audio_level: Option<f32>,
     pub transfers: Vec<Transfer>,
     /// How the session travels: relay, direct (TCP) or P2P (UDP); None until connected.
     pub path: Option<crate::direct::Path>,
@@ -306,6 +321,9 @@ impl Viewer {
                 remote_clipboard: None,
                 cursor: None,
                 codec: String::new(),
+                encoder: String::new(),
+                muted: false,
+                audio_level: None,
                 transfers: Vec::new(),
                 path: None,
                 browser: RemoteDir::default(),
@@ -358,6 +376,7 @@ impl Viewer {
             recording: std::env::var_os("AEGIRON_UI_DEMO_RECORDING").is_some(),
             whiteboard: true,
             features: crate::files::FEATURES.iter().map(|f| f.to_string()).collect(),
+            audio: true,
         };
         Arc::new(Viewer {
             state: Mutex::new(State {
@@ -374,6 +393,9 @@ impl Viewer {
                 remote_clipboard: None,
                 cursor: None,
                 codec: String::new(),
+                encoder: String::new(),
+                muted: false,
+                audio_level: None,
                 transfers: vec![Transfer { id: 1, name: "รายงานประจำเดือน.xlsx".into(), size: 100, sent: 64, files: 1, ..Default::default() }],
                 path: Some(crate::direct::Path::Direct),
                 browser: RemoteDir::default(),
@@ -396,7 +418,13 @@ impl Viewer {
 
     pub fn submit_password(&self, pw: &str) {
         self.state.lock().unwrap().error = None;
-        self.send(json!({"t": "auth", "password": pw, "codecs": CODECS, "features": FEATURES}));
+        self.send(json!({"t": "auth", "password": pw, "codecs": CODECS, "features": FEATURES, "audio": audio_codecs()}));
+    }
+
+    /// Mutes or unmutes the remote audio; the agent stops sending while muted.
+    pub fn set_muted(&self, muted: bool) {
+        self.update(|st| st.muted = muted);
+        self.send(json!({"t": "audio", "on": !muted}));
     }
 
     /// Uploads a local file or folder into `remote_dir` ("" = the agent's ~/Downloads/Aegiron).
@@ -585,6 +613,12 @@ async fn run(v: &Arc<Viewer>, t: Target, mut cmds: mpsc::UnboundedReceiver<Cmd>)
     let (up_tx, mut up_rx) = mpsc::channel::<Vec<u8>>(8);
     let (mut frames, mut bytes, mut stats_at) = (0u32, 0usize, Instant::now());
     let mut h264: Option<H264Decoder> = None;
+    let mut opus: Option<OpusDecoder> = None;
+    let mut player: Option<Player> = None;
+    // AEGIRON_AUDIO_OUT=0 decodes but does not play (tests on the same machine as the agent,
+    // where playing would loop back into the capture).
+    let mut player_failed = std::env::var("AEGIRON_AUDIO_OUT").is_ok_and(|v| v == "0");
+    let mut level: Option<f32> = None;
 
     loop {
         tokio::select! {
@@ -638,6 +672,35 @@ async fn run(v: &Arc<Viewer>, t: Target, mut cmds: mpsc::UnboundedReceiver<Cmd>)
                             let _ = r.send(Ev::Chunk(plain[5..].to_vec()));
                         }
                     }
+                    Some(&proto::MSG_AUDIO) => {
+                        let Some((proto::AUDIO_OPUS, _seq, packet)) = proto::parse_audio(&plain) else { continue };
+                        if opus.is_none() {
+                            tracing::info!("viewer: receiving audio (Opus)");
+                            opus = Some(OpusDecoder::new()?);
+                        }
+                        match opus.as_mut().unwrap().decode(packet) {
+                            Ok(pcm) => {
+                                let l = audio::rms(pcm);
+                                level = Some(level.unwrap_or(0.0).max(l));
+                                if v.state.lock().unwrap().muted {
+                                    if let Some(p) = &player { p.clear(); }
+                                } else {
+                                    if player.is_none() && !player_failed {
+                                        // Opening the output device takes a moment; don't stall other tasks.
+                                        match tokio::task::block_in_place(Player::new) {
+                                            Ok(p) => player = Some(p),
+                                            Err(e) => {
+                                                tracing::warn!("viewer: no audio output: {e:#}");
+                                                player_failed = true;
+                                            }
+                                        }
+                                    }
+                                    if let Some(p) = &player { p.push(pcm); }
+                                }
+                            }
+                            Err(e) => tracing::debug!("viewer: {e:#}"),
+                        }
+                    }
                     Some(&proto::MSG_JSON) => {
                         let m: Value = serde_json::from_slice(&plain[1..])?;
                         let route = m["id"].as_u64().and_then(|id| v.routes.lock().unwrap().get(&(id as u32)).cloned());
@@ -651,7 +714,11 @@ async fn run(v: &Arc<Viewer>, t: Target, mut cmds: mpsc::UnboundedReceiver<Cmd>)
                 }
                 if stats_at.elapsed() >= Duration::from_secs(1) {
                     let (f, kb) = (frames, (bytes * 8 / 1000) as u32);
-                    v.update(|st| { st.fps = f; st.kbps = kb; });
+                    if let Some(l) = level {
+                        tracing::debug!("viewer: audio level {l:.4}");
+                    }
+                    let lvl = level.take().or(opus.as_ref().map(|_| 0.0));
+                    v.update(|st| { st.fps = f; st.kbps = kb; st.audio_level = lvl; });
                     (frames, bytes, stats_at) = (0, 0, Instant::now());
                 }
             }
@@ -697,7 +764,7 @@ fn control(v: &Viewer, m: &Value) -> Option<Value> {
                 st.phase = Phase::Password;
             } else {
                 st.phase = Phase::Approval;
-                reply = Some(json!({"t": "auth", "password": null, "codecs": CODECS, "features": FEATURES}));
+                reply = Some(json!({"t": "auth", "password": null, "codecs": CODECS, "features": FEATURES, "audio": audio_codecs()}));
             }
         }
         "auth_pending" => st.phase = Phase::Approval,
@@ -722,6 +789,17 @@ fn control(v: &Viewer, m: &Value) -> Option<Value> {
         "info" => {
             st.info = serde_json::from_value(m.clone()).ok();
             st.codec = m["codec"].as_str().unwrap_or("jpeg").to_owned();
+            // Older agents do not say; they always used OpenH264 for H.264.
+            st.encoder = m["encoder"].as_str().unwrap_or(if st.codec == "h264" { "openh264" } else { "jpeg" }).to_owned();
+            tracing::info!("viewer: codec {} via {}, audio {}", st.codec, st.encoder, m["audio"].as_bool().unwrap_or(false));
+        }
+        // The agent switched encoders mid-session (e.g. hardware -> OpenH264 -> JPEG).
+        "encoder" => {
+            st.encoder = m["encoder"].as_str().unwrap_or("").to_owned();
+            if let Some(c) = m["codec"].as_str() {
+                st.codec = c.to_owned();
+            }
+            tracing::info!("viewer: encoder now {}", st.encoder);
         }
         "cursor" => {
             let (x, y) = (m["x"].as_f64().unwrap_or(-1.0) as f32, m["y"].as_f64().unwrap_or(-1.0) as f32);

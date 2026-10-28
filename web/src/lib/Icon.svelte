@@ -45,7 +45,9 @@
 		pen: 'M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5z',
 		video: 'M23 7l-7 5 7 5zM1 5h15v14H1z',
 		play: 'M6 4l14 8-14 8z',
-		pause: 'M6 4h4v16H6zM14 4h4v16h-4z'
+		pause: 'M6 4h4v16H6zM14 4h4v16h-4z',
+		volume: 'M11 5 6 9H2v6h4l5 4zM15.54 8.46a5 5 0 0 1 0 7.07M19.07 4.93a10 10 0 0 1 0 14.14',
+		volumeOff: 'M11 5 6 9H2v6h4l5 4zM23 9l-6 6M17 9l6 6'
 	} as const;
 	export type IconName = keyof typeof paths;
 </script>

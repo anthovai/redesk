@@ -4,6 +4,7 @@ import { api, ApiError, type SessionTicket } from './api';
 import { b64decode, b64encode, completeHandshake, newViewerKeys, type Channel, type ViewerKeys } from './crypto';
 import { fingerprint } from './format';
 import { sanitizeRel, ZIP_LIMIT, ZipWriter, type LocalTree } from './filetree';
+import { RemoteAudio, supportedAudioCodecs } from './audio';
 
 export type Phase = 'requesting' | 'waiting' | 'handshake' | 'auth' | 'approval' | 'connected' | 'closed';
 
@@ -31,6 +32,11 @@ export interface AgentInfo {
 	whiteboard?: boolean;
 	/** Optional capabilities (agents from 0.6), e.g. "fs2" for folders and file management. */
 	features?: string[];
+	/** H.264 encoder on the agent: videotoolbox | mediafoundation | openh264 (jpeg for JPEG). */
+	encoder?: string;
+	/** The agent streams its audio to this viewer (0x05 Opus packets). */
+	audio?: boolean;
+	audio_codec?: string | null;
 }
 
 /** A whiteboard stroke, normalised to the remote screen. */
@@ -83,7 +89,9 @@ const MSG_JSON = 0x01;
 const MSG_FRAME = 0x02;
 const MSG_FILE = 0x03;
 const MSG_VIDEO = 0x04;
+const MSG_AUDIO = 0x05;
 const VIDEO_H264 = 1;
+const AUDIO_OPUS = 1;
 
 // Constrained Baseline (what OpenH264 emits); Annex B, so no avcC description is needed.
 const H264_CONFIG: VideoDecoderConfig = { codec: 'avc1.42E033', optimizeForLatency: true, hardwareAcceleration: 'no-preference' };
@@ -143,6 +151,12 @@ export class RemoteViewer {
 		loading: false
 	});
 	transfers = $state<Transfer[]>([]);
+	/** Speaker muted by the user (the agent is asked to stop sending audio). */
+	muted = $state(false);
+	/** Loudest decoded audio block of the last second (RMS 0–1); null before any audio. */
+	audioLevel = $state<number | null>(null);
+	/** Audio is decoded but the browser has not allowed playback yet (needs a click). */
+	audioBlocked = $state(false);
 
 	private ws: WebSocket | null = null;
 	private ch: Channel | null = null;
@@ -159,6 +173,8 @@ export class RemoteViewer {
 	private statsTimer: ReturnType<typeof setInterval> | null = null;
 	private nextTransfer = 1;
 	private codecs: Promise<string[]> = supportedCodecs();
+	private audioCodecs: Promise<string[]> = supportedAudioCodecs();
+	private audio = new RemoteAudio();
 	private decoder: VideoDecoder | null = null;
 	private needKeyframe = true;
 	private videoTs = 0;
@@ -238,6 +254,9 @@ export class RemoteViewer {
 		else if (plain[0] === MSG_VIDEO) this.decodeVideo(plain);
 		else if (plain[0] === MSG_FRAME) await this.drawFrame(plain);
 		else if (plain[0] === MSG_FILE) this.onFileChunk(plain);
+		else if (plain[0] === MSG_AUDIO && plain.length > 6 && plain[1] === AUDIO_OPUS) {
+			this.audio.push(new DataView(plain.buffer, plain.byteOffset).getUint32(2), plain.subarray(6));
+		}
 	}
 
 	private onControl(m: any) {
@@ -248,7 +267,7 @@ export class RemoteViewer {
 					this.phase = 'auth';
 				} else {
 					this.phase = 'approval';
-					this.codecs.then((codecs) => this.send({ t: 'auth', password: null, codecs }));
+					this.authMessage(null).then((m) => this.send(m));
 				}
 				break;
 			case 'auth_pending':
@@ -274,6 +293,10 @@ export class RemoteViewer {
 				break;
 			case 'info':
 				this.info = m;
+				break;
+			case 'encoder':
+				// The agent switched encoders mid-session (e.g. hardware -> OpenH264 -> JPEG).
+				if (this.info) this.info = { ...this.info, encoder: m.encoder, codec: m.codec ?? this.info.codec };
 				break;
 			case 'ls':
 				this.files = { path: m.path, parent: m.parent, sep: m.sep, entries: m.entries, error: '', loading: false };
@@ -382,9 +405,11 @@ export class RemoteViewer {
 	}
 
 	private startStats() {
-		this.stopStats();
+		if (this.statsTimer) clearInterval(this.statsTimer);
 		this.statsTimer = setInterval(() => {
 			this.stats = { fps: this.frames, kbps: Math.round((this.bytesIn * 8) / 1000) };
+			this.audioLevel = this.audio.takeLevel();
+			this.audioBlocked = this.audioLevel !== null && !this.muted && !this.audio.playing;
 			this.frames = 0;
 			this.bytesIn = 0;
 		}, 1000);
@@ -396,6 +421,7 @@ export class RemoteViewer {
 		// Stats stop exactly when the session ends; release the hardware decoder with them.
 		if (this.decoder && this.decoder.state !== 'closed') this.decoder.close();
 		this.decoder = null;
+		this.audio.close();
 	}
 
 	/** Encrypts and sends in call order (the nonce counter depends on it). */
@@ -699,7 +725,24 @@ export class RemoteViewer {
 	submitPassword(password: string) {
 		this.authBusy = true;
 		this.error = null;
-		this.codecs.then((codecs) => this.send({ t: 'auth', password, codecs }));
+		this.audio.unlock(); // inside the click/submit gesture, so the browser lets it play
+		this.authMessage(password).then((m) => this.send(m));
+	}
+
+	private async authMessage(password: string | null) {
+		return { t: 'auth', password, codecs: await this.codecs, audio: await this.audioCodecs };
+	}
+
+	/** Lets audio play after a user gesture (browsers block autoplay until one). */
+	unlockAudio() {
+		if (!this.muted) this.audio.unlock();
+	}
+
+	setMuted(muted: boolean) {
+		this.muted = muted;
+		this.audio.muted = muted;
+		if (!muted) this.audio.unlock();
+		this.send({ t: 'audio', on: !muted });
 	}
 
 	// --- input (coordinates normalised to the displayed frame) ---

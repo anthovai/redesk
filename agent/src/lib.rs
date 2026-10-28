@@ -1,6 +1,7 @@
 //! Aegiron agent library: shared by the `aegiron-agent` CLI and the `aegiron` desktop app.
 
 pub mod account;
+pub mod audio;
 pub mod capture;
 pub mod codec;
 pub mod config;

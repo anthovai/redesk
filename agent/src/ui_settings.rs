@@ -349,6 +349,27 @@ impl App {
             ui.add_space(4.0);
         });
 
+        card_title(ui, "การเข้ารหัสวิดีโอ");
+        let picked = card(ui, |ui| {
+            let mut picked = None;
+            let opts = [
+                (EncoderPref::Auto, "อัตโนมัติ", "ใช้ตัวเข้ารหัส H.264 ฮาร์ดแวร์ของเครื่อง (VideoToolbox / Media Foundation) ถ้าใช้ได้ ไม่เช่นนั้นใช้ OpenH264"),
+                (EncoderPref::Software, "ซอฟต์แวร์เท่านั้น", "ใช้ OpenH264 เสมอ (ใช้ CPU มากกว่า เลือกเมื่อภาพจากฮาร์ดแวร์มีปัญหา)"),
+            ];
+            for (i, (pref, title, desc)) in opts.into_iter().enumerate() {
+                if i > 0 {
+                    sep(ui);
+                }
+                if radio_row(ui, c.video_encoder == pref, true, title, desc) {
+                    picked = Some(pref);
+                }
+            }
+            picked
+        });
+        if let Some(pref) = picked {
+            self.save_config(|c| c.video_encoder = pref);
+        }
+
         if cfg!(target_os = "macos") {
             permissions_ui::permissions_card(ui);
         }
@@ -358,7 +379,7 @@ impl App {
         let pal = Palette::of(ui);
 
         card_title(ui, "สิทธิ์ของผู้ควบคุม");
-        let (mut input, mut clip, mut files, mut board) = (c.allow_input, c.allow_clipboard, c.allow_file_transfer, c.allow_whiteboard);
+        let (mut input, mut clip, mut files, mut board, mut sound) = (c.allow_input, c.allow_clipboard, c.allow_file_transfer, c.allow_whiteboard, c.allow_audio);
         let changed = card(ui, |ui| {
             let mut changed = check_row(ui, "ควบคุมเมาส์และคีย์บอร์ด", "ถ้าปิด ผู้เชื่อมต่อจะดูหน้าจอได้อย่างเดียว", &mut input);
             sep(ui);
@@ -367,6 +388,13 @@ impl App {
             changed |= check_row(ui, "รับ-ส่งไฟล์", "ไฟล์ที่ได้รับจะอยู่ในโฟลเดอร์ Downloads/Aegiron", &mut files);
             sep(ui);
             changed |= check_row(ui, "วาดบนหน้าจอ", "ผู้ควบคุมขีดเขียนชี้จุดบนหน้าจอนี้ได้ (คลิกทะลุ ไม่บังหน้าจอ หายไปเมื่อจบเซสชัน)", &mut board);
+            sep(ui);
+            let hint = if crate::audio::capture_supported() {
+                "ส่งเสียงที่เครื่องนี้กำลังเล่นไปให้ผู้ควบคุม"
+            } else {
+                "ส่งเสียงที่เครื่องนี้กำลังเล่นไปให้ผู้ควบคุม (ต้องใช้ macOS 13 ขึ้นไป หรือ Windows)"
+            };
+            changed |= check_row(ui, "อนุญาตเสียง", hint, &mut sound);
             changed
         });
         if changed {
@@ -375,6 +403,7 @@ impl App {
                 c.allow_clipboard = clip;
                 c.allow_file_transfer = files;
                 c.allow_whiteboard = board;
+                c.allow_audio = sound;
             });
         }
 

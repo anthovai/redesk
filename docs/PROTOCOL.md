@@ -53,12 +53,12 @@ Every later message is binary ciphertext. A dropped, reordered, or replayed mess
 
 ## 4. Messages inside the encrypted channel
 
-Byte 0 is the type: `0x01` JSON, `0x02` video rectangle (`x, y, frame_w, frame_h` as u16 BE, followed by a JPEG), `0x03` file chunk (transfer id as u32 BE, followed by up to 64 KiB of data), `0x04` video frame (codec u8 `1` = H.264, flags u8 with bit 0 = keyframe, `width, height` as u16 BE, followed by one Annex B access unit).
+Byte 0 is the type: `0x01` JSON, `0x02` video rectangle (`x, y, frame_w, frame_h` as u16 BE, followed by a JPEG), `0x03` file chunk (transfer id as u32 BE, followed by up to 64 KiB of data), `0x04` video frame (codec u8 `1` = H.264, flags u8 with bit 0 = keyframe, `width, height` as u16 BE, followed by one Annex B access unit), `0x05` audio packet (see [Audio](#audio)).
 
 | Direction | Message |
 |---|---|
-| agent→viewer | `auth_required {password, click}`, `auth_pending`, `auth_result {ok, reason?, attempts_left?, retry_after?}`, `info {hostname, os, displays[], input, clipboard, files, codec, features?}`, `cursor {x,y,visible}`, `clip {s}` |
-| viewer→agent | `auth {password, codecs[]}`, `mm {x,y}`, `mb {b,down,x,y}`, `wh {dx,dy}`, `key {code,key,down}`, `text {s}`, `clip {s}`, `cfg {fps,quality,max_width,display}`, `refresh` (alias `keyframe`), `bye` |
+| agent→viewer | `auth_required {password, click}`, `auth_pending`, `auth_result {ok, reason?, attempts_left?, retry_after?}`, `info {hostname, os, displays[], input, clipboard, files, codec, features?, encoder?, audio?, audio_codec?}`, `encoder {encoder,codec}`, `cursor {x,y,visible}`, `clip {s}` |
+| viewer→agent | `auth {password, codecs[], features?[], audio?[]}`, `audio {on}`, `mm {x,y}`, `mb {b,down,x,y}`, `wh {dx,dy}`, `key {code,key,down}`, `text {s}`, `clip {s}`, `cfg {fps,quality,max_width,display}`, `refresh` (alias `keyframe`), `bye` |
 | files viewer→agent | `ls {path}` (`""` = home), `put {id,dir,name,size}` followed by `0x03` chunks and then `put_end {id}`, `get {id,path}`, `cancel {id}` |
 | files agent→viewer | `ls {path,parent,sep,entries[{name,dir,size,mtime}]}`, `put_ok {id,path}`, `put_done {id,path}`, `get_start {id,name,size}` followed by `0x03` chunks and then `get_end {id}`, `fs_error {op,id?,message}` |
 
@@ -68,6 +68,30 @@ The viewer lists the codecs it can decode in `auth.codecs`, best first (`["h264"
 
 - **H.264** (OpenH264, Constrained Baseline, screen-content mode, rate control from resolution × fps × quality): whole frames as `0x04`, sent only when the screen changed. A keyframe goes out at start, after `cfg` changes, on `refresh`/`keyframe`, and every ~10 s of activity. Browsers decode with WebCodecs (`avc1.42E033`) and the native app with OpenH264. A viewer drops deltas until its first keyframe and sends `keyframe` after a decoder error. If the agent's encoder fails, it falls back to JPEG rectangles in the same session, so every viewer must accept both.
 - **JPEG** (fallback): only the changed bounding rectangle as `0x02`.
+
+### Video encoders
+
+H.264 has several encoders behind it; the agent picks one per session and reports it in `info.encoder`:
+
+| `encoder` | Where | Notes |
+|---|---|---|
+| `videotoolbox` | macOS | Hardware only (`RequireHardwareAcceleratedVideoEncoder`), Constrained Baseline (Baseline before macOS 12), real time, no frame reordering, BT.601. AVCC output is rewritten to Annex B with SPS/PPS before every IDR. |
+| `mediafoundation` | Windows | First hardware H.264 MFT that accepts NV12 input (Quick Sync, NVENC, AMF), Baseline profile, low-latency mode. Untested on real hardware so far. |
+| `openh264` | everywhere | Software fallback, unchanged. |
+| `jpeg` | | The session uses JPEG rectangles. |
+
+All of them produce Annex B Constrained Baseline, so `avc1.42E033` (WebCodecs) and OpenH264 (native app) decode any of them and nothing changes for older viewers. The choice is automatic: hardware, then OpenH264, then JPEG. The host can force software in the app (Settings → General → การเข้ารหัสวิดีโอ → ซอฟต์แวร์เท่านั้น) or with `aegiron-agent set --video-encoder software` (`video_encoder` in the config; default `auto`). If the encoder in use changes during a session (a hardware encoder fails and OpenH264 takes over, or H.264 fails and JPEG takes over), the agent sends `{"t":"encoder","encoder","codec"}`. Viewers that do not know this message ignore it. `AEGIRON_HW_ENCODER=0` on the agent turns hardware encoding off. Older agents send no `encoder`; for H.264 that means `openh264`.
+
+VP9 is not offered. libvpx is a C library that would have to be built for both macOS architectures and cross-compiled with mingw for Windows, and screen content at these bitrates gains little over hardware H.264.
+
+### Audio
+
+Byte `0x05`: audio packet: codec u8 (`1` = Opus, 48 kHz, stereo), sequence u32 BE (+1 per 20 ms frame), then one Opus packet (20 ms, about 96 kbit/s).
+
+- The viewer lists the audio codecs it can play in `auth.audio` (`["opus"]`). If the list is missing or does not include `opus`, the agent never sends `0x05`, so older viewers are unaffected.
+- `info.audio` (bool) says whether this session streams audio, and `info.audio_codec` names the codec (`"opus"` or `null`). It is true only when the viewer asked for audio, the device allows it (`allow_audio`, "อนุญาตเสียง" in the app), and the platform can capture: macOS 13+ (ScreenCaptureKit, using the Screen Recording permission, without the agent's own sound) or Windows (WASAPI loopback of the default output device). Linux sends no audio.
+- Mute: viewer→agent `{"t":"audio","on":false}` stops `0x05` packets, and `on:true` resumes them. Older agents ignore it.
+- Audio has its own queue of about 320 ms on the agent. Packets are dropped rather than delayed when the link is congested, so a sequence gap means dropped audio. Viewers play through a jitter buffer of about 80 ms: the browser uses WebCodecs `AudioDecoder` and Web Audio, and the native app uses Opus and the default output device.
 
 Screen captures do not include the pointer, so the agent sends `cursor` (normalised to the streamed display, `visible=false` when it is on another display) whenever the pointer moves. Viewers draw it while their own pointer is not over the remote screen.
 
