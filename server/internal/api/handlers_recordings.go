@@ -155,14 +155,14 @@ func (a *API) uploadRecording(w http.ResponseWriter, r *http.Request) {
 		a.internal(w, err)
 		return
 	}
-	meta := store.RecordingMeta{DurationMS: info.DurationMS, SizeBytes: size, SHA256: sum, Codec: info.Codec, Frames: info.Frames}
+	meta := store.RecordingMeta{DurationMS: info.DurationMS, SizeBytes: size, SHA256: sum, Codec: info.Codec, Frames: info.Frames, Audio: info.Audio}
 	if err := a.store.CompleteRecording(r.Context(), rec.ID, meta); err != nil {
 		os.Remove(a.recordingPath(sid))
 		storeErr(a, w, err)
 		return
 	}
 	_ = a.store.AddAudit(r.Context(), rec.UserID, ip, "recording.uploaded", rec.DeviceID, map[string]any{
-		"sid": sid, "recording_id": rec.ID, "bytes": size, "duration_ms": info.DurationMS, "codec": info.Codec, "sha256": sum,
+		"sid": sid, "recording_id": rec.ID, "bytes": size, "duration_ms": info.DurationMS, "codec": info.Codec, "audio": info.Audio, "sha256": sum,
 	})
 	a.log.Info("session recording stored", "sid", sid, "device", rec.DeviceID, "bytes", size)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": rec.ID})

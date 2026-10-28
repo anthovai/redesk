@@ -24,13 +24,23 @@ func TestScan(t *testing.T) {
 	video := []byte{msgVideo, 1, 1, 0, 64, 0, 48, 0, 0, 0, 1, 0x65}
 	jpeg := []byte{msgFrame, 0, 0, 0, 0, 0, 64, 0, 48, 0xff, 0xd8}
 	cursor := append([]byte{msgJSON}, []byte(`{"t":"cursor","x":0.5,"y":0.5,"visible":true}`)...)
+	audio := []byte{msgAudio, audioOpus, 0, 0, 0, 7, 0xfc, 0xff, 0xfe}
 
 	info, err := Scan(bytes.NewReader(build(h, video, cursor, jpeg)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Frames != 2 || info.DurationMS != 200 || info.Codec != "h264+jpeg" || info.Header.SID != "abc" {
+	if info.Frames != 2 || info.DurationMS != 200 || info.Codec != "h264+jpeg" || info.Header.SID != "abc" || info.Audio != "" {
 		t.Fatalf("unexpected info %+v", info)
+	}
+
+	// Audio packets between video frames: counted, and they do not count as frames.
+	info, err = Scan(bytes.NewReader(build(h, video, audio, cursor, audio, jpeg)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Frames != 2 || info.AudioPackets != 2 || info.Audio != "opus" || info.DurationMS != 400 {
+		t.Fatalf("unexpected info with audio %+v", info)
 	}
 
 	info, err = Scan(bytes.NewReader(build(h)))
@@ -47,6 +57,7 @@ func TestScan(t *testing.T) {
 		append(full, 0, 0, 0),  // partial record header
 		build(h, []byte{}),     // zero-length record
 		build(h, []byte{4, 1}), // short video frame
+		build(h, video, []byte{msgAudio, audioOpus, 0, 0, 0, 1}), // audio without payload
 	} {
 		if _, err := Scan(bytes.NewReader(bad)); err == nil {
 			t.Errorf("accepted invalid recording %q", bad)

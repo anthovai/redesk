@@ -2,13 +2,20 @@
 //
 // A recording is the plaintext stream the controlled machine sent during the session, with
 // timestamps: H.264 frames are decoded with WebCodecs (the same decoder setup as the live
-// viewer), JPEG rectangles are drawn as images, and pointer positions are replayed.
+// viewer), JPEG rectangles are drawn as images, pointer positions are replayed, and Opus audio
+// (when the session streamed it) plays through Web Audio on the same clock.
+
+import { RecordedAudio, type AudioPacket } from './audio.js';
 
 const MAGIC = 'AEGREC1\n';
 const MSG_JSON = 0x01;
 const MSG_FRAME = 0x02;
 const MSG_VIDEO = 0x04;
+const MSG_AUDIO = 0x05;
 const VIDEO_H264 = 1;
+const AUDIO_OPUS = 1;
+/** Audio plays up to this speed (faster is unintelligible); above it playback is silent. */
+const MAX_AUDIO_SPEED = 2;
 const H264_CONFIG: VideoDecoderConfig = { codec: 'avc1.42E033', optimizeForLatency: true, hardwareAcceleration: 'no-preference' };
 
 export interface RecordingHeader {
@@ -27,8 +34,29 @@ interface Rec {
 
 export interface ParsedRecording {
 	header: RecordingHeader;
+	/** Video, JPEG and JSON records. */
 	records: Rec[];
+	/** Opus packets, kept apart from the video records; empty for silent or older recordings. */
+	audio: AudioPacket[];
 	durationMs: number;
+}
+
+/**
+ * Record times are when the agent sent a packet, which jitters with the network. Consecutive
+ * packets (by sequence number) are placed 20 ms apart instead, as long as that stays close to
+ * the send time; a gap (dropped or muted audio) or drift starts a new run at the send time.
+ */
+function audioPacket(r: Rec, prev: { t: number; seq: number } | null): { t: number; seq: number } | null {
+	const d = r.data;
+	if (d.length < 7 || d[1] !== AUDIO_OPUS) return null;
+	const seq = new DataView(d.buffer, d.byteOffset, d.byteLength).getUint32(2);
+	if (prev) {
+		const n = (seq - prev.seq) >>> 0;
+		const expected = prev.t + n * 20;
+		if (n >= 1 && n <= 50 && Math.abs(r.t - expected) <= 100) return { t: expected, seq };
+	}
+	// Never before the end of the previous packet: positions stay in order.
+	return { t: Math.max(r.t, prev ? prev.t + 20 : 0), seq };
 }
 
 export function parseRecording(buf: ArrayBuffer): ParsedRecording {
@@ -38,15 +66,23 @@ export function parseRecording(buf: ArrayBuffer): ParsedRecording {
 	const hlen = view.getUint32(8);
 	const header = JSON.parse(new TextDecoder().decode(bytes.subarray(12, 12 + hlen))) as RecordingHeader;
 	const records: Rec[] = [];
+	const audio: AudioPacket[] = [];
+	let prev: { t: number; seq: number } | null = null;
+	let durationMs = 0;
 	let at = 12 + hlen;
 	while (at + 8 <= bytes.length) {
 		const t = view.getUint32(at);
 		const len = view.getUint32(at + 4);
 		if (at + 8 + len > bytes.length) break;
-		records.push({ t, data: bytes.subarray(at + 8, at + 8 + len) });
+		const r = { t, data: bytes.subarray(at + 8, at + 8 + len) };
+		if (r.data[0] === MSG_AUDIO) {
+			prev = audioPacket(r, prev);
+			if (prev) audio.push({ t: prev.t, data: r.data.subarray(6) });
+		} else records.push(r);
+		durationMs = Math.max(durationMs, t);
 		at += 8 + len;
 	}
-	return { header, records, durationMs: records.length ? records[records.length - 1].t : 0 };
+	return { header, records, audio, durationMs };
 }
 
 /** Width and height from a JPEG's SOF marker (to recognise full-screen rectangles). */
@@ -85,8 +121,12 @@ export class RecordingPlayer {
 	frame = $state({ w: 0, h: 0 });
 	cursor = $state<{ x: number; y: number } | null>(null);
 	error = $state('');
+	muted = $state(false);
+	/** The recording has sound but the browser has not allowed playback yet (needs a click). */
+	audioBlocked = $state(false);
 
 	private ctx: CanvasRenderingContext2D;
+	private audio: RecordedAudio | null = null;
 	private decoder: VideoDecoder | null = null;
 	private videoTs = 0;
 	private next = 0;
@@ -101,11 +141,41 @@ export class RecordingPlayer {
 		private canvas: HTMLCanvasElement
 	) {
 		this.ctx = canvas.getContext('2d', { alpha: false })!;
+		if (rec.audio.length && RecordedAudio.supported) this.audio = new RecordedAudio(rec.audio);
 		this.seek(0);
 	}
 
 	get duration() {
 		return this.rec.durationMs;
+	}
+
+	/** Whether the recording has sound this browser can play. */
+	get hasAudio() {
+		return !!this.audio;
+	}
+
+	/** Whether the current speed plays sound at all. */
+	get audioAtSpeed() {
+		return this.speed <= MAX_AUDIO_SPEED;
+	}
+
+	/** The playback position right now (between animation frames too). */
+	private now = () => (this.playing ? this.base + (performance.now() - this.wall) * this.speed : this.time);
+
+	/** Restarts the audio from the current position after a seek, pause, play or speed change. */
+	private syncAudio() {
+		this.audio?.reset(this.time, this.now, this.playing && this.audioAtSpeed ? this.speed : 0);
+	}
+
+	toggleMute() {
+		if (!this.audio) return;
+		// The click is a user gesture: the browser now allows playback.
+		this.audio.unlock();
+		if (this.audioBlocked) {
+			this.audioBlocked = false;
+			this.muted = false;
+		} else this.muted = !this.muted;
+		this.audio.muted = this.muted;
 	}
 
 	private resize(w: number, h: number) {
@@ -198,22 +268,31 @@ export class RecordingPlayer {
 		this.time = ms;
 		this.base = ms;
 		this.wall = performance.now();
+		this.syncAudio();
 	}
 
 	play() {
 		if (this.playing) return;
 		if (this.time >= this.duration) this.seek(0);
+		this.audio?.unlock();
 		this.playing = true;
 		this.base = this.time;
 		this.wall = performance.now();
+		this.syncAudio();
 		const tick = () => {
 			if (!this.playing) return;
-			const now = this.base + (performance.now() - this.wall) * this.speed;
+			const now = this.now();
 			const recs = this.rec.records;
 			while (this.next < recs.length && recs[this.next].t <= now) this.apply(recs[this.next++]);
 			this.time = Math.min(now, this.duration);
+			if (this.audio) {
+				this.audio.tick();
+				const blocked = !this.audio.running && this.audioAtSpeed;
+				if (blocked !== this.audioBlocked) this.audioBlocked = blocked;
+			}
 			if (this.time >= this.duration) {
 				this.playing = false;
+				this.syncAudio();
 				return;
 			}
 			this.raf = requestAnimationFrame(tick);
@@ -224,18 +303,22 @@ export class RecordingPlayer {
 	pause() {
 		this.playing = false;
 		cancelAnimationFrame(this.raf);
+		this.syncAudio();
 	}
 
 	setSpeed(s: number) {
 		this.base = this.time;
 		this.wall = performance.now();
 		this.speed = s;
+		this.syncAudio();
 	}
 
 	destroy() {
 		this.pause();
 		this.generation++;
 		this.resetDecoder();
+		this.audio?.close();
+		this.audio = null;
 	}
 }
 

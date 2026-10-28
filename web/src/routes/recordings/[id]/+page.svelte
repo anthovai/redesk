@@ -53,7 +53,8 @@
 			ev.preventDefault();
 			if (player.playing) player.pause();
 			else player.play();
-		} else if (ev.key === 'ArrowRight') player.seek(player.time + 10_000);
+		} else if (ev.key === 'm' && player.hasAudio) player.toggleMute();
+		else if (ev.key === 'ArrowRight') player.seek(player.time + 10_000);
 		else if (ev.key === 'ArrowLeft') player.seek(player.time - 10_000);
 	}
 </script>
@@ -114,10 +115,21 @@
 					<button class="btn px-2 {player.speed === s ? 'border-accent bg-accent-soft text-accent' : ''}" onclick={() => player!.setSpeed(s)}>{s}×</button>
 				{/each}
 			</div>
+			{#if player.hasAudio}
+				<button
+					class="btn {player.audioBlocked ? 'border-accent bg-accent-soft text-accent' : ''}"
+					onclick={() => player!.toggleMute()}
+					aria-pressed={player.muted}
+					title={!player.audioAtSpeed ? 'เสียงเล่นได้ที่ความเร็วไม่เกิน 2×' : player.audioBlocked ? 'คลิกเพื่อเปิดเสียง' : player.muted ? 'เปิดเสียง' : 'ปิดเสียง'}
+				>
+					<Icon name={player.muted || player.audioBlocked || !player.audioAtSpeed ? 'volumeOff' : 'volume'} size={14} />
+					{#if player.audioBlocked}<span class="text-xs">เปิดเสียง</span>{/if}
+				</button>
+			{/if}
 			<a class="btn" href="/api/recordings/{id}/file" download title="ดาวน์โหลดไฟล์ .aerec"><Icon name="download" size={14} /></a>
 		</div>
 		<p class="border-t border-line px-4 py-2 text-xs text-muted">
-			{rec?.codec.toUpperCase()} · {player.frame.w}×{player.frame.h} · {bytes(rec?.size_bytes ?? 0)} · SHA-256 <span class="mono">{rec?.sha256.slice(0, 16)}…</span> · เว้นวรรค = เล่น/หยุด, ← → = ถอย/ข้าม 10 วินาที
+			{rec?.codec.toUpperCase()}{player.hasAudio ? ' + Opus' : player.rec.audio.length ? ' (เบราว์เซอร์นี้เล่นเสียงไม่ได้)' : ''} · {player.frame.w}×{player.frame.h} · {bytes(rec?.size_bytes ?? 0)} · SHA-256 <span class="mono">{rec?.sha256.slice(0, 16)}…</span> · เว้นวรรค = เล่น/หยุด, ← → = ถอย/ข้าม 10 วินาที
 		</p>
 	{/if}
 </div>

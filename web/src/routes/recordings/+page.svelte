@@ -138,7 +138,10 @@
 					{#if r.status === 'ready'}
 						<td class="mono whitespace-nowrap">{clock(r.duration_ms)}</td>
 						<td class="mono text-right whitespace-nowrap text-muted">{bytes(r.size_bytes)}</td>
-						<td><span class="badge">{r.codec.toUpperCase() || '—'}</span></td>
+						<td class="whitespace-nowrap">
+							<span class="badge">{r.codec.toUpperCase() || '—'}</span>
+							{#if r.audio}<span class="badge" title="มีเสียง ({r.audio})"><Icon name="volume" size={12} /></span>{/if}
+						</td>
 						<td class="text-right whitespace-nowrap">
 							<a class="btn" href="/recordings/{r.id}"><Icon name="play" size={14} /> เล่น</a>
 							<button class="btn btn-ghost text-danger" title="ลบ" onclick={() => remove(r)}><Icon name="trash" size={15} /></button>
