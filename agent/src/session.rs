@@ -121,7 +121,7 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
     agent.changed();
     let _registered = Registered { agent: agent.clone(), sid: sid.to_string() };
     agent.report(sid, "auth_ok", json!({"method": if need_password { "password" } else { "click" }, "approved_locally": need_click}));
-    let _awake = crate::power::KeepAwake::new("ReDesk remote session");
+    let _awake = crate::power::KeepAwake::new("Aegiron remote session");
 
     // 4. Stream.
     let cfg = agent.config.lock().unwrap().clone();
@@ -379,7 +379,7 @@ async fn ask_local_user(agent: &Agent, viewer: &Viewer) -> bool {
         }
     }
 
-    let question = format!("{who} ({}) ขอควบคุมเครื่องนี้ผ่าน ReDesk\nอนุญาตหรือไม่?", viewer.ip);
+    let question = format!("{who} ({}) ขอควบคุมเครื่องนี้ผ่าน Aegiron\nอนุญาตหรือไม่?", viewer.ip);
 
     let terminal = async {
         if !std::io::stdin().is_terminal() {
@@ -420,13 +420,13 @@ async fn gui_confirm(question: &str) -> Option<bool> {
     if cfg!(target_os = "macos") {
         let q = question.replace('\\', "\\\\").replace('"', "\\\"");
         let script = format!(
-            "display dialog \"{q}\" with title \"ReDesk\" buttons {{\"ปฏิเสธ\", \"อนุญาต\"}} default button \"ปฏิเสธ\" with icon caution giving up after 30"
+            "display dialog \"{q}\" with title \"Aegiron\" buttons {{\"ปฏิเสธ\", \"อนุญาต\"}} default button \"ปฏิเสธ\" with icon caution giving up after 30"
         );
         cmd = tokio::process::Command::new("osascript");
         cmd.arg("-e").arg(script);
     } else if cfg!(target_os = "linux") && std::env::var_os("DISPLAY").or(std::env::var_os("WAYLAND_DISPLAY")).is_some() {
         cmd = tokio::process::Command::new("zenity");
-        cmd.args(["--question", "--title=ReDesk", "--timeout=30", "--ok-label=อนุญาต", "--cancel-label=ปฏิเสธ"]).arg(format!("--text={question}"));
+        cmd.args(["--question", "--title=Aegiron", "--timeout=30", "--ok-label=อนุญาต", "--cancel-label=ปฏิเสธ"]).arg(format!("--text={question}"));
     } else {
         return None;
     }

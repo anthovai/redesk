@@ -61,7 +61,7 @@
 	const serverUrl = $derived(typeof location !== 'undefined' ? location.origin : '');
 	const initCmd = $derived(
 		info
-			? `redesk-agent init --server ${serverUrl} --key ${info.public_key}${settings?.require_enroll ? ' --enroll-token <TOKEN>' : ''}${serverUrl.startsWith('http://') && !/localhost|127\.0\.0\.1/.test(serverUrl) ? ' --insecure' : ''}`
+			? `aegiron-agent init --server ${serverUrl} --key ${info.public_key}${settings?.require_enroll ? ' --enroll-token <TOKEN>' : ''}${serverUrl.startsWith('http://') && !/localhost|127\.0\.0\.1/.test(serverUrl) ? ' --insecure' : ''}`
 			: ''
 	);
 
@@ -204,7 +204,7 @@
 	}
 </script>
 
-<svelte:head><title>ตั้งค่าเซิร์ฟเวอร์ · ReDesk</title></svelte:head>
+<svelte:head><title>ตั้งค่าเซิร์ฟเวอร์ · Aegiron</title></svelte:head>
 
 <h1 class="mb-6 text-2xl font-semibold tracking-tight">ตั้งค่าเซิร์ฟเวอร์</h1>
 {#if error}<p class="mb-4 rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">{error}</p>{/if}
@@ -225,7 +225,7 @@
 				<dd>{info.version}</dd>
 			</dl>
 			<div class="mt-4 flex items-start gap-2 rounded-lg bg-raised p-3">
-				<code class="mono flex-1 text-xs break-all">{initCmd}<br />redesk-agent run</code>
+				<code class="mono flex-1 text-xs break-all">{initCmd}<br />aegiron-agent run</code>
 				<button class="btn shrink-0" onclick={() => copy(initCmd)} title="คัดลอก"><Icon name="copy" /></button>
 			</div>
 		{/if}
@@ -304,7 +304,7 @@
 		<div>
 			<h2 class="font-semibold">TeamViewer API</h2>
 			<p class="mt-1 text-sm text-muted">
-				ดึงรายชื่ออุปกรณ์ (เข้าหน้า "การเชื่อมต่อ") และประวัติการเชื่อมต่อของ TeamViewer มาไว้ใน ReDesk ทุก 15 นาที
+				ดึงรายชื่ออุปกรณ์ (เข้าหน้า "การเชื่อมต่อ") และประวัติการเชื่อมต่อของ TeamViewer มาไว้ใน Aegiron ทุก 15 นาที
 				ใช้ <b>script token</b> ที่สร้างใน TeamViewer Management Console → Profile → Apps ให้สิทธิ์เฉพาะ Computers &amp; Contacts: read และ Connection reporting: read
 			</p>
 		</div>
@@ -345,7 +345,7 @@
 		<div>
 			<h2 class="font-semibold">เข้าสู่ระบบด้วย SSO (OpenID Connect)</h2>
 			<p class="mt-1 text-sm text-muted">
-				ให้ผู้ใช้เข้าสู่ระบบด้วยบัญชีองค์กร เช่น Microsoft 365 (Entra ID), Google Workspace หรือ Keycloak ทั้งในคอนโซลเว็บและโปรแกรม ReDesk
+				ให้ผู้ใช้เข้าสู่ระบบด้วยบัญชีองค์กร เช่น Microsoft 365 (Entra ID), Google Workspace หรือ Keycloak ทั้งในคอนโซลเว็บและโปรแกรม Aegiron
 				โดยลงทะเบียนแอปที่ผู้ให้บริการแล้วใส่ Redirect URI ด้านล่าง
 			</p>
 		</div>
@@ -404,7 +404,7 @@
 		<div>
 			<h2 class="font-semibold">เวอร์ชันของ agent</h2>
 			<p class="mt-1 text-sm text-muted">
-				อัปโหลดไฟล์ติดตั้งที่ตรวจสอบแล้ว โปรแกรม ReDesk จะแจ้งผู้ใช้เมื่อมีเวอร์ชันใหม่ที่เปิดให้ดาวน์โหลด และตรวจขนาดกับ SHA-256 ก่อนใช้ไฟล์ทุกครั้ง
+				อัปโหลดไฟล์ติดตั้งที่ตรวจสอบแล้ว โปรแกรม Aegiron จะแจ้งผู้ใช้เมื่อมีเวอร์ชันใหม่ที่เปิดให้ดาวน์โหลด และตรวจขนาดกับ SHA-256 ก่อนใช้ไฟล์ทุกครั้ง
 				— ไม่มีการติดตั้งอัตโนมัติ
 			</p>
 		</div>

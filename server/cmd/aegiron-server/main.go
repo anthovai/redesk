@@ -1,4 +1,4 @@
-// Command redesk-server runs the ReDesk rendezvous, relay and API server on a single port.
+// Command aegiron-server runs the Aegiron rendezvous, relay and API server on a single port.
 package main
 
 import (
@@ -11,12 +11,12 @@ import (
 	"syscall"
 	"time"
 
-	"redesk/server/internal/api"
-	"redesk/server/internal/auth"
-	"redesk/server/internal/config"
-	"redesk/server/internal/hub"
-	"redesk/server/internal/store"
-	"redesk/server/internal/vault"
+	"aegiron/server/internal/api"
+	"aegiron/server/internal/auth"
+	"aegiron/server/internal/config"
+	"aegiron/server/internal/hub"
+	"aegiron/server/internal/store"
+	"aegiron/server/internal/vault"
 )
 
 func main() {

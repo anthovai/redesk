@@ -1,7 +1,7 @@
 // Viewer side of the end-to-end session crypto. Must stay byte-compatible with agent/src/crypto.rs:
 //   transcript = "redesk-kx-v1" || sid || viewer_epk || agent_epk
 //   agent signs transcript with its Ed25519 identity (pinned by the server at registration)
-//   keys = HKDF-SHA256(ikm = X25519 shared, salt = SHA-256(transcript), info = "redesk v1 <dir>")
+//   keys = HKDF-SHA256(ikm = X25519 shared, salt = SHA-256(transcript), info = "aegiron v1 <dir>")
 //   AES-256-GCM, nonce = 4 zero bytes || u64 big-endian message counter (per direction)
 
 const enc = new TextEncoder();

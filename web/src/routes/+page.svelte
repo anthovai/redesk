@@ -85,8 +85,8 @@
 		setTimeout(() => (toast = null), 4000);
 	}
 
-	let view = $state(savedView('redesk.home.view'));
-	const setView = (v: 'grid' | 'list') => saveView('redesk.home.view', v);
+	let view = $state(savedView('aegiron.home.view'));
+	const setView = (v: 'grid' | 'list') => saveView('aegiron.home.view', v);
 
 	const editEntry = (e: AddressEntry) => (editing = { id: e.device_id, alias: e.alias, tags: e.tags.join(', '), favorite: e.favorite, isNew: false });
 	const addShared = (d: Device) => api.put(`/api/address-book/${d.id}`, { alias: '', tags: [], favorite: false }).then(load);
@@ -116,13 +116,13 @@
 	}
 </script>
 
-<svelte:head><title>สมุดที่อยู่ · ReDesk</title></svelte:head>
+<svelte:head><title>สมุดที่อยู่ · Aegiron</title></svelte:head>
 
 <section class="card mb-8 overflow-hidden">
 	<div class="grid gap-6 p-6 md:grid-cols-[1fr_auto] md:items-end md:p-8">
 		<div>
 			<h1 class="text-2xl font-semibold tracking-tight">เชื่อมต่อเครื่องปลายทาง</h1>
-			<p class="mt-1 text-sm text-muted">ใส่ ID 9 หลักที่แสดงในโปรแกรม ReDesk agent ของเครื่องที่ต้องการควบคุม</p>
+			<p class="mt-1 text-sm text-muted">ใส่ ID 9 หลักที่แสดงในโปรแกรม Aegiron agent ของเครื่องที่ต้องการควบคุม</p>
 		</div>
 		<form class="flex w-full gap-2 md:w-[26rem]" onsubmit={quickConnect}>
 			<input

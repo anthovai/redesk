@@ -1,6 +1,6 @@
 // Package vault seals stored credentials (endpoint passwords, API tokens) with AES-256-GCM.
 //
-// The key comes from REDESK_VAULT_KEY (base64, 32 bytes) or <data dir>/vault.key, created
+// The key comes from AEGIRON_VAULT_KEY (base64, 32 bytes) or <data dir>/vault.key, created
 // on first start. Database dumps alone therefore do not reveal secrets; keep the key file
 // out of database backups and back it up separately.
 package vault
@@ -41,7 +41,7 @@ func loadKey(envKey, dataDir string) ([]byte, error) {
 	if envKey != "" {
 		k, err := base64.StdEncoding.DecodeString(envKey)
 		if err != nil || len(k) != 32 {
-			return nil, errors.New("REDESK_VAULT_KEY must be 32 bytes, base64")
+			return nil, errors.New("AEGIRON_VAULT_KEY must be 32 bytes, base64")
 		}
 		return k, nil
 	}

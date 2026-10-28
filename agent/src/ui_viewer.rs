@@ -152,7 +152,7 @@ impl ViewerWindow {
                 for p in dropped {
                     self.viewer.upload(p);
                 }
-                Self::flash(w, format!("กำลังส่ง {n} ไฟล์ไปที่ Downloads/ReDesk ของเครื่องปลายทาง"));
+                Self::flash(w, format!("กำลังส่ง {n} ไฟล์ไปที่ Downloads/Aegiron ของเครื่องปลายทาง"));
             } else {
                 Self::flash(w, "เครื่องปลายทางไม่อนุญาตให้รับไฟล์");
             }
@@ -368,7 +368,7 @@ impl ViewerWindow {
             menu_separator(ui);
             let files = f.info.is_some_and(|i| i.files);
             if menu_row(ui, Lead::Glyph(Glyph::Folder), "ส่งไฟล์", "", files).on_hover_text("ลากไฟล์มาวางบนหน้าต่างนี้").clicked() {
-                Self::flash(w, "ลากไฟล์มาวางบนหน้าต่างนี้ ไฟล์จะไปอยู่ที่ Downloads/ReDesk ของเครื่องปลายทาง");
+                Self::flash(w, "ลากไฟล์มาวางบนหน้าต่างนี้ ไฟล์จะไปอยู่ที่ Downloads/Aegiron ของเครื่องปลายทาง");
             }
             let clip = f.info.is_some_and(|i| i.clipboard);
             if menu_row(ui, Lead::Glyph(Glyph::Clipboard), "ส่งคลิปบอร์ดไปเครื่องปลายทาง", "", clip).clicked() {
@@ -627,7 +627,7 @@ impl ViewerWindow {
     fn password_dialog(&self, ui: &mut Ui, w: &mut WinUi, error: Option<&str>, name: &str) {
         let pal = Palette::of(ui);
         dialog_title(ui, Glyph::Lock, "ต้องใส่รหัสผ่าน", pal.accent);
-        ui.label(RichText::new(format!("ใส่รหัสผ่านของ {name} ดูได้ที่หน้าต่าง ReDesk ของเครื่องนั้น")).size(13.0).color(pal.muted));
+        ui.label(RichText::new(format!("ใส่รหัสผ่านของ {name} ดูได้ที่หน้าต่าง Aegiron ของเครื่องนั้น")).size(13.0).color(pal.muted));
         ui.add_space(2.0);
         let r = ui.add(
             TextEdit::singleline(&mut w.password)
@@ -660,18 +660,18 @@ impl ViewerWindow {
     // -----------------------------------------------------------------------------------------
     // Test and screenshot hooks
 
-    /// Automation for tests: REDESK_UI_PASSWORD answers the password prompt once.
+    /// Automation for tests: AEGIRON_UI_PASSWORD answers the password prompt once.
     fn debug_hooks(&self, phase: &Phase) {
         static SUBMITTED: AtomicBool = AtomicBool::new(false);
         if *phase == Phase::Password
-            && let Ok(pw) = std::env::var("REDESK_UI_PASSWORD")
+            && let Ok(pw) = std::env::var("AEGIRON_UI_PASSWORD")
             && !SUBMITTED.swap(true, Ordering::Relaxed)
         {
             self.viewer.submit_password(&pw);
         }
     }
 
-    /// Screenshots: REDESK_UI_VIEWER_STATE="menu=display,quality,dark,..." sets up the demo
+    /// Screenshots: AEGIRON_UI_VIEWER_STATE="menu=display,quality,dark,..." sets up the demo
     /// viewer once (flags: menu=monitor|actions|display|keyboard, pinned, collapsed, quality,
     /// original, cursor, dark, password, connecting, closed).
     fn demo_state(&self, ctx: &egui::Context, w: &mut WinUi) {
@@ -679,7 +679,7 @@ impl ViewerWindow {
             return;
         }
         w.demo_done = true;
-        let Ok(spec) = std::env::var("REDESK_UI_VIEWER_STATE") else { return };
+        let Ok(spec) = std::env::var("AEGIRON_UI_VIEWER_STATE") else { return };
         let mut st = self.viewer.state.lock().unwrap();
         if st.codec.is_empty() {
             st.codec = "h264".into();

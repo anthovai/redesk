@@ -28,14 +28,14 @@ import (
 
 	"github.com/go-jose/go-jose/v4"
 
-	"redesk/server/internal/auth"
-	"redesk/server/internal/config"
-	"redesk/server/internal/hub"
-	"redesk/server/internal/store"
-	"redesk/server/internal/vault"
+	"aegiron/server/internal/auth"
+	"aegiron/server/internal/config"
+	"aegiron/server/internal/hub"
+	"aegiron/server/internal/store"
+	"aegiron/server/internal/vault"
 )
 
-// DB-backed tests run when REDESK_TEST_DATABASE_URL points at a scratch database.
+// DB-backed tests run when AEGIRON_TEST_DATABASE_URL points at a scratch database.
 
 type testEnv struct {
 	t   *testing.T
@@ -47,9 +47,9 @@ type testEnv struct {
 
 func newTestEnv(t *testing.T) *testEnv {
 	t.Helper()
-	dsn := os.Getenv("REDESK_TEST_DATABASE_URL")
+	dsn := os.Getenv("AEGIRON_TEST_DATABASE_URL")
 	if dsn == "" {
-		t.Skip("REDESK_TEST_DATABASE_URL not set")
+		t.Skip("AEGIRON_TEST_DATABASE_URL not set")
 	}
 	ctx := context.Background()
 	st, err := store.Open(ctx, dsn)
@@ -117,7 +117,7 @@ type mockIdP struct {
 
 func newMockIdP(t *testing.T) *mockIdP {
 	key, _ := rsa.GenerateKey(rand.Reader, 2048)
-	m := &mockIdP{key: key, codes: map[string]map[string]any{}, authz: map[string]url.Values{}, client: "redesk-test", secret: "s3cret"}
+	m := &mockIdP{key: key, codes: map[string]map[string]any{}, authz: map[string]url.Values{}, client: "aegiron-test", secret: "s3cret"}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{
@@ -358,7 +358,7 @@ func TestOIDCAppFlow(t *testing.T) {
 
 	post := func() (code, link string) {
 		req, _ := http.NewRequest("POST", e.srv.URL+"/api/oidc/auth", strings.NewReader(`{"device":"PC-01"}`))
-		req.Header.Set("X-ReDesk", "1")
+		req.Header.Set("X-Aegiron", "1")
 		res, err := api.Do(req)
 		if err != nil {
 			t.Fatal(err)
@@ -440,7 +440,7 @@ func TestOIDCSettingsAPI(t *testing.T) {
 	tok := e.bearer(admin)
 	put := func(body string) int {
 		req, _ := http.NewRequest("PUT", e.srv.URL+"/api/oidc/settings", strings.NewReader(body))
-		req.Header.Set("X-ReDesk", "1")
+		req.Header.Set("X-Aegiron", "1")
 		req.Header.Set("Authorization", "Bearer "+tok)
 		res, err := http.DefaultClient.Do(req)
 		if err != nil {
@@ -510,11 +510,11 @@ func TestSemver(t *testing.T) {
 
 func TestReleaseFilename(t *testing.T) {
 	cases := map[string]string{
-		"redesk-0.4.0-x64.msi":        "redesk-0.4.0-x64.msi",
-		`C:\Users\x\redesk setup.exe`: "redesk_setup.exe",
-		"../../etc/passwd":            "passwd",
-		"..":                          "redesk-1.0.0-linux-x86_64",
-		"\"; rm -rf.exe":              "___rm_-rf.exe",
+		"aegiron-0.4.0-x64.msi":        "aegiron-0.4.0-x64.msi",
+		`C:\Users\x\aegiron setup.exe`: "aegiron_setup.exe",
+		"../../etc/passwd":             "passwd",
+		"..":                           "aegiron-1.0.0-linux-x86_64",
+		"\"; rm -rf.exe":               "___rm_-rf.exe",
 	}
 	for in, want := range cases {
 		if got := releaseFilename(in, "1.0.0", "linux", "x86_64"); got != want {
@@ -530,12 +530,12 @@ func (e *testEnv) upload(tok, version, osName, arch string, data []byte) (int, m
 	mw.WriteField("os", osName)
 	mw.WriteField("arch", arch)
 	mw.WriteField("notes", "แก้บั๊ก")
-	fw, _ := mw.CreateFormFile("file", "redesk-"+version+".exe")
+	fw, _ := mw.CreateFormFile("file", "aegiron-"+version+".exe")
 	fw.Write(data)
 	mw.Close()
 	req, _ := http.NewRequest("POST", e.srv.URL+"/api/agent/releases", &buf)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
-	req.Header.Set("X-ReDesk", "1")
+	req.Header.Set("X-Aegiron", "1")
 	req.Header.Set("Authorization", "Bearer "+tok)
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -601,7 +601,7 @@ func TestAgentUpdates(t *testing.T) {
 	}
 	setEnabled := func(key string, on bool) {
 		req, _ := http.NewRequest("PATCH", e.srv.URL+"/api/agent/releases/"+itoa(ids[key]), strings.NewReader(`{"enabled":`+map[bool]string{true: "true", false: "false"}[on]+`}`))
-		req.Header.Set("X-ReDesk", "1")
+		req.Header.Set("X-Aegiron", "1")
 		req.Header.Set("Authorization", "Bearer "+tok)
 		res, err := http.DefaultClient.Do(req)
 		if err != nil || res.StatusCode != 200 {
@@ -640,7 +640,7 @@ func TestAgentUpdates(t *testing.T) {
 	res := get(t, http.DefaultClient, e.srv.URL+"/api/agent/releases/"+itoa(id)+"/download")
 	body, _ := io.ReadAll(res.Body)
 	if res.StatusCode != 200 || !bytes.Equal(body, payloads["0.5.0/windows/x86_64"]) || res.Header.Get("Content-Type") != "application/octet-stream" ||
-		res.Header.Get("Content-Disposition") != `attachment; filename=redesk-0.5.0.exe` || res.Header.Get("Content-Length") != itoa(int64(len(body))) {
+		res.Header.Get("Content-Disposition") != `attachment; filename=aegiron-0.5.0.exe` || res.Header.Get("Content-Length") != itoa(int64(len(body))) {
 		t.Fatalf("download: %d %v %q", res.StatusCode, res.Header, body)
 	}
 
@@ -651,7 +651,7 @@ func TestAgentUpdates(t *testing.T) {
 		t.Fatal(err)
 	}
 	req, _ := http.NewRequest("DELETE", e.srv.URL+"/api/agent/releases/"+itoa(ids["0.9.0/linux/x86_64"]), nil)
-	req.Header.Set("X-ReDesk", "1")
+	req.Header.Set("X-Aegiron", "1")
 	req.Header.Set("Authorization", "Bearer "+tok)
 	if res, err := http.DefaultClient.Do(req); err != nil || res.StatusCode != 200 {
 		t.Fatalf("delete: %v", err)

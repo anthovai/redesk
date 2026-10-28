@@ -1,14 +1,14 @@
 #!/bin/bash
-# ReDesk server installer for macOS (Apple Silicon or Intel).
+# Aegiron server installer for macOS (Apple Silicon or Intel).
 #
-#   sudo ./install.sh --domain redesk.example.com --email it@example.com
+#   sudo ./install.sh --domain aegiron.example.com --email it@example.com
 #
 # Installs (or upgrades, when run again from a newer kit):
-#   redesk-server     native binary, launchd daemon, runs as hidden user _redesk on 127.0.0.1:21114
+#   aegiron-server     native binary, launchd daemon, runs as hidden user _aegiron on 127.0.0.1:21114
 #   Caddy             HTTPS reverse proxy on :80/:443 with automatic Let's Encrypt certificates
 #   PostgreSQL 16     Homebrew, launchd daemon (starts at boot without anyone logged in)
 #   guacd             RDP/VNC/SSH gateway engine in Colima (Docker) — skip with --no-gateway
-#   daily backups     02:30, /usr/local/var/redesk/backups, kept 14 days
+#   daily backups     02:30, /usr/local/var/aegiron/backups, kept 14 days
 #
 # Options:
 #   --domain NAME        public DNS name pointing at this Mac (required)
@@ -19,12 +19,12 @@
 #   --dry-run            print what would be done without changing anything
 set -euo pipefail
 
-PREFIX=/usr/local/redesk
-ETC=/usr/local/etc/redesk
-VAR=/usr/local/var/redesk
-LOG=/usr/local/var/log/redesk
-SVC_USER=_redesk
-LABEL=co.redesk
+PREFIX=/usr/local/aegiron
+ETC=/usr/local/etc/aegiron
+VAR=/usr/local/var/aegiron
+LOG=/usr/local/var/log/aegiron
+SVC_USER=_aegiron
+LABEL=co.aegiron
 KIT="$(cd "$(dirname "$0")" && pwd)"
 
 DOMAIN="" EMAIL="" GATEWAY=1 DB_URL="" POWER=0 DRY=0
@@ -143,11 +143,35 @@ for b in /opt/homebrew/bin/brew /usr/local/bin/brew; do [ -x "$b" ] && BREW="$b"
 [ -n "${BREW:-}" ] || die "Homebrew not found. Install it first (as $BREW_USER): https://brew.sh"
 BREW_PREFIX="$("$BREW" --prefix)"
 USER_HOME="$(dscl . -read "/Users/$BREW_USER" NFSHomeDirectory | awk '{print $2}')"
-[ -f "$KIT/bin/redesk-server" ] && [ -d "$KIT/web" ] || die "run install.sh from inside the extracted kit"
+[ -f "$KIT/bin/aegiron-server" ] && [ -d "$KIT/web" ] || die "run install.sh from inside the extracted kit"
 VERSION="$(cat "$KIT/VERSION" 2>/dev/null || echo unknown)"
 
+# --- migrate a ReDesk install (before the rename to Aegiron) -------------------
+# Same data, keys and database; only names and paths change. The old env file keeps working:
+# AEGIRON_* replaces REDESK_*, and the server still reads REDESK_* if anything is left.
+LEGACY_ETC=/usr/local/etc/redesk LEGACY_VAR=/usr/local/var/redesk LEGACY_LOG=/usr/local/var/log/redesk
+LEGACY_USER=_redesk MIGRATED=0
+if [ ! -f "$ETC/aegiron.env" ] && [ -f "$LEGACY_ETC/redesk.env" ]; then
+	step "Migrating the ReDesk install to Aegiron"
+	[ -z "$DOMAIN" ] && [ -f "$LEGACY_ETC/domain" ] && DOMAIN="$(cat "$LEGACY_ETC/domain")"
+	for l in server caddy backup colima postgresql; do
+		run launchctl bootout "system/co.redesk.$l" 2>/dev/null || true
+		run rm -f "/Library/LaunchDaemons/co.redesk.$l.plist"
+	done
+	run mkdir -p "$(dirname "$ETC")" "$(dirname "$VAR")" "$(dirname "$LOG")"
+	run mv "$LEGACY_ETC" "$ETC"
+	run mv "$ETC/redesk.env" "$ETC/aegiron.env"
+	run sed -i '' 's/^REDESK_/AEGIRON_/' "$ETC/aegiron.env"
+	[ -d "$LEGACY_VAR" ] && run mv "$LEGACY_VAR" "$VAR"
+	[ -d "$LEGACY_LOG" ] && run mv "$LEGACY_LOG" "$LOG"
+	run rm -rf /usr/local/redesk
+	run rm -f /etc/newsyslog.d/redesk.conf
+	MIGRATED=1
+fi
+
 UPGRADE=0
-[ -f "$ETC/redesk.env" ] && UPGRADE=1
+[ -f "$ETC/aegiron.env" ] && UPGRADE=1
+[ "$MIGRATED" = 1 ] && UPGRADE=1
 if [ -z "$DOMAIN" ] && [ -f "$ETC/domain" ]; then DOMAIN="$(cat "$ETC/domain")"; fi
 [ -n "$DOMAIN" ] || die "--domain is required"
 echo "$DOMAIN" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$' || die "invalid domain: $DOMAIN"
@@ -155,7 +179,7 @@ if [ "$UPGRADE" = 0 ] && [ -z "$EMAIL" ]; then die "--email is required on first
 [ -z "$EMAIL" ] || echo "$EMAIL" | grep -Eq '^[^@ ]+@[^@ ]+\.[^@ ]+$' || die "invalid email: $EMAIL"
 
 echo "   macOS $(sw_vers -productVersion) ($(uname -m)), Homebrew at $BREW_PREFIX owned by $BREW_USER"
-echo "   ReDesk $VERSION, domain $DOMAIN, $([ "$UPGRADE" = 1 ] && echo upgrade || echo new install)$([ "$DRY" = 1 ] && echo ', DRY RUN')"
+echo "   Aegiron $VERSION, domain $DOMAIN, $([ "$UPGRADE" = 1 ] && echo upgrade || echo new install)$([ "$DRY" = 1 ] && echo ', DRY RUN')"
 
 if [ "$DRY" = 0 ]; then
 	xattr -dr com.apple.quarantine "$KIT" 2>/dev/null || true
@@ -176,13 +200,13 @@ else
 	[ -n "$SVC_ID" ] || die "no free uid/gid in 420-499"
 	run dscl . -create "/Groups/$SVC_USER"
 	run dscl . -create "/Groups/$SVC_USER" PrimaryGroupID "$SVC_ID"
-	run dscl . -create "/Groups/$SVC_USER" RealName "ReDesk service"
+	run dscl . -create "/Groups/$SVC_USER" RealName "Aegiron service"
 	run dscl . -create "/Users/$SVC_USER"
 	run dscl . -create "/Users/$SVC_USER" UniqueID "$SVC_ID"
 	run dscl . -create "/Users/$SVC_USER" PrimaryGroupID "$SVC_ID"
 	run dscl . -create "/Users/$SVC_USER" UserShell /usr/bin/false
 	run dscl . -create "/Users/$SVC_USER" NFSHomeDirectory "$VAR"
-	run dscl . -create "/Users/$SVC_USER" RealName "ReDesk service"
+	run dscl . -create "/Users/$SVC_USER" RealName "Aegiron service"
 	run dscl . -create "/Users/$SVC_USER" Password '*'
 	run dscl . -create "/Users/$SVC_USER" IsHidden 1
 	echo "   created uid/gid $SVC_ID"
@@ -193,6 +217,15 @@ run chown -R "$SVC_USER:$SVC_USER" "$VAR/data" "$VAR/caddy" "$LOG"
 run chmod 700 "$VAR/data" "$VAR/backups"
 run chmod 750 "$ETC"
 run chown "root:$SVC_USER" "$ETC"
+if [ "$MIGRATED" = 1 ]; then
+	run chown -R "$SVC_USER:$SVC_USER" "$VAR/data" "$VAR/caddy" "$LOG"
+	run chown "root:$SVC_USER" "$ETC/aegiron.env"
+	if id "$LEGACY_USER" >/dev/null 2>&1; then
+		run dscl . -delete "/Users/$LEGACY_USER"
+		run dscl . -delete "/Groups/$LEGACY_USER" 2>/dev/null || true
+		echo "   removed the old service account $LEGACY_USER"
+	fi
+fi
 
 # --- packages --------------------------------------------------------------
 
@@ -237,18 +270,18 @@ if [ -z "$DB_URL" ]; then
 		DB_PASS="$(random_secret 24)"
 		PSQL=(sudo -u "$BREW_USER" -H "$PG_BIN/psql" -h 127.0.0.1 -d postgres -v ON_ERROR_STOP=1 -qtA)
 		if [ "$DRY" = 1 ]; then
-			echo "   + create role/database redesk"
+			echo "   + create role/database aegiron"
 		else
-			if [ "$("${PSQL[@]}" -c "SELECT 1 FROM pg_roles WHERE rolname='redesk'")" = 1 ]; then
-				"${PSQL[@]}" -c "ALTER ROLE redesk LOGIN PASSWORD '$DB_PASS'"
+			if [ "$("${PSQL[@]}" -c "SELECT 1 FROM pg_roles WHERE rolname='aegiron'")" = 1 ]; then
+				"${PSQL[@]}" -c "ALTER ROLE aegiron LOGIN PASSWORD '$DB_PASS'"
 			else
-				"${PSQL[@]}" -c "CREATE ROLE redesk LOGIN PASSWORD '$DB_PASS'"
+				"${PSQL[@]}" -c "CREATE ROLE aegiron LOGIN PASSWORD '$DB_PASS'"
 			fi
-			if [ "$("${PSQL[@]}" -c "SELECT 1 FROM pg_database WHERE datname='redesk'")" != 1 ]; then
-				"${PSQL[@]}" -c "CREATE DATABASE redesk OWNER redesk"
+			if [ "$("${PSQL[@]}" -c "SELECT 1 FROM pg_database WHERE datname='aegiron'")" != 1 ]; then
+				"${PSQL[@]}" -c "CREATE DATABASE aegiron OWNER aegiron"
 			fi
 		fi
-		DB_URL="postgres://redesk:$DB_PASS@127.0.0.1:5432/redesk?sslmode=disable"
+		DB_URL="postgres://aegiron:$DB_PASS@127.0.0.1:5432/aegiron?sslmode=disable"
 	fi
 fi
 
@@ -258,43 +291,43 @@ step "Configuration ($ETC)"
 run sh -c "echo '$DOMAIN' > '$ETC/domain'"
 ADMIN_PASS=""
 if [ "$UPGRADE" = 1 ]; then
-	echo "   keeping existing $ETC/redesk.env"
+	echo "   keeping existing $ETC/aegiron.env"
 else
 	ADMIN_PASS="$(random_secret 9)"
-	write_file "$ETC/redesk.env" 640 "root:$SVC_USER" <<EOF
-# ReDesk server settings (see README). Restart after editing:
+	write_file "$ETC/aegiron.env" 640 "root:$SVC_USER" <<EOF
+# Aegiron server settings (see README). Restart after editing:
 #   sudo launchctl kickstart -k system/$LABEL.server
-REDESK_LISTEN=127.0.0.1:21114
-REDESK_DATABASE_URL=$DB_URL
-REDESK_DATA_DIR=$VAR/data
-REDESK_WEB_DIR=$PREFIX/web
-REDESK_TRUST_PROXY=true
-REDESK_COOKIE_SECURE=true
-REDESK_TIMEZONE=Asia/Bangkok
-REDESK_ADMIN_EMAIL=$EMAIL
-REDESK_ADMIN_PASSWORD=$ADMIN_PASS
-$([ "$GATEWAY" = 1 ] && printf 'REDESK_GUACD_ADDR=127.0.0.1:4822\nREDESK_GATEWAY_RECORDING_PATH=/recordings' || echo '# REDESK_GUACD_ADDR=127.0.0.1:4822')
+AEGIRON_LISTEN=127.0.0.1:21114
+AEGIRON_DATABASE_URL=$DB_URL
+AEGIRON_DATA_DIR=$VAR/data
+AEGIRON_WEB_DIR=$PREFIX/web
+AEGIRON_TRUST_PROXY=true
+AEGIRON_COOKIE_SECURE=true
+AEGIRON_TIMEZONE=Asia/Bangkok
+AEGIRON_ADMIN_EMAIL=$EMAIL
+AEGIRON_ADMIN_PASSWORD=$ADMIN_PASS
+$([ "$GATEWAY" = 1 ] && printf 'AEGIRON_GUACD_ADDR=127.0.0.1:4822\nAEGIRON_GATEWAY_RECORDING_PATH=/recordings' || echo '# AEGIRON_GUACD_ADDR=127.0.0.1:4822')
 EOF
 fi
 
 # --- binaries ----------------------------------------------------------------
 
-step "Installing ReDesk $VERSION to $PREFIX"
+step "Installing Aegiron $VERSION to $PREFIX"
 run launchctl bootout "system/$LABEL.server" 2>/dev/null || true
 run rm -rf "$PREFIX/web.new"
 run cp -R "$KIT/web" "$PREFIX/web.new"
 run rm -rf "$PREFIX/web"
 run mv "$PREFIX/web.new" "$PREFIX/web"
-run install -m 755 -o root -g wheel "$KIT/bin/redesk-server" "$PREFIX/bin/redesk-server"
-run install -m 755 -o root -g wheel "$KIT/redesk-backup" "$PREFIX/bin/redesk-backup"
+run install -m 755 -o root -g wheel "$KIT/bin/aegiron-server" "$PREFIX/bin/aegiron-server"
+run install -m 755 -o root -g wheel "$KIT/aegiron-backup" "$PREFIX/bin/aegiron-backup"
 run install -m 755 -o root -g wheel "$KIT/uninstall.sh" "$PREFIX/uninstall.sh"
-write_file "$PREFIX/bin/redesk-server-run" 755 root:wheel <<EOF
+write_file "$PREFIX/bin/aegiron-server-run" 755 root:wheel <<EOF
 #!/bin/sh
 # launchd entry point: load settings, then run the server.
 set -a
-. "$ETC/redesk.env"
+. "$ETC/aegiron.env"
 set +a
-exec "$PREFIX/bin/redesk-server"
+exec "$PREFIX/bin/aegiron-server"
 EOF
 run sh -c "echo '$VERSION' > '$PREFIX/VERSION'"
 
@@ -314,23 +347,26 @@ if [ "$GATEWAY" = 1 ]; then
 	wait_for 600 "Docker in Colima" brew_user "${DOCKER[@]}" info ||
 		die "Colima did not start; see $LOG/colima.log"
 	as_user "${DOCKER[@]}" pull -q guacamole/guacd:1.5.5
-	as_user "${DOCKER[@]}" rm -f redesk-guacd >/dev/null 2>&1 || true
-	as_user "${DOCKER[@]}" run -d --name redesk-guacd --restart unless-stopped \
-		-p 127.0.0.1:4822:4822 -v redesk-recordings:/recordings guacamole/guacd:1.5.5
+	as_user "${DOCKER[@]}" rm -f aegiron-guacd redesk-guacd >/dev/null 2>&1 || true
+	# Keep session recordings made before the rename.
+	RECORDINGS=aegiron-recordings
+	brew_user "${DOCKER[@]}" volume inspect redesk-recordings >/dev/null 2>&1 && RECORDINGS=redesk-recordings
+	as_user "${DOCKER[@]}" run -d --name aegiron-guacd --restart unless-stopped \
+		-p 127.0.0.1:4822:4822 -v "$RECORDINGS:/recordings" guacamole/guacd:1.5.5
 	wait_for 60 "guacd on 127.0.0.1:4822" nc -z 127.0.0.1 4822 || warn "guacd is not reachable on 127.0.0.1:4822 yet"
 fi
 
 # --- server daemon -----------------------------------------------------------
 
-step "ReDesk server daemon"
-daemon_plist "$LABEL.server" "$SVC_USER" "$LOG/server.log" "$PREFIX/bin/redesk-server-run" |
+step "Aegiron server daemon"
+daemon_plist "$LABEL.server" "$SVC_USER" "$LOG/server.log" "$PREFIX/bin/aegiron-server-run" |
 	write_file "/Library/LaunchDaemons/$LABEL.server.plist" 644 root:wheel
 load_daemon "$LABEL.server"
-wait_for 60 "redesk-server" curl -fsS http://127.0.0.1:21114/healthz || die "server did not start; see $LOG/server.log"
+wait_for 60 "aegiron-server" curl -fsS http://127.0.0.1:21114/healthz || die "server did not start; see $LOG/server.log"
 
 if [ -n "$ADMIN_PASS" ] && [ "$DRY" = 0 ]; then
 	# The bootstrap password is only needed for the very first start.
-	sed -i '' '/^REDESK_ADMIN_PASSWORD=/d' "$ETC/redesk.env"
+	sed -i '' '/^AEGIRON_ADMIN_PASSWORD=/d' "$ETC/aegiron.env"
 fi
 
 # --- Caddy (HTTPS) -----------------------------------------------------------
@@ -380,7 +416,7 @@ cat <<EOF | write_file "/Library/LaunchDaemons/$LABEL.backup.plist" 644 root:whe
 <plist version="1.0">
 <dict>
   <key>Label</key><string>$LABEL.backup</string>
-  <key>ProgramArguments</key><array><string>$PREFIX/bin/redesk-backup</string></array>
+  <key>ProgramArguments</key><array><string>$PREFIX/bin/aegiron-backup</string></array>
   <key>EnvironmentVariables</key><dict><key>PG_BIN</key><string>$PG_BIN</string></dict>
   <key>StartCalendarInterval</key><dict><key>Hour</key><integer>2</integer><key>Minute</key><integer>30</integer></dict>
   <key>StandardOutPath</key><string>$LOG/backup.log</string>
@@ -390,7 +426,7 @@ cat <<EOF | write_file "/Library/LaunchDaemons/$LABEL.backup.plist" 644 root:whe
 EOF
 run launchctl bootout "system/$LABEL.backup" 2>/dev/null || true
 run launchctl bootstrap system "/Library/LaunchDaemons/$LABEL.backup.plist"
-write_file /etc/newsyslog.d/redesk.conf 644 root:wheel <<EOF
+write_file /etc/newsyslog.d/aegiron.conf 644 root:wheel <<EOF
 # logfilename                                 [owner:group]     mode count size  when flags
 $LOG/server.log      $SVC_USER:$SVC_USER  640  10    20480 *    J
 $LOG/caddy.log       $SVC_USER:$SVC_USER  640  10    20480 *    J
@@ -422,13 +458,13 @@ if [ "$DRY" = 0 ]; then
 fi
 
 echo
-bold "ReDesk $VERSION is installed."
+bold "Aegiron $VERSION is installed."
 echo "  Console:        https://$DOMAIN $([ "${HTTPS_OK:-0}" = 1 ] && echo '(OK)' || echo '(waiting for DNS/ports)')"
 if [ -n "$ADMIN_PASS" ]; then
 	echo "  First login:    $EMAIL / $ADMIN_PASS   ← shown only now; change it and enable 2FA"
 fi
 [ -n "$PUBKEY" ] && echo "  Server key:     $PUBKEY"
-echo "  Agent setup:    redesk-agent init --server https://$DOMAIN --key <server key>"
+echo "  Agent setup:    aegiron-agent init --server https://$DOMAIN --key <server key>"
 echo "  Gateway:        $([ "$GATEWAY" = 1 ] && echo 'RDP/VNC/SSH enabled (guacd in Colima)' || echo disabled)"
 echo "  Logs:           $LOG"
 echo "  Backups:        $VAR/backups (daily 02:30, 14 days)"

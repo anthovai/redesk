@@ -60,7 +60,7 @@
 	}
 </script>
 
-<svelte:head><title>ผู้ใช้ · ReDesk</title></svelte:head>
+<svelte:head><title>ผู้ใช้ · Aegiron</title></svelte:head>
 
 <div class="mb-6 flex items-end justify-between gap-4">
 	<div>

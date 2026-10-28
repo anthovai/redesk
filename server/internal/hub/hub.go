@@ -19,8 +19,8 @@ import (
 
 	"github.com/coder/websocket"
 
-	"redesk/server/internal/auth"
-	"redesk/server/internal/store"
+	"aegiron/server/internal/auth"
+	"aegiron/server/internal/store"
 )
 
 var (

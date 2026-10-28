@@ -1,4 +1,4 @@
-//! Agent updates distributed by the ReDesk server (not GitHub): an admin uploads a vetted
+//! Agent updates distributed by the Aegiron server (not GitHub): an admin uploads a vetted
 //! build, the app asks whether a newer one exists and downloads it only when the person at
 //! the screen agrees. Nothing is installed automatically. A download is kept only after its
 //! size and SHA-256 match what the server announced, and TLS is always verified.
@@ -37,7 +37,7 @@ fn agent(timeout: Option<Duration>) -> ureq::Agent {
         .timeout_global(timeout)
         .timeout_connect(Some(Duration::from_secs(15)))
         .timeout_per_read(Some(Duration::from_secs(60)))
-        .user_agent(concat!("ReDesk/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("Aegiron/", env!("CARGO_PKG_VERSION")))
         .build()
         .into()
 }
@@ -72,11 +72,11 @@ impl Release {
     /// Sample for UI screenshots; its URL is never fetched.
     pub fn demo() -> Self {
         Release {
-            version: "0.4.0".into(),
-            notes: "H.264 video, LAN discovery, SSO sign-in".into(),
+            version: "0.6.0".into(),
+            notes: "Faster file transfer, audio".into(),
             size: 14_200_000,
             sha256: String::new(),
-            filename: "ReDesk-0.4.0.dmg".into(),
+            filename: "Aegiron-0.6.0.dmg".into(),
             url: String::new(),
             insecure: false,
         }
@@ -148,7 +148,7 @@ fn safe_filename(name: &str, version: &str) -> String {
         .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+') { c } else { '_' })
         .collect();
     let clean = clean.trim_start_matches('.').chars().take(128).collect::<String>();
-    if clean.is_empty() || clean == "_" { format!("redesk-{version}") } else { clean }
+    if clean.is_empty() || clean == "_" { format!("aegiron-{version}") } else { clean }
 }
 
 /// Downloads the build into `dest_dir`, streaming to a temporary file and renaming it only
@@ -292,7 +292,7 @@ mod tests {
     fn filenames() {
         assert_eq!(safe_filename("../../evil.exe", "1.0.0"), "evil.exe");
         assert_eq!(safe_filename("C:\\x\\a b.msi", "1.0.0"), "a_b.msi");
-        assert_eq!(safe_filename("..", "1.0.0"), "redesk-1.0.0");
+        assert_eq!(safe_filename("..", "1.0.0"), "aegiron-1.0.0");
         assert_eq!(safe_filename(".hidden", "1.0.0"), "hidden");
     }
 
@@ -302,7 +302,7 @@ mod tests {
 
     #[test]
     fn rejects_bad_replies() {
-        let s = "https://redesk.example.com";
+        let s = "https://aegiron.example.com";
         assert!(validate(s, false, "0.3.0", reply("0.4.0", "/api/agent/releases/1/download")).is_ok());
         assert!(validate(s, false, "0.3.0", reply("0.2.0", "/api/agent/releases/1/download")).is_err(), "downgrade");
         assert!(validate(s, false, "0.3.0", reply("0.3.0", "/api/agent/releases/1/download")).is_err(), "same version");
@@ -334,7 +334,7 @@ mod tests {
             notes: String::new(),
             size: data.len() as u64,
             sha256: Sha256::digest(data).iter().map(|b| format!("{b:02x}")).collect(),
-            filename: "redesk-9.9.9.exe".into(),
+            filename: "aegiron-9.9.9.exe".into(),
             url: format!("{server}/api/agent/releases/1/download"),
             insecure: false,
         }
@@ -342,13 +342,13 @@ mod tests {
 
     #[test]
     fn download_verifies() {
-        let dir = std::env::temp_dir().join(format!("redesk-updater-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("aegiron-updater-test-{}", std::process::id()));
         let data = b"vetted build".to_vec();
 
         let rel = release(&serve(data.clone()), &data);
         let p = download(&rel, &dir).unwrap();
         assert_eq!(fs::read(&p).unwrap(), data);
-        assert_eq!(p.file_name().unwrap(), "redesk-9.9.9.exe");
+        assert_eq!(p.file_name().unwrap(), "aegiron-9.9.9.exe");
 
         // Tampered content: same length, different bytes.
         let mut rel = release(&serve(b"evil build!!".to_vec()), &data);
@@ -363,7 +363,7 @@ mod tests {
         assert!(!dir.join("long.exe").exists() && !dir.join(".long.exe.part").exists());
 
         // Plain http to a non-loopback host is refused before connecting.
-        let mut rel = release("http://redesk.example.com", &data);
+        let mut rel = release("http://aegiron.example.com", &data);
         rel.filename = "x.exe".into();
         assert!(download(&rel, &dir).is_err());
         let _ = fs::remove_dir_all(&dir);

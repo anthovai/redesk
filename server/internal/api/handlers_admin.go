@@ -6,8 +6,8 @@ import (
 	"strings"
 	"time"
 
-	"redesk/server/internal/auth"
-	"redesk/server/internal/store"
+	"aegiron/server/internal/auth"
+	"aegiron/server/internal/store"
 )
 
 func (a *API) listAudit(w http.ResponseWriter, r *http.Request) {

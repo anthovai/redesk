@@ -35,10 +35,10 @@
 			// ignore
 		}
 	}
-	let pinned = $state(pref('redesk.viewer.pinned', true));
+	let pinned = $state(pref('aegiron.viewer.pinned', true));
 	let barShown = $state(false);
 	let menu = $state<'' | 'actions' | 'display'>('');
-	let showMonitor = $state(pref('redesk.viewer.monitor', false));
+	let showMonitor = $state(pref('aegiron.viewer.monitor', false));
 	let isFullscreen = $state(false);
 	let toolbar = $state<HTMLElement>();
 	let hideTimer: ReturnType<typeof setTimeout> | undefined;
@@ -46,12 +46,12 @@
 
 	function togglePin() {
 		pinned = !pinned;
-		setPref('redesk.viewer.pinned', pinned);
+		setPref('aegiron.viewer.pinned', pinned);
 		barShown = !pinned;
 	}
 	function collapse() {
 		pinned = false;
-		setPref('redesk.viewer.pinned', false);
+		setPref('aegiron.viewer.pinned', false);
 		barShown = false;
 		menu = '';
 		canvas?.focus();
@@ -75,7 +75,7 @@
 	}
 	function toggleMonitor() {
 		showMonitor = !showMonitor;
-		setPref('redesk.viewer.monitor', showMonitor);
+		setPref('aegiron.viewer.monitor', showMonitor);
 	}
 
 	// Scale the remote screen to fill the stage while keeping its aspect ratio.
@@ -205,7 +205,7 @@
 		if (!viewer.info?.files) return;
 		const files = [...(ev.dataTransfer?.files ?? [])];
 		if (!files.length) return;
-		// Into the folder open in the file panel, otherwise ~/Downloads/ReDesk on the remote machine.
+		// Into the folder open in the file panel, otherwise ~/Downloads/Aegiron on the remote machine.
 		for (const f of files) viewer.upload(f, viewer.files.path);
 		showFiles = true;
 		flash(`กำลังส่ง ${files.length} ไฟล์`);
@@ -235,7 +235,7 @@
 	const mi = 'flex w-full items-center gap-2.5 px-3 py-1.5 text-left text-sm transition-colors hover:bg-accent hover:text-accent-fg';
 </script>
 
-<svelte:head><title>{peerName} · ReDesk</title></svelte:head>
+<svelte:head><title>{peerName} · Aegiron</title></svelte:head>
 <svelte:window onkeydown={(e) => onKey(e, true)} onkeyup={(e) => onKey(e, false)} onblur={releaseAll} onpointerdown={onWindowPointerDown} />
 
 <div class="flex h-screen bg-stage">
@@ -478,12 +478,12 @@
 								</div>
 							</div>
 							<div class="space-y-3 px-6 py-4">
-								<p class="text-sm text-muted">ดูรหัสชั่วคราวได้ที่หน้าจอ ReDesk agent ของเครื่องนั้น</p>
+								<p class="text-sm text-muted">ดูรหัสชั่วคราวได้ที่หน้าจอ Aegiron agent ของเครื่องนั้น</p>
 								<!-- svelte-ignore a11y_autofocus -->
 								<input class="input mono" type="password" autocomplete="off" placeholder="รหัสผ่าน" autofocus required bind:value={password} />
 								{#if viewer.error}<p class="text-sm text-danger">{viewer.error}</p>{/if}
 								{#if viewer.keyFingerprint}
-									<p class="mono text-[11px] text-muted" title="ลายนิ้วมือกุญแจของเครื่อง ตรวจสอบกับ `redesk-agent info`">E2E · {viewer.keyFingerprint}</p>
+									<p class="mono text-[11px] text-muted" title="ลายนิ้วมือกุญแจของเครื่อง ตรวจสอบกับ `aegiron-agent info`">E2E · {viewer.keyFingerprint}</p>
 								{/if}
 							</div>
 							<div class="flex justify-end gap-2 border-t border-line bg-raised/60 px-6 py-3">
@@ -520,7 +520,7 @@
 							</div>
 							{#if viewer.error}<p class="mt-3 text-sm text-danger">{viewer.error}</p>{/if}
 							{#if viewer.keyFingerprint}
-								<p class="mono mt-3 text-[11px] text-muted" title="ลายนิ้วมือกุญแจของเครื่อง ตรวจสอบกับ `redesk-agent info`">E2E · {viewer.keyFingerprint}</p>
+								<p class="mono mt-3 text-[11px] text-muted" title="ลายนิ้วมือกุญแจของเครื่อง ตรวจสอบกับ `aegiron-agent info`">E2E · {viewer.keyFingerprint}</p>
 							{/if}
 						</div>
 						<div class="flex justify-end border-t border-line bg-raised/60 px-6 py-3">
@@ -540,7 +540,7 @@
 				<div class="text-center">
 					<Icon name="upload" size={32} class="mx-auto mb-2" />
 					<p class="font-medium">วางไฟล์เพื่อส่งไปยังเครื่องปลายทาง</p>
-					<p class="mono mt-1 text-xs text-white/70">{viewer.files.path || '~/Downloads/ReDesk'}</p>
+					<p class="mono mt-1 text-xs text-white/70">{viewer.files.path || '~/Downloads/Aegiron'}</p>
 				</div>
 			</div>
 		{/if}

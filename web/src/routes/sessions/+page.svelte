@@ -6,7 +6,7 @@
 	let active = $state<{ sid: string; state: string }[]>([]);
 	let onlineDevices = $state(0);
 	let error = $state('');
-	let tab = $state<'redesk' | 'external'>('redesk');
+	let tab = $state<'aegiron' | 'external'>('aegiron');
 	let external = $state<ExternalSession[]>([]);
 
 	$effect(() => {
@@ -43,7 +43,7 @@
 	}
 </script>
 
-<svelte:head><title>เซสชัน · ReDesk</title></svelte:head>
+<svelte:head><title>เซสชัน · Aegiron</title></svelte:head>
 
 <h1 class="mb-6 text-2xl font-semibold tracking-tight">เซสชันรีโมต</h1>
 
@@ -59,7 +59,7 @@
 {#if error}<p class="mb-4 rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">{error}</p>{/if}
 
 <div class="mb-3 flex gap-1">
-	<button class="btn {tab === 'redesk' ? 'border-accent bg-accent-soft text-accent' : ''}" onclick={() => (tab = 'redesk')}>ReDesk และ gateway</button>
+	<button class="btn {tab === 'aegiron' ? 'border-accent bg-accent-soft text-accent' : ''}" onclick={() => (tab = 'aegiron')}>Aegiron และ gateway</button>
 	<button class="btn {tab === 'external' ? 'border-accent bg-accent-soft text-accent' : ''}" onclick={() => (tab = 'external')}>จาก TeamViewer API</button>
 </div>
 

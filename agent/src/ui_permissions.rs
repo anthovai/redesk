@@ -99,7 +99,7 @@ pub fn permissions_card(ui: &mut Ui) {
         }
         ui.add_space(4.0);
         ui.label(
-            RichText::new("macOS ผูกสิทธิ์กับลายเซ็นของแอป ถ้าติดตั้ง ReDesk เวอร์ชันใหม่อาจต้องอนุญาตอีกครั้ง")
+            RichText::new("macOS ผูกสิทธิ์กับลายเซ็นของแอป ถ้าติดตั้ง Aegiron เวอร์ชันใหม่อาจต้องอนุญาตอีกครั้ง")
                 .size(12.0)
                 .color(pal.muted),
         );

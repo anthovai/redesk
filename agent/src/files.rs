@@ -173,7 +173,7 @@ async fn send_file(id: u32, path: &str, out: &mpsc::Sender<Vec<u8>>) -> std::io:
 }
 
 pub fn default_upload_dir() -> PathBuf {
-    let d = dirs::download_dir().or_else(dirs::home_dir).unwrap_or_else(|| PathBuf::from(".")).join("ReDesk");
+    let d = dirs::download_dir().or_else(dirs::home_dir).unwrap_or_else(|| PathBuf::from(".")).join("Aegiron");
     let _ = std::fs::create_dir_all(&d);
     d
 }
@@ -212,7 +212,7 @@ mod tests {
 
     #[test]
     fn upload_round_trip() {
-        let dir = std::env::temp_dir().join(format!("redesk-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("aegiron-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut f = Files::new();
         let d = dir.display().to_string();

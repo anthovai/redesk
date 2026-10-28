@@ -2,26 +2,26 @@
 // performs the same E2E handshake as the browser viewer, authenticates, and counts frames.
 //
 //   bun scripts/e2e-viewer.ts <device-id> <device-password> [remote-dir-for-file-test]
-// Env: REDESK_URL (default http://localhost:21114), REDESK_EMAIL, REDESK_PASSWORD
+// Env: AEGIRON_URL (default http://localhost:21114), AEGIRON_EMAIL, AEGIRON_PASSWORD
 // With a remote dir, also lists it, uploads a random file there, downloads it back and compares.
 
 import { b64decode, b64encode, completeHandshake, newViewerKeys, type Channel } from '../src/lib/crypto';
 
-const base = process.env.REDESK_URL ?? 'http://localhost:21114';
+const base = process.env.AEGIRON_URL ?? 'http://localhost:21114';
 const [deviceId, devicePassword, fileDir] = process.argv.slice(2);
 if (!deviceId || !devicePassword) throw new Error('usage: e2e-viewer.ts <device-id> <device-password>');
 
 const login = await fetch(`${base}/api/auth/login`, {
 	method: 'POST',
-	headers: { 'X-ReDesk': '1', 'Content-Type': 'application/json' },
-	body: JSON.stringify({ email: process.env.REDESK_EMAIL ?? 'admin@redesk.local', password: process.env.REDESK_PASSWORD })
+	headers: { 'X-Aegiron': '1', 'Content-Type': 'application/json' },
+	body: JSON.stringify({ email: process.env.AEGIRON_EMAIL ?? 'admin@aegiron.local', password: process.env.AEGIRON_PASSWORD })
 });
 if (!login.ok) throw new Error(`login failed: ${await login.text()}`);
 const cookie = login.headers.get('set-cookie')!.split(';')[0];
 
 const res = await fetch(`${base}/api/sessions`, {
 	method: 'POST',
-	headers: { 'X-ReDesk': '1', 'Content-Type': 'application/json', Cookie: cookie },
+	headers: { 'X-Aegiron': '1', 'Content-Type': 'application/json', Cookie: cookie },
 	body: JSON.stringify({ device_id: deviceId })
 });
 const t = await res.json();

@@ -15,16 +15,16 @@ import (
 	"sync"
 	"time"
 
-	"redesk/server/internal/auth"
-	"redesk/server/internal/config"
-	"redesk/server/internal/hub"
-	"redesk/server/internal/store"
-	"redesk/server/internal/vault"
+	"aegiron/server/internal/auth"
+	"aegiron/server/internal/config"
+	"aegiron/server/internal/hub"
+	"aegiron/server/internal/store"
+	"aegiron/server/internal/vault"
 )
 
-const cookieName = "redesk_session"
+const cookieName = "aegiron_session"
 
-// Version is set at build time: -ldflags "-X redesk/server/internal/api.Version=..."
+// Version is set at build time: -ldflags "-X aegiron/server/internal/api.Version=..."
 var Version = "dev"
 
 type API struct {
@@ -157,11 +157,12 @@ func securityHeaders(next http.Handler) http.Handler {
 }
 
 // csrf requires a custom header on state-changing requests. Browsers cannot send it
-// cross-origin without a CORS preflight, which this server never grants.
+// cross-origin without a CORS preflight, which this server never grants. X-ReDesk is the
+// header of agents released before the rename to Aegiron.
 func (a *API) csrf(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Header.Get("X-ReDesk") != "1" {
-			writeErr(w, http.StatusForbidden, "missing X-ReDesk header")
+		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Header.Get("X-Aegiron") != "1" && r.Header.Get("X-ReDesk") != "1" {
+			writeErr(w, http.StatusForbidden, "missing X-Aegiron header")
 			return
 		}
 		next.ServeHTTP(w, r)

@@ -175,7 +175,7 @@
 		'สาขาเชียงใหม่,teamviewer,987654321,,,,branch,';
 </script>
 
-<svelte:head><title>การเชื่อมต่อ · ReDesk</title></svelte:head>
+<svelte:head><title>การเชื่อมต่อ · Aegiron</title></svelte:head>
 
 <div class="mb-6 flex flex-wrap items-end justify-between gap-4">
 	<div>
@@ -262,7 +262,7 @@
 						<td>
 							<div class="flex justify-end gap-1.5">
 								{#if p.gateway && gateway}
-									<a class="btn btn-primary" href="/gateway/{e.id}" title="เปิดในเบราว์เซอร์ผ่าน ReDesk gateway">เปิดในเบราว์เซอร์</a>
+									<a class="btn btn-primary" href="/gateway/{e.id}" title="เปิดในเบราว์เซอร์ผ่าน Aegiron gateway">เปิดในเบราว์เซอร์</a>
 									<button class="btn" title="เปิดด้วยโปรแกรมในเครื่อง" onclick={() => launchNative(e)}><Icon name="link" /></button>
 								{:else}
 									<button class="btn btn-primary" onclick={() => launchNative(e)}>

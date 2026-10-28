@@ -7,7 +7,7 @@ import (
 	"sort"
 	"strings"
 
-	"redesk/server/internal/store"
+	"aegiron/server/internal/store"
 )
 
 // Wake-on-LAN: the server never sends packets itself. It asks an online agent

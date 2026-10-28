@@ -1,4 +1,4 @@
-//! ReDesk agent library: shared by the `redesk-agent` CLI and the `redesk` desktop app.
+//! Aegiron agent library: shared by the `aegiron-agent` CLI and the `aegiron` desktop app.
 
 pub mod account;
 pub mod capture;
@@ -52,7 +52,7 @@ pub fn format_id(id: &str) -> String {
 pub fn runtime() -> &'static tokio::runtime::Runtime {
     static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
     RT.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread().enable_all().thread_name("redesk-rt").build().expect("tokio runtime")
+        tokio::runtime::Builder::new_multi_thread().enable_all().thread_name("aegiron-rt").build().expect("tokio runtime")
     })
 }
 

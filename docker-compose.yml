@@ -1,38 +1,38 @@
 # Production-ish stack. Put a TLS reverse proxy (Caddy, nginx) in front of :21114,
-# or set REDESK_TLS_CERT / REDESK_TLS_KEY. Agents refuse plain ws:// to non-local hosts.
+# or set AEGIRON_TLS_CERT / AEGIRON_TLS_KEY. Agents refuse plain ws:// to non-local hosts.
 services:
   db:
     image: postgres:16
     environment:
-      POSTGRES_USER: redesk
+      POSTGRES_USER: aegiron
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
-      POSTGRES_DB: redesk
+      POSTGRES_DB: aegiron
     volumes: [pgdata:/var/lib/postgresql/data]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U redesk"]
+      test: ["CMD-SHELL", "pg_isready -U aegiron"]
       interval: 5s
       retries: 10
     restart: unless-stopped
 
   # Protocol engine for the in-browser RDP / VNC / SSH gateway. It must be able to reach
-  # the target machines; credentials are injected by redesk-server and never reach browsers.
+  # the target machines; credentials are injected by aegiron-server and never reach browsers.
   guacd:
     image: guacamole/guacd:1.5.5
-    volumes: [recordings:/recordings]   # session recordings (REDESK_GATEWAY_RECORDING_PATH)
+    volumes: [recordings:/recordings]   # session recordings (AEGIRON_GATEWAY_RECORDING_PATH)
     restart: unless-stopped
 
   server:
     build: { context: ., dockerfile: server/Dockerfile }
     depends_on: { db: { condition: service_healthy }, guacd: { condition: service_started } }
     environment:
-      REDESK_DATABASE_URL: postgres://redesk:${POSTGRES_PASSWORD}@db:5432/redesk?sslmode=disable
-      REDESK_ADMIN_EMAIL: ${REDESK_ADMIN_EMAIL:-admin@redesk.local}
-      REDESK_ADMIN_PASSWORD: ${REDESK_ADMIN_PASSWORD:-}
-      REDESK_TRUST_PROXY: ${REDESK_TRUST_PROXY:-true}
-      REDESK_COOKIE_SECURE: ${REDESK_COOKIE_SECURE:-true}
-      REDESK_GUACD_ADDR: guacd:4822
-      REDESK_GATEWAY_RECORDING_PATH: ${REDESK_GATEWAY_RECORDING_PATH:-/recordings}
-      REDESK_VAULT_KEY: ${REDESK_VAULT_KEY:-}
+      AEGIRON_DATABASE_URL: postgres://aegiron:${POSTGRES_PASSWORD}@db:5432/aegiron?sslmode=disable
+      AEGIRON_ADMIN_EMAIL: ${AEGIRON_ADMIN_EMAIL:-admin@aegiron.local}
+      AEGIRON_ADMIN_PASSWORD: ${AEGIRON_ADMIN_PASSWORD:-}
+      AEGIRON_TRUST_PROXY: ${AEGIRON_TRUST_PROXY:-true}
+      AEGIRON_COOKIE_SECURE: ${AEGIRON_COOKIE_SECURE:-true}
+      AEGIRON_GUACD_ADDR: guacd:4822
+      AEGIRON_GATEWAY_RECORDING_PATH: ${AEGIRON_GATEWAY_RECORDING_PATH:-/recordings}
+      AEGIRON_VAULT_KEY: ${AEGIRON_VAULT_KEY:-}
     volumes: [serverdata:/data]   # server identity key + vault.key — back up separately from the database
     ports: ["21114:21114"]
     restart: unless-stopped

@@ -56,7 +56,7 @@ func VerifyPassword(encoded, pw string) bool {
 }
 
 // dummyHash lets login spend the same time whether or not the email exists.
-var dummyHash, _ = HashPassword("redesk-timing-equalizer")
+var dummyHash, _ = HashPassword("aegiron-timing-equalizer")
 
 func VerifyDummy(pw string) { VerifyPassword(dummyHash, pw) }
 

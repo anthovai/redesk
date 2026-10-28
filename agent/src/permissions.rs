@@ -33,10 +33,10 @@ impl Kind {
         }
     }
 
-    /// Why ReDesk needs it (Thai, for the UI).
+    /// Why Aegiron needs it (Thai, for the UI).
     pub fn reason(self) -> &'static str {
         match self {
-            Kind::ScreenRecording => "ส่งภาพหน้าจอให้ผู้ควบคุม (หลังอนุญาตต้องเปิด ReDesk ใหม่)",
+            Kind::ScreenRecording => "ส่งภาพหน้าจอให้ผู้ควบคุม (หลังอนุญาตต้องเปิด Aegiron ใหม่)",
             Kind::Accessibility => "ให้ผู้ควบคุมใช้เมาส์และคีย์บอร์ดของเครื่องนี้",
             Kind::InputMonitoring => "รับปุ่มลัดของระบบระหว่างควบคุม (ไม่บังคับ)",
         }

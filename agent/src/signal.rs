@@ -1,4 +1,4 @@
-//! Signaling connection to the ReDesk server: registration, keepalive, session requests.
+//! Signaling connection to the Aegiron server: registration, keepalive, session requests.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -55,7 +55,7 @@ impl Agent {
     pub fn rotate_temp_password(&self) {
         let pw = crypto::random_password(8);
         if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
-            println!("\n  ReDesk temporary password: {pw}\n");
+            println!("\n  Aegiron temporary password: {pw}\n");
         }
         if let Err(e) = write_private(&Config::temp_password_path(&self.config_path), &pw) {
             tracing::warn!("cannot save temporary password file: {e}");

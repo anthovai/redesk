@@ -5,7 +5,11 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
-const LABEL: &str = "com.redesk.agent";
+const LABEL: &str = "com.aegiron.agent";
+/// Names used before the rename to Aegiron; removed on install so two agents never run.
+const LEGACY_LABEL: &str = "com.redesk.agent";
+const LEGACY_UNIT: &str = "redesk-agent.service";
+const LEGACY_RUN_VALUE: &str = "ReDesk";
 
 fn home() -> Result<PathBuf> {
     dirs::home_dir().context("no home directory")
@@ -28,14 +32,14 @@ fn plist_path() -> Result<PathBuf> {
 }
 
 fn unit_path() -> Result<PathBuf> {
-    Ok(dirs::config_dir().context("no config dir")?.join("systemd/user/redesk-agent.service"))
+    Ok(dirs::config_dir().context("no config dir")?.join("systemd/user/aegiron-agent.service"))
 }
 
 pub fn log_path() -> Result<PathBuf> {
     Ok(if cfg!(target_os = "macos") {
-        home()?.join("Library/Logs/ReDesk/agent.log")
+        home()?.join("Library/Logs/Aegiron/agent.log")
     } else {
-        dirs::state_dir().or_else(dirs::data_local_dir).context("no state dir")?.join("redesk/agent.log")
+        dirs::state_dir().or_else(dirs::data_local_dir).context("no state dir")?.join("aegiron/agent.log")
     })
 }
 
@@ -79,7 +83,7 @@ const WIN_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 
 /// Prefers the desktop app next to this binary (starts in the tray), else the CLI agent.
 fn windows_autostart_command(exe: &Path, config: &Path) -> String {
-    let gui = exe.with_file_name("redesk.exe");
+    let gui = exe.with_file_name("aegiron.exe");
     if gui.exists() {
         format!("\"{}\" --background", gui.display())
     } else {
@@ -94,15 +98,59 @@ pub fn is_installed() -> bool {
     } else if cfg!(target_os = "linux") {
         unit_path().is_ok_and(|p| p.exists())
     } else if cfg!(windows) {
-        run("reg", &["query", WIN_RUN_KEY, "/v", "ReDesk"]).is_ok()
+        run("reg", &["query", WIN_RUN_KEY, "/v", "Aegiron"]).is_ok()
     } else {
         false
     }
 }
 
+/// Stops and deletes the autostart entry of a ReDesk (pre-rename) agent, if any.
+fn remove_legacy() {
+    if cfg!(target_os = "macos") {
+        if let (Ok(uid), Ok(home)) = (run("id", &["-u"]), home()) {
+            let _ = run("launchctl", &["bootout", &format!("gui/{}/{LEGACY_LABEL}", uid.trim())]);
+            let _ = std::fs::remove_file(home.join("Library/LaunchAgents").join(format!("{LEGACY_LABEL}.plist")));
+        }
+    } else if cfg!(target_os = "linux") {
+        let _ = run("systemctl", &["--user", "disable", "--now", LEGACY_UNIT]);
+        if let Some(dir) = dirs::config_dir() {
+            let _ = std::fs::remove_file(dir.join("systemd/user").join(LEGACY_UNIT));
+        }
+    } else if cfg!(windows) {
+        let _ = run("reg", &["delete", WIN_RUN_KEY, "/v", LEGACY_RUN_VALUE, "/f"]);
+    }
+}
+
+fn legacy_installed() -> bool {
+    if cfg!(target_os = "macos") {
+        home().is_ok_and(|h| h.join("Library/LaunchAgents").join(format!("{LEGACY_LABEL}.plist")).exists())
+    } else if cfg!(target_os = "linux") {
+        dirs::config_dir().is_some_and(|d| d.join("systemd/user").join(LEGACY_UNIT).exists())
+    } else if cfg!(windows) {
+        run("reg", &["query", WIN_RUN_KEY, "/v", LEGACY_RUN_VALUE]).is_ok()
+    } else {
+        false
+    }
+}
+
+/// After upgrading from ReDesk: swaps its start-at-login entry for Aegiron's (same config), so
+/// the machine keeps starting the agent and the deleted old app is not relaunched forever.
+/// Returns whether anything was migrated.
+pub fn migrate_legacy(config: &Path) -> Result<bool> {
+    if !legacy_installed() {
+        return Ok(false);
+    }
+    remove_legacy();
+    if !is_installed() {
+        install(config)?;
+    }
+    Ok(true)
+}
+
 pub fn install(config: &Path) -> Result<()> {
+    remove_legacy();
     let exe = plain(std::env::current_exe()?.canonicalize()?);
-    let config = plain(config.canonicalize().context("config not found; run `redesk-agent init` first")?);
+    let config = plain(config.canonicalize().context("config not found; run `aegiron-agent init` first")?);
     let log = log_path()?;
     std::fs::create_dir_all(log.parent().unwrap())?;
 
@@ -121,7 +169,7 @@ pub fn install(config: &Path) -> Result<()> {
         std::fs::write(
             &unit,
             format!(
-                "[Unit]\nDescription=ReDesk remote desktop agent\nAfter=graphical-session.target network-online.target\n\n\
+                "[Unit]\nDescription=Aegiron remote desktop agent\nAfter=graphical-session.target network-online.target\n\n\
                  [Service]\nExecStart=\"{}\" --config \"{}\" run\nRestart=always\nRestartSec=5\nStandardOutput=append:{}\nStandardError=append:{}\n\n\
                  [Install]\nWantedBy=default.target\n",
                 exe.display(),
@@ -131,12 +179,12 @@ pub fn install(config: &Path) -> Result<()> {
             ),
         )?;
         run("systemctl", &["--user", "daemon-reload"])?;
-        run("systemctl", &["--user", "enable", "--now", "redesk-agent.service"])?;
+        run("systemctl", &["--user", "enable", "--now", "aegiron-agent.service"])?;
         println!("Installed systemd user unit {}", unit.display());
     } else if cfg!(windows) {
         // Per-user "Run" entry: the agent needs the user's desktop session to capture the screen.
         let cmd = windows_autostart_command(&exe, &config);
-        run("reg", &["add", WIN_RUN_KEY, "/v", "ReDesk", "/t", "REG_SZ", "/d", &cmd, "/f"])?;
+        run("reg", &["add", WIN_RUN_KEY, "/v", "Aegiron", "/t", "REG_SZ", "/d", &cmd, "/f"])?;
         println!("Registered to start at logon: {cmd}");
     } else {
         bail!("service install is not supported on this platform");
@@ -146,6 +194,7 @@ pub fn install(config: &Path) -> Result<()> {
 }
 
 pub fn uninstall() -> Result<()> {
+    remove_legacy();
     if cfg!(target_os = "macos") {
         let uid = run("id", &["-u"])?.trim().to_string();
         let _ = run("launchctl", &["bootout", &format!("gui/{uid}/{LABEL}")]);
@@ -154,14 +203,14 @@ pub fn uninstall() -> Result<()> {
             std::fs::remove_file(&p)?;
         }
     } else if cfg!(target_os = "linux") {
-        let _ = run("systemctl", &["--user", "disable", "--now", "redesk-agent.service"]);
+        let _ = run("systemctl", &["--user", "disable", "--now", "aegiron-agent.service"]);
         let p = unit_path()?;
         if p.exists() {
             std::fs::remove_file(&p)?;
         }
         let _ = run("systemctl", &["--user", "daemon-reload"]);
     } else if cfg!(windows) {
-        let _ = run("reg", &["delete", WIN_RUN_KEY, "/v", "ReDesk", "/f"]);
+        let _ = run("reg", &["delete", WIN_RUN_KEY, "/v", "Aegiron", "/f"]);
     } else {
         bail!("not supported on this platform");
     }
@@ -178,7 +227,7 @@ pub fn status() -> Result<()> {
         }
     } else if cfg!(target_os = "linux") {
         Command::new("systemctl")
-            .args(["--user", "is-active", "redesk-agent.service"])
+            .args(["--user", "is-active", "aegiron-agent.service"])
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_else(|_| "unknown".into())
@@ -198,10 +247,10 @@ mod tests {
 
     #[test]
     fn plist_escapes_paths() {
-        let p = launchd_plist(Path::new("/Apps/R&D <x>/redesk-agent"), Path::new("/cfg/agent.toml"), Path::new("/log/a.log"));
-        assert!(p.contains("<string>/Apps/R&amp;D &lt;x&gt;/redesk-agent</string>"));
+        let p = launchd_plist(Path::new("/Apps/R&D <x>/aegiron-agent"), Path::new("/cfg/agent.toml"), Path::new("/log/a.log"));
+        assert!(p.contains("<string>/Apps/R&amp;D &lt;x&gt;/aegiron-agent</string>"));
         assert!(p.contains("<string>run</string>"));
-        if let Ok(dir) = std::env::var("REDESK_PLIST_OUT") {
+        if let Ok(dir) = std::env::var("AEGIRON_PLIST_OUT") {
             std::fs::write(Path::new(&dir).join("test.plist"), p).unwrap();
         }
     }

@@ -51,7 +51,7 @@ pub(super) fn demo_page(page: Page) {
 }
 
 fn page_id() -> egui::Id {
-    egui::Id::unique("redesk-settings-page")
+    egui::Id::unique("aegiron-settings-page")
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -331,7 +331,7 @@ impl App {
     fn page_general(&mut self, ui: &mut Ui, c: &Config) {
         card_title(ui, "การเริ่มต้นระบบ");
         let mut auto = self.autostart;
-        let auto_changed = card(ui, |ui| switch_row(ui, "เปิด ReDesk เมื่อล็อกอิน", "เริ่มทำงานในถาดระบบ (tray) โดยไม่เปิดหน้าต่าง", &mut auto));
+        let auto_changed = card(ui, |ui| switch_row(ui, "เปิด Aegiron เมื่อล็อกอิน", "เริ่มทำงานในถาดระบบ (tray) โดยไม่เปิดหน้าต่าง", &mut auto));
         if auto_changed {
             let res = if auto { service::install(&self.config_path) } else { service::uninstall() };
             match res {
@@ -364,7 +364,7 @@ impl App {
             sep(ui);
             changed |= check_row(ui, "คลิปบอร์ด", "คัดลอกและวางข้อความระหว่างสองเครื่อง", &mut clip);
             sep(ui);
-            changed |= check_row(ui, "รับ-ส่งไฟล์", "ไฟล์ที่ได้รับจะอยู่ในโฟลเดอร์ Downloads/ReDesk", &mut files);
+            changed |= check_row(ui, "รับ-ส่งไฟล์", "ไฟล์ที่ได้รับจะอยู่ในโฟลเดอร์ Downloads/Aegiron", &mut files);
             changed
         });
         if changed {
@@ -621,7 +621,7 @@ impl App {
                 ui.vertical(|ui| {
                     ui.add_space(2.0);
                     ui.spacing_mut().item_spacing.y = 0.0;
-                    ui.label(RichText::new("ReDesk").font(semi(19.0)).color(pal.fg));
+                    ui.label(RichText::new("Aegiron").font(semi(19.0)).color(pal.fg));
                     ui.label(RichText::new(format!("เวอร์ชัน {}", env!("CARGO_PKG_VERSION"))).size(13.0).color(pal.muted));
                     ui.label(RichText::new("รีโมตเดสก์ท็อปบนเซิร์ฟเวอร์ขององค์กรเอง เข้ารหัสต้นทาง-ปลายทาง").size(12.5).color(pal.muted));
                 });
@@ -691,7 +691,7 @@ impl App {
             Some(1) => self.check_update(&ctx, c.server_url.clone(), c.allow_insecure_transport),
             Some(2) => {
                 if let UpdateState::Available(rel) = std::mem::take(&mut self.update) {
-                    let dir = dirs::download_dir().unwrap_or_else(std::env::temp_dir).join("ReDesk");
+                    let dir = dirs::download_dir().unwrap_or_else(std::env::temp_dir).join("Aegiron");
                     self.update = UpdateState::Downloading(rel.clone());
                     self.spawn_job(&ctx, move || Job::UpdateDownload(updater::download(&rel, &dir).map_err(|e| format!("{e:#}"))));
                 }

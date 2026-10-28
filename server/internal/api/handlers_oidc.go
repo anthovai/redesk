@@ -18,8 +18,8 @@ import (
 	"github.com/coreos/go-oidc/v3/oidc"
 	"golang.org/x/oauth2"
 
-	"redesk/server/internal/auth"
-	"redesk/server/internal/store"
+	"aegiron/server/internal/auth"
+	"aegiron/server/internal/store"
 )
 
 // Single sign-on with an OpenID Connect provider (Authorization Code + PKCE).
@@ -31,7 +31,7 @@ import (
 // The poll code never appears in the browser URL; the browser only sees a separate app id.
 
 const (
-	oidcCookie     = "redesk_oidc"
+	oidcCookie     = "aegiron_oidc"
 	oidcFlowTTL    = 10 * time.Minute
 	oidcAppTTL     = 5 * time.Minute
 	oidcMaxPending = 5000
@@ -324,7 +324,7 @@ func (a *API) oidcLogin(w http.ResponseWriter, r *http.Request) {
 			device, appIP, confirm = x.device, x.ip, x.confirm
 		})
 		if !ok {
-			oidcPage(w, http.StatusNotFound, "ลิงก์หมดอายุ", "ลิงก์เข้าสู่ระบบนี้หมดอายุหรือถูกใช้ไปแล้ว กรุณากดเข้าสู่ระบบจากโปรแกรม ReDesk ใหม่อีกครั้ง")
+			oidcPage(w, http.StatusNotFound, "ลิงก์หมดอายุ", "ลิงก์เข้าสู่ระบบนี้หมดอายุหรือถูกใช้ไปแล้ว กรุณากดเข้าสู่ระบบจากโปรแกรม Aegiron ใหม่อีกครั้ง")
 			return
 		}
 		if confirm != "ok" {
@@ -434,7 +434,7 @@ func (a *API) oidcCallback(w http.ResponseWriter, r *http.Request) {
 		}
 		detail["app"], detail["device"] = true, device
 		_ = a.store.AddAudit(r.Context(), &u.ID, ip, "auth.oidc_login", u.Email, detail)
-		oidcPage(w, http.StatusOK, "เข้าสู่ระบบสำเร็จ", "กลับไปที่โปรแกรม ReDesk ได้เลย หน้านี้ปิดได้")
+		oidcPage(w, http.StatusOK, "เข้าสู่ระบบสำเร็จ", "กลับไปที่โปรแกรม Aegiron ได้เลย หน้านี้ปิดได้")
 		return
 	}
 
@@ -458,7 +458,7 @@ func (a *API) oidcCallback(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, f.next, http.StatusSeeOther)
 }
 
-// oidcResolveUser maps verified claims to a ReDesk account. reason != "" means rejected.
+// oidcResolveUser maps verified claims to a Aegiron account. reason != "" means rejected.
 func (a *API) oidcResolveUser(ctx context.Context, s *store.OIDCSettings, cl *oidcClaims) (u *store.User, created bool, reason, email string) {
 	email = cl.Email
 	if email == "" && strings.Contains(cl.PreferredUsername, "@") {
@@ -525,7 +525,7 @@ var oidcReasonText = map[string]string{
 	"no_email":             "บัญชี SSO ไม่มีอีเมล",
 	"email_unverified":     "อีเมลของบัญชี SSO ยังไม่ได้รับการยืนยัน",
 	"domain_not_allowed":   "โดเมนอีเมลนี้ไม่ได้รับอนุญาต",
-	"no_account":           "ยังไม่มีบัญชี ReDesk สำหรับอีเมลนี้ กรุณาติดต่อผู้ดูแลระบบ",
+	"no_account":           "ยังไม่มีบัญชี Aegiron สำหรับอีเมลนี้ กรุณาติดต่อผู้ดูแลระบบ",
 	"disabled_account":     "บัญชีนี้ถูกปิดใช้งาน",
 	"expired":              "คำขอเข้าสู่ระบบจากโปรแกรมหมดอายุ กรุณาลองใหม่",
 	"internal":             "เกิดข้อผิดพลาดภายในเซิร์ฟเวอร์",
@@ -550,7 +550,7 @@ func (a *API) oidcFail(w http.ResponseWriter, r *http.Request, f *oidcFlow, reas
 }
 
 var oidcTmpl = template.Must(template.New("p").Parse(`<!doctype html><html lang="th"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>{{.Title}} · ReDesk</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>{{.Title}} · Aegiron</title>
 <style>body{font-family:system-ui,sans-serif;background:#f6f7f9;color:#1b1f24;display:grid;place-items:center;min-height:100vh;margin:0;padding:16px;box-sizing:border-box}
 .c{background:#fff;border:1px solid #e2e5e9;border-radius:12px;padding:24px;max-width:420px;width:100%}h1{font-size:1.15rem;margin:0 0 8px}
 p{color:#4b5563;line-height:1.5}dl{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:.9rem}dt{color:#6b7280}dd{margin:0;word-break:break-all}
@@ -558,7 +558,7 @@ a.b{display:inline-block;margin-top:12px;background:#2563eb;color:#fff;padding:8
 @media (prefers-color-scheme:dark){body{background:#0f1115;color:#e5e7eb}.c{background:#181b21;border-color:#2a2f37}p{color:#9ca3af}}</style>
 </head><body><div class="c"><h1>{{.Title}}</h1><p>{{.Msg}}</p>
 {{if .Link}}<dl><dt>เครื่อง</dt><dd>{{.Device}}</dd><dt>IP</dt><dd>{{.IP}}</dd></dl>
-<p>ถ้าคุณไม่ได้กดเข้าสู่ระบบจากโปรแกรม ReDesk บนเครื่องนี้เอง ให้ปิดหน้านี้ทันที</p>
+<p>ถ้าคุณไม่ได้กดเข้าสู่ระบบจากโปรแกรม Aegiron บนเครื่องนี้เอง ให้ปิดหน้านี้ทันที</p>
 <a class="b" href="{{.Link}}">ดำเนินการต่อด้วย {{.Name}}</a>{{end}}</div></body></html>`))
 
 func oidcPage(w http.ResponseWriter, status int, title, msg string) {
@@ -572,7 +572,7 @@ func oidcConfirmPage(w http.ResponseWriter, name, device, ip, link string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	_ = oidcTmpl.Execute(w, map[string]string{
-		"Title": "เข้าสู่ระบบโปรแกรม ReDesk", "Msg": "มีคำขอเข้าสู่ระบบโปรแกรม ReDesk จากเครื่องต่อไปนี้",
+		"Title": "เข้าสู่ระบบโปรแกรม Aegiron", "Msg": "มีคำขอเข้าสู่ระบบโปรแกรม Aegiron จากเครื่องต่อไปนี้",
 		"Device": device, "IP": ip, "Link": link, "Name": name,
 	})
 }

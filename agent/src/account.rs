@@ -1,4 +1,4 @@
-//! Signing in from the desktop app (like a RustDesk account): HTTPS calls to the ReDesk API.
+//! Signing in from the desktop app (like a RustDesk account): HTTPS calls to the Aegiron API.
 //!
 //! Sign-in returns the server's identity key over the server's own TLS connection, so a new
 //! device can enroll without anyone copying keys or tokens by hand.
@@ -15,7 +15,7 @@ fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .http_status_as_error(false)
         .timeout_global(Some(Duration::from_secs(15)))
-        .user_agent(concat!("ReDesk/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("Aegiron/", env!("CARGO_PKG_VERSION")))
         .build()
         .into()
 }
@@ -79,19 +79,19 @@ pub fn login(server: &str, insecure: bool, email: &str, password: &str, totp: &s
     check_server_url(server, insecure)?;
     let device = hostname::get().map(|h| h.to_string_lossy().into_owned()).unwrap_or_default();
     let body = json!({"email": email.trim(), "password": password, "totp": totp.trim(), "device": device});
-    let r: LoginReply = call(agent().post(&format!("{server}/api/agent/login")).header("X-ReDesk", "1").send_json(&body))
+    let r: LoginReply = call(agent().post(&format!("{server}/api/agent/login")).header("X-Aegiron", "1").send_json(&body))
         .map_err(|(_, m)| anyhow!(m))?;
     if r.need_totp {
         return Ok(Login::NeedTotp);
     }
     match (r.user, r.token, r.server_key, r.enroll_token) {
         (Some(user), Some(token), Some(server_key), Some(enroll_token)) => Ok(Login::Ok(Session { user, token, server_key, enroll_token })),
-        _ => bail!("เซิร์ฟเวอร์นี้ยังไม่รองรับการเข้าสู่ระบบจากโปรแกรม (ต้องเป็น ReDesk 0.3 ขึ้นไป)"),
+        _ => bail!("เซิร์ฟเวอร์นี้ยังไม่รองรับการเข้าสู่ระบบจากโปรแกรม (ต้องเป็น Aegiron 0.3 ขึ้นไป)"),
     }
 }
 
 pub fn logout(server: &str, token: &str) {
-    let _ = agent().post(&format!("{server}/api/auth/logout")).header("X-ReDesk", "1").header("Authorization", &format!("Bearer {token}")).send_empty();
+    let _ = agent().post(&format!("{server}/api/auth/logout")).header("X-Aegiron", "1").header("Authorization", &format!("Bearer {token}")).send_empty();
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -156,7 +156,7 @@ pub fn handoff_url(server: &str, token: &str, next: &str) -> Result<String, (u16
     let r: R = call(
         agent()
             .post(&format!("{server}/api/auth/handoff"))
-            .header("X-ReDesk", "1")
+            .header("X-Aegiron", "1")
             .header("Authorization", &format!("Bearer {token}"))
             .send_empty(),
     )?;
@@ -193,7 +193,7 @@ pub fn start_session(server: &str, token: &str, device_id: &str) -> Result<Sessi
     call::<SessionTicket>(
         agent()
             .post(&format!("{server}/api/sessions"))
-            .header("X-ReDesk", "1")
+            .header("X-Aegiron", "1")
             .header("Authorization", &format!("Bearer {token}"))
             .send_json(&json!({"device_id": device_id})),
     )
@@ -219,7 +219,7 @@ pub fn oidc_start(server: &str, insecure: bool, device: &str) -> Result<(String,
         code: String,
         url: String,
     }
-    let r: R = call(agent().post(&format!("{server}/api/oidc/auth")).header("X-ReDesk", "1").send_json(&json!({"device": device})))
+    let r: R = call(agent().post(&format!("{server}/api/oidc/auth")).header("X-Aegiron", "1").send_json(&json!({"device": device})))
         .map_err(|(status, m)| match status {
             400 => anyhow!("เซิร์ฟเวอร์ยังไม่ได้เปิดการเข้าสู่ระบบด้วย SSO"),
             404 | 405 => anyhow!("เซิร์ฟเวอร์นี้ยังไม่รองรับการเข้าสู่ระบบด้วย SSO"),
@@ -263,7 +263,7 @@ pub fn oidc_poll(server: &str, insecure: bool, code: &str) -> Result<Option<Sess
 /// Thai text for "sign-in failed: <reason>" from the server.
 fn oidc_reason(msg: &str) -> String {
     match msg.rsplit(": ").next().unwrap_or("") {
-        "no_account" => "ยังไม่มีบัญชี ReDesk สำหรับอีเมลนี้ กรุณาติดต่อผู้ดูแลระบบ",
+        "no_account" => "ยังไม่มีบัญชี Aegiron สำหรับอีเมลนี้ กรุณาติดต่อผู้ดูแลระบบ",
         "domain_not_allowed" => "โดเมนอีเมลนี้ไม่ได้รับอนุญาต",
         "email_unverified" => "อีเมลของบัญชี SSO ยังไม่ได้รับการยืนยัน",
         "no_email" => "บัญชี SSO ไม่มีอีเมล",

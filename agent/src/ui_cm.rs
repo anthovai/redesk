@@ -14,11 +14,11 @@ const TAB_HEIGHT: f32 = 44.0;
 static NO_VIEWPORTS: AtomicBool = AtomicBool::new(false);
 
 fn cm_viewport() -> egui::ViewportId {
-    egui::ViewportId::from_hash_of("redesk-connection-manager")
+    egui::ViewportId::from_hash_of("aegiron-connection-manager")
 }
 
 fn state_id() -> egui::Id {
-    egui::Id::unique("redesk-cm-state")
+    egui::Id::unique("aegiron-cm-state")
 }
 
 /// Connection-manager UI state, kept in egui memory while the window is open.
@@ -220,8 +220,8 @@ impl App {
             st.selected = entries.iter().find(|e| matches!(e.kind, Kind::Pending(..))).or(entries.last()).map(|e| e.key);
         }
         if st.pos.is_none() {
-            // REDESK_UI_CM_POS="x,y" places the window (automated screenshots).
-            st.pos = std::env::var("REDESK_UI_CM_POS")
+            // AEGIRON_UI_CM_POS="x,y" places the window (automated screenshots).
+            st.pos = std::env::var("AEGIRON_UI_CM_POS")
                 .ok()
                 .and_then(|p| {
                     let (x, y) = p.split_once(',')?;
@@ -236,7 +236,7 @@ impl App {
         }
 
         let mut builder = egui::ViewportBuilder::default()
-            .with_title("ReDesk — การเชื่อมต่อเข้า")
+            .with_title("Aegiron — การเชื่อมต่อเข้า")
             .with_inner_size(CM_SIZE)
             .with_min_inner_size([300.0, 460.0])
             .with_maximize_button(false)

@@ -53,12 +53,13 @@ pub fn normalize_id(s: &str) -> Option<String> {
     (id.len() == 9 && id.bytes().all(|b| b.is_ascii_digit())).then_some(id)
 }
 
-/// `redesk://connect/<id>` or `redesk://<id>` (one trailing slash allowed, URL-encoded spaces
+/// `aegiron://connect/<id>` or `aegiron://<id>` (one trailing slash allowed, URL-encoded spaces
 /// accepted). Anything else is rejected.
 pub fn parse_link(url: &str) -> Option<String> {
     let url = url.trim();
     let (scheme, rest) = url.split_once("://")?;
-    if !scheme.eq_ignore_ascii_case("redesk") {
+    // redesk:// links from before the rename keep working.
+    if !scheme.eq_ignore_ascii_case("aegiron") && !scheme.eq_ignore_ascii_case("redesk") {
         return None;
     }
     let rest = rest.strip_suffix('/').unwrap_or(rest);
@@ -189,26 +190,27 @@ mod tests {
 
     #[test]
     fn links() {
+        assert_eq!(parse_link("aegiron://connect/123456789").as_deref(), Some("123456789"));
         assert_eq!(parse_link("redesk://connect/123456789").as_deref(), Some("123456789"));
-        assert_eq!(parse_link("redesk://123456789").as_deref(), Some("123456789"));
-        assert_eq!(parse_link("redesk://123456789/").as_deref(), Some("123456789"));
-        assert_eq!(parse_link("ReDesk://Connect/123 456 789").as_deref(), Some("123456789"));
-        assert_eq!(parse_link("redesk://connect/123%20456%20789").as_deref(), Some("123456789"));
-        assert_eq!(parse_link(" redesk://123456789 ").as_deref(), Some("123456789"));
+        assert_eq!(parse_link("aegiron://123456789").as_deref(), Some("123456789"));
+        assert_eq!(parse_link("aegiron://123456789/").as_deref(), Some("123456789"));
+        assert_eq!(parse_link("Aegiron://Connect/123 456 789").as_deref(), Some("123456789"));
+        assert_eq!(parse_link("aegiron://connect/123%20456%20789").as_deref(), Some("123456789"));
+        assert_eq!(parse_link(" aegiron://123456789 ").as_deref(), Some("123456789"));
         for bad in [
-            "redesk://12345678",
-            "redesk://1234567890",
-            "redesk://12345678a",
-            "redesk://connect/123456789?pw=x",
-            "redesk://connect/123456789/extra",
-            "redesk://open/123456789",
-            "redesk:123456789",
+            "aegiron://12345678",
+            "aegiron://1234567890",
+            "aegiron://12345678a",
+            "aegiron://connect/123456789?pw=x",
+            "aegiron://connect/123456789/extra",
+            "aegiron://open/123456789",
+            "aegiron:123456789",
             "https://123456789",
             "rustdesk://123456789",
-            "redesk://",
-            "redesk://connect/",
-            "redesk://１２３４５６７８９",
-            "redesk://123\t456789",
+            "aegiron://",
+            "aegiron://connect/",
+            "aegiron://１２３４５６７８９",
+            "aegiron://123\t456789",
             "",
         ] {
             assert_eq!(parse_link(bad), None, "{bad}");
@@ -246,7 +248,7 @@ mod tests {
 
     #[test]
     fn roundtrip_and_permissions() {
-        let dir = std::env::temp_dir().join(format!("redesk-local-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("aegiron-local-test-{}", std::process::id()));
         let path = LocalState::path_for(&dir.join("agent.toml"));
         assert_eq!(path.file_name().unwrap(), "local.toml");
         let mut s = LocalState::default();

@@ -192,31 +192,77 @@ fn style(ctx: &egui::Context) {
     });
 }
 
-/// Window and tray icon pixels: blue rounded square with a white screen outline.
+/// Aegiron logo pixels: a white shield (aegis) with a blue "A" on a blue rounded square.
+/// Drawn in code so every size (window, tray, .ico, .icns) stays sharp; 4×4 supersampled.
 pub fn icon_rgba(size: u32) -> Vec<u8> {
+    // Shield outline in unit coordinates: flat top, straight sides, curved to a point.
+    let mut shield = vec![(0.235f32, 0.215f32), (0.765, 0.215), (0.765, 0.47)];
+    let bez = |t: f32, x0: f32| {
+        let (p0, c, p1) = ((x0, 0.47f32), (x0, 0.70f32), (0.5f32, 0.835f32));
+        let u = 1.0 - t;
+        (u * u * p0.0 + 2.0 * u * t * c.0 + t * t * p1.0, u * u * p0.1 + 2.0 * u * t * c.1 + t * t * p1.1)
+    };
+    shield.extend((1..=16).map(|i| bez(i as f32 / 16.0, 0.765)));
+    shield.extend((0..16).rev().map(|i| bez(i as f32 / 16.0, 0.235)));
+    let in_shield = |x: f32, y: f32| {
+        let mut inside = false;
+        let mut j = shield.len() - 1;
+        for i in 0..shield.len() {
+            let ((xi, yi), (xj, yj)) = (shield[i], shield[j]);
+            if (yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi {
+                inside = !inside;
+            }
+            j = i;
+        }
+        inside
+    };
+    let seg = |x: f32, y: f32, a: (f32, f32), b: (f32, f32)| {
+        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let t = (((x - a.0) * dx + (y - a.1) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0);
+        ((x - a.0 - t * dx).powi(2) + (y - a.1 - t * dy).powi(2)).sqrt()
+    };
+    let half = 0.041;
+    let in_a = |x: f32, y: f32| {
+        let apex = (0.5, 0.325);
+        seg(x, y, apex, (0.378, 0.668)) < half || seg(x, y, apex, (0.622, 0.668)) < half || seg(x, y, (0.43, 0.56), (0.57, 0.56)) < half * 0.8
+    };
+    let in_square = |x: f32, y: f32| {
+        let r = 0.225;
+        let (cx, cy) = (x.clamp(r, 1.0 - r), y.clamp(r, 1.0 - r));
+        (x - cx).powi(2) + (y - cy).powi(2) <= r * r
+    };
+
+    const SS: u32 = 4;
     let s = size as f32;
     let mut px = vec![0u8; (size * size * 4) as usize];
-    for y in 0..size {
-        for x in 0..size {
-            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
-            let r = s * 0.22;
-            let cx = fx.clamp(r, s - r);
-            let cy = fy.clamp(r, s - r);
-            if (fx - cx).powi(2) + (fy - cy).powi(2) > r * r {
-                continue;
+    for py in 0..size {
+        for pxi in 0..size {
+            let (mut r, mut g, mut b, mut a) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+            for sy in 0..SS {
+                for sx in 0..SS {
+                    let x = (pxi as f32 + (sx as f32 + 0.5) / SS as f32) / s;
+                    let y = (py as f32 + (sy as f32 + 0.5) / SS as f32) / s;
+                    if !in_square(x, y) {
+                        continue;
+                    }
+                    // Vertical gradient #2B8CFF → #0057E0.
+                    let mut c = [43.0 + (0.0 - 43.0) * y, 140.0 + (87.0 - 140.0) * y, 255.0 + (224.0 - 255.0) * y];
+                    if in_shield(x, y) && !in_a(x, y) {
+                        c = [255.0, 255.0, 255.0];
+                    } else if in_shield(x, y) {
+                        c = [0.0, 113.0, 255.0];
+                    }
+                    r += c[0];
+                    g += c[1];
+                    b += c[2];
+                    a += 1.0;
+                }
             }
-            let i = ((y * size + x) * 4) as usize;
-            let mut c = [0x00, 0x71, 0xff];
-            let (l, t, rr, b, w) = (s * 0.22, s * 0.28, s * 0.78, s * 0.66, (s * 0.07).max(1.0));
-            let on_frame = (fx >= l && fx <= rr && fy >= t && fy <= b) && (fx - l < w || rr - fx < w || fy - t < w || b - fy < w);
-            let stand = fx >= s * 0.38 && fx <= s * 0.62 && fy >= s * 0.74 && fy <= s * 0.74 + w;
-            let dot = (fx - s * 0.5).powi(2) + (fy - s * 0.47).powi(2) <= (s * 0.07).powi(2);
-            if on_frame || stand {
-                c = [255, 255, 255];
-            } else if dot {
-                c = [0x9c, 0xc8, 0xff];
+            if a > 0.0 {
+                let i = ((py * size + pxi) * 4) as usize;
+                let n = (SS * SS) as f32;
+                px[i..i + 4].copy_from_slice(&[(r / a) as u8, (g / a) as u8, (b / a) as u8, (a / n * 255.0) as u8]);
             }
-            px[i..i + 4].copy_from_slice(&[c[0], c[1], c[2], 255]);
         }
     }
     px
@@ -752,7 +798,7 @@ enum Job {
 #[derive(Clone, Default)]
 pub struct ShowSignal(pub Arc<AtomicBool>);
 
-/// Device IDs from `redesk://` links (command line or a second launch), waiting to be opened.
+/// Device IDs from `aegiron://` links (command line or a second launch), waiting to be opened.
 #[derive(Clone, Default)]
 pub struct OpenRequests(pub Arc<Mutex<VecDeque<String>>>);
 
@@ -1343,15 +1389,15 @@ impl App {
         let live: Vec<_> = self.viewers.iter().map(|w| w.viewport).collect();
         self.viewer_init.retain(|v, _| live.contains(v));
         for w in &self.viewers {
-            let title = format!("{} — ReDesk", w.viewer.state.lock().unwrap().device_name);
+            let title = format!("{} — Aegiron", w.viewer.state.lock().unwrap().device_name);
             let size = *self.viewer_init.entry(w.viewport).or_insert(self.local.viewer_size.unwrap_or(VIEWER_SIZE));
             let builder = egui::ViewportBuilder::default()
                 .with_title(title)
                 .with_inner_size(size)
                 .with_min_inner_size([640.0, 420.0])
                 .with_icon(Arc::new(egui::IconData { rgba: icon_rgba(64), width: 64, height: 64 }));
-            // REDESK_UI_VIEWER_POS="x,y" places the window (automated screenshots).
-            let builder = match std::env::var("REDESK_UI_VIEWER_POS").ok().and_then(|p| {
+            // AEGIRON_UI_VIEWER_POS="x,y" places the window (automated screenshots).
+            let builder = match std::env::var("AEGIRON_UI_VIEWER_POS").ok().and_then(|p| {
                 let (x, y) = p.split_once(',')?;
                 Some([x.parse::<f32>().ok()?, y.parse::<f32>().ok()?])
             }) {
@@ -1408,7 +1454,7 @@ impl eframe::App for App {
             Self::bring_to_front(ctx);
             ctx.send_viewport_cmd(ViewportCommand::RequestUserAttention(egui::UserAttentionType::Critical));
         }
-        if let Ok(id) = std::env::var("REDESK_UI_CONNECT")
+        if let Ok(id) = std::env::var("AEGIRON_UI_CONNECT")
             && self.viewers.is_empty()
             && self.account().is_some()
             && !self.started.elapsed().is_zero()
@@ -1447,10 +1493,10 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(ViewportCommand::Close);
         }
         if let Some((path, frames)) = &mut self.screenshot
-            && std::env::var_os("REDESK_UI_CONNECT").is_none()
+            && std::env::var_os("AEGIRON_UI_CONNECT").is_none()
         {
-            // REDESK_UI_SCREENSHOT_AFTER=<seconds> waits (e.g. for the server connection) before capturing.
-            let wait = std::env::var("REDESK_UI_SCREENSHOT_AFTER").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+            // AEGIRON_UI_SCREENSHOT_AFTER=<seconds> waits (e.g. for the server connection) before capturing.
+            let wait = std::env::var("AEGIRON_UI_SCREENSHOT_AFTER").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
             if self.started.elapsed() >= Duration::from_secs(wait) {
                 *frames += 1;
             }
@@ -1559,7 +1605,7 @@ impl App {
         }
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
-            let (home, _) = tab_chip(ui, "ReDesk", TabIcon::Logo, self.view == View::Home, false);
+            let (home, _) = tab_chip(ui, "Aegiron", TabIcon::Logo, self.view == View::Home, false);
             if home.clicked() {
                 self.view = View::Home;
             }
@@ -1905,8 +1951,8 @@ impl App {
             let msg = match self.tab {
                 HomeTab::Recent => "ยังไม่มีประวัติการเชื่อมต่อ — เครื่องที่คุณเคยควบคุมจะแสดงที่นี่",
                 HomeTab::Favorites => "ยังไม่มีรายการโปรด — เพิ่มได้จากเมนู ⋮ ของแต่ละเครื่อง",
-                HomeTab::Book => "ยังไม่มีเครื่องในสมุดที่อยู่ — เพิ่มได้จากคอนโซล ReDesk",
-                HomeTab::Lan => "ไม่พบเครื่อง ReDesk อื่นในเครือข่ายเดียวกัน",
+                HomeTab::Book => "ยังไม่มีเครื่องในสมุดที่อยู่ — เพิ่มได้จากคอนโซล Aegiron",
+                HomeTab::Lan => "ไม่พบเครื่อง Aegiron อื่นในเครือข่ายเดียวกัน",
             };
             ui.label(RichText::new(msg).size(13.0).color(pal.muted));
             return;
@@ -2175,8 +2221,8 @@ impl App {
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| ui.vertical_centered(|ui| {
             ui.add_space(24.0);
             Self::brand(ui, 48.0);
-            ui.label(RichText::new("เข้าสู่ระบบ ReDesk").font(semi(22.0)).color(pal.fg));
-            ui.label(RichText::new("ใช้บัญชีเดียวกับคอนโซล ReDesk ขององค์กร").color(pal.muted));
+            ui.label(RichText::new("เข้าสู่ระบบ Aegiron").font(semi(22.0)).color(pal.fg));
+            ui.label(RichText::new("ใช้บัญชีเดียวกับคอนโซล Aegiron ขององค์กร").color(pal.muted));
             ui.add_space(12.0);
             Frame::new()
                 .fill(pal.bg)
@@ -2189,7 +2235,7 @@ impl App {
                         label(ui, "เซิร์ฟเวอร์");
                         ui.add(
                             TextEdit::singleline(&mut self.setup.server)
-                                .hint_text("https://redesk.example.com")
+                                .hint_text("https://aegiron.example.com")
                                 .margin(Margin::symmetric(10, 8))
                                 .desired_width(f32::INFINITY),
                         );
@@ -2334,7 +2380,7 @@ impl App {
         }
     }
 
-    /// Confirms a `redesk://` link before connecting: a web page must not be able to make this
+    /// Confirms a `aegiron://` link before connecting: a web page must not be able to make this
     /// app announce the user to an arbitrary device without a click.
     fn link_modal(&mut self, ui: &mut Ui) {
         let Some(id) = self.link_prompt.clone() else { return };

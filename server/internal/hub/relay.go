@@ -10,7 +10,7 @@ import (
 
 	"github.com/coder/websocket"
 
-	"redesk/server/internal/auth"
+	"aegiron/server/internal/auth"
 )
 
 // relay pairs one viewer and one agent connection for a single remote session.

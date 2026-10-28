@@ -5,9 +5,9 @@
 #   deploy/windows/build-installer.sh
 #
 # Pre-configured installer for your organisation (users just click Next; also used by /S):
-#   SERVER_URL=https://redesk.example.com SERVER_KEY=<key from Server settings> deploy/windows/build-installer.sh
+#   SERVER_URL=https://aegiron.example.com SERVER_KEY=<key from Server settings> deploy/windows/build-installer.sh
 #
-# Output: dist/ReDesk-Agent-Setup-<version>[-<host>].exe and its SHA-256.
+# Output: dist/Aegiron-Agent-Setup-<version>[-<host>].exe and its SHA-256.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -23,9 +23,9 @@ if [ -n "$SERVER_URL" ]; then
 	case "$SERVER_URL" in https://*) ;; *) echo "SERVER_URL must start with https://"; exit 1 ;; esac
 	echo "$SERVER_KEY" | grep -Eq '^[A-Za-z0-9+/]{43}=$' || { echo "SERVER_KEY must be the 44-character base64 key from Server settings"; exit 1; }
 	host="${SERVER_URL#https://}"; host="${host%%/*}"; host="${host%%:*}"
-	OUT="ReDesk-Agent-Setup-$VERSION-$host.exe"
+	OUT="Aegiron-Agent-Setup-$VERSION-$host.exe"
 else
-	OUT="ReDesk-Agent-Setup-$VERSION.exe"
+	OUT="Aegiron-Agent-Setup-$VERSION.exe"
 fi
 
 echo "==> Building Windows binaries ($TARGET)"
@@ -40,7 +40,7 @@ makensis -V2 -INPUTCHARSET UTF8 \
 	-DSERVER_URL="$SERVER_URL" \
 	-DSERVER_KEY="$SERVER_KEY" \
 	-DOUTFILE="$ROOT/dist/$OUT" \
-	"$ROOT/deploy/windows/redesk-agent.nsi"
+	"$ROOT/deploy/windows/aegiron-agent.nsi"
 
 (cd "$ROOT/dist" && shasum -a 256 "$OUT" | tee "$OUT.sha256")
 echo "==> dist/$OUT"

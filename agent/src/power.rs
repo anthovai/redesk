@@ -163,10 +163,10 @@ mod tests {
     #[test]
     fn guard_is_send_and_releases() {
         assert_send::<KeepAwake>(); // held across .await in session tasks
-        let g = KeepAwake::new("ReDesk test");
+        let g = KeepAwake::new("Aegiron test");
         assert!(g.active());
         drop(g);
-        let g2 = KeepAwake::new("ReDesk test 2");
+        let g2 = KeepAwake::new("Aegiron test 2");
         assert!(g2.active());
     }
 }

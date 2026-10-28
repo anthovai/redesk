@@ -1,4 +1,6 @@
-# ReDesk protocol (v1)
+# Aegiron protocol (v1)
+
+> The product was called ReDesk before 0.5.0. Signature and key-derivation labels (`redesk-register-v1`, `redesk-server-v1`, `redesk-kx-v1`, `redesk v1 …`), the vault AAD and the LAN discovery magic keep that name on purpose: they are part of the wire format, so agents, servers and stored secrets from before the rename keep working. The server also accepts the old `X-ReDesk` header and `REDESK_*` environment variables.
 
 Everything runs over one HTTPS port (default `21114`): REST API, agent signaling (`/ws/agent`) and the relay (`/ws/relay`).
 
@@ -37,7 +39,7 @@ agent  → viewer {"t":"hello","v":1,"epk":...,"sig":Ed25519(device_key, transcr
 transcript = "redesk-kx-v1" || sid || viewer_epk || agent_epk
 ```
 
-The viewer verifies `sig` against the device public key fetched from the API. That key was bound at registration, so a relay or server that swaps keys cannot impersonate the device. The UI shows the key's fingerprint, which can be compared with `redesk-agent info`.
+The viewer verifies `sig` against the device public key fetched from the API. That key was bound at registration, so a relay or server that swaps keys cannot impersonate the device. The UI shows the key's fingerprint, which can be compared with `aegiron-agent info`.
 
 ```
 shared  = X25519(viewer_esk, agent_epk)

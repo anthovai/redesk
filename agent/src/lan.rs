@@ -195,7 +195,7 @@ pub fn wake(macs: &[Mac]) -> usize {
     }
     // Debug builds only: copy to a loopback port so tests can observe packets without LAN access.
     #[cfg(debug_assertions)]
-    if let Some(a) = std::env::var("REDESK_WOL_DEBUG_TARGET").ok().and_then(|t| t.parse::<SocketAddrV4>().ok())
+    if let Some(a) = std::env::var("AEGIRON_WOL_DEBUG_TARGET").ok().and_then(|t| t.parse::<SocketAddrV4>().ok())
         && a.ip().is_loopback()
     {
         sent += send_magic(Ipv4Addr::LOCALHOST, &[a], macs);
@@ -472,7 +472,7 @@ mod tests {
         let key = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
         let cfg = crate::config::Config::new("http://localhost:1".into(), key).unwrap();
         let id = cfg.id.clone();
-        let agent = Agent::new(cfg, std::env::temp_dir().join("redesk-lan-test.toml"), None).unwrap();
+        let agent = Agent::new(cfg, std::env::temp_dir().join("aegiron-lan-test.toml"), None).unwrap();
         let port = UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         tokio::spawn(listen(agent.clone(), port));
         tokio::time::sleep(Duration::from_millis(200)).await;

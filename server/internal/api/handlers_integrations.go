@@ -7,8 +7,8 @@ import (
 	"net/http"
 	"time"
 
-	"redesk/server/internal/integrations"
-	"redesk/server/internal/store"
+	"aegiron/server/internal/integrations"
+	"aegiron/server/internal/store"
 )
 
 func supportedIntegration(w http.ResponseWriter, r *http.Request) (string, bool) {

@@ -1,4 +1,4 @@
-//! ReDesk agent: makes this machine reachable for remote control through a self-hosted ReDesk server.
+//! Aegiron agent: makes this machine reachable for remote control through a self-hosted Aegiron server.
 
 use std::path::PathBuf;
 
@@ -7,13 +7,13 @@ use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use clap::{Parser, Subcommand};
 use tokio::io::AsyncBufReadExt;
 
-use redesk_agent::config::{ApproveMode, Config, Verification};
-use redesk_agent::{fingerprint, identity, service, signal};
+use aegiron_agent::config::{ApproveMode, Config, Verification};
+use aegiron_agent::{fingerprint, identity, service, signal};
 
 #[derive(Parser)]
-#[command(name = "redesk-agent", version, about = "ReDesk remote desktop agent")]
+#[command(name = "aegiron-agent", version, about = "Aegiron remote desktop agent")]
 struct Cli {
-    /// Config file (default: <user config dir>/ReDesk/agent.toml)
+    /// Config file (default: <user config dir>/Aegiron/agent.toml)
     #[arg(long, global = true)]
     config: Option<PathBuf>,
     #[command(subcommand)]
@@ -24,7 +24,7 @@ struct Cli {
 enum Cmd {
     /// Create a new identity bound to a server.
     Init {
-        /// Server URL, e.g. https://redesk.example.com
+        /// Server URL, e.g. https://aegiron.example.com
         #[arg(long)]
         server: String,
         /// Server public key (shown in the console under Settings and in the server log)
@@ -40,10 +40,10 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
-    /// Sign in with a ReDesk account. On a new machine this also creates the device identity
+    /// Sign in with a Aegiron account. On a new machine this also creates the device identity
     /// and enrolls it under that account (no server key or token needed).
     Login {
-        /// Server URL (only needed the first time), e.g. https://redesk.example.com
+        /// Server URL (only needed the first time), e.g. https://aegiron.example.com
         #[arg(long)]
         server: Option<String>,
         #[arg(long)]
@@ -115,20 +115,20 @@ async fn main() -> Result<()> {
                 (None, None) => bail!("--server is required on a new machine"),
             };
             let insecure = insecure || existing.as_ref().is_some_and(|c| c.allow_insecure_transport);
-            // REDESK_LOGIN_PASSWORD allows unattended scripts; interactive use prompts without echo.
-            let password = match std::env::var("REDESK_LOGIN_PASSWORD") {
+            // AEGIRON_LOGIN_PASSWORD allows unattended scripts; interactive use prompts without echo.
+            let password = match std::env::var("AEGIRON_LOGIN_PASSWORD") {
                 Ok(p) if !p.is_empty() => p,
                 _ => rpassword::prompt_password(format!("Password for {email}: "))?,
             };
             let mut totp = String::new();
             let session = loop {
-                match redesk_agent::account::login(&server, insecure, &email, &password, &totp)? {
-                    redesk_agent::account::Login::Ok(s) => break s,
-                    redesk_agent::account::Login::NeedTotp if totp.is_empty() => totp = rpassword::prompt_password("2FA code: ")?,
-                    redesk_agent::account::Login::NeedTotp => bail!("invalid authentication code"),
+                match aegiron_agent::account::login(&server, insecure, &email, &password, &totp)? {
+                    aegiron_agent::account::Login::Ok(s) => break s,
+                    aegiron_agent::account::Login::NeedTotp if totp.is_empty() => totp = rpassword::prompt_password("2FA code: ")?,
+                    aegiron_agent::account::Login::NeedTotp => bail!("invalid authentication code"),
                 }
             };
-            let account = redesk_agent::config::Account { email: session.user.email.clone(), name: session.user.name.clone(), token: session.token };
+            let account = aegiron_agent::config::Account { email: session.user.email.clone(), name: session.user.name.clone(), token: session.token };
             let c = match existing {
                 Some(mut c) => {
                     if c.server_key != session.server_key {
@@ -158,7 +158,7 @@ async fn main() -> Result<()> {
             if rpassword::prompt_password("Repeat: ")? != pw {
                 bail!("passwords do not match");
             }
-            c.permanent_password = Some(redesk_agent::hash_password(&pw)?);
+            c.permanent_password = Some(aegiron_agent::hash_password(&pw)?);
             if c.verification == Verification::Temporary {
                 c.verification = Verification::Both;
             }
@@ -169,7 +169,7 @@ async fn main() -> Result<()> {
             let mut c = Config::load(&path)?;
             if let Some(v) = verification {
                 if v != Verification::Temporary && c.permanent_password.is_none() {
-                    bail!("run `redesk-agent set-password` first");
+                    bail!("run `aegiron-agent set-password` first");
                 }
                 c.verification = v;
             }
@@ -202,7 +202,7 @@ async fn main() -> Result<()> {
             let c = Config::load(&path)?;
             service::install(&path)?;
             if c.verification == Verification::Temporary && c.approve_mode == ApproveMode::Password {
-                println!("Note: no terminal is attached to the service. Read the one-time password with `redesk-agent show-password`,");
+                println!("Note: no terminal is attached to the service. Read the one-time password with `aegiron-agent show-password`,");
                 println!("      or use `set-password` / `set --approve-mode click` for people who connect to this machine.");
             }
             if cfg!(target_os = "macos") {
@@ -224,7 +224,7 @@ async fn main() -> Result<()> {
                 }
             });
             let agent = signal::Agent::new(c, path, Some(line_rx))?;
-            println!("ReDesk agent {}  —  ID: {}", env!("CARGO_PKG_VERSION"), id);
+            println!("Aegiron agent {}  —  ID: {}", env!("CARGO_PKG_VERSION"), id);
             agent.rotate_temp_password();
             tokio::select! {
                 _ = signal::run_forever(agent) => {}

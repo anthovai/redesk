@@ -28,7 +28,7 @@ pub enum ApproveMode {
     Both,
 }
 
-/// The person signed in from the desktop app (bearer token for the ReDesk API).
+/// The person signed in from the desktop app (bearer token for the Aegiron API).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
     pub email: String,
@@ -131,12 +131,14 @@ impl Config {
     }
 
     pub fn default_path() -> PathBuf {
-        dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("ReDesk").join("agent.toml")
+        let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+        migrate_legacy_dir(&base.join("ReDesk"), &base.join("Aegiron"));
+        base.join("Aegiron").join("agent.toml")
     }
 
     pub fn load(path: &Path) -> Result<Self> {
         let s = std::fs::read_to_string(path)
-            .with_context(|| format!("cannot read {} (run `redesk-agent init` first)", path.display()))?;
+            .with_context(|| format!("cannot read {} (run `aegiron-agent init` first)", path.display()))?;
         toml::from_str(&s).context("invalid agent config")
     }
 
@@ -176,5 +178,37 @@ impl Config {
             other => bail!("unsupported scheme {other}"),
         };
         Ok(format!("{ws}://{rest}"))
+    }
+}
+
+/// Moves the settings folder of a pre-rename (ReDesk) install to the Aegiron folder once, so
+/// the device keeps its ID, key, sign-in and history. Does nothing when the new folder exists.
+pub fn migrate_legacy_dir(old: &Path, new: &Path) {
+    if new.exists() || !old.join("agent.toml").is_file() {
+        return;
+    }
+    if let Err(e) = std::fs::rename(old, new) {
+        tracing::warn!("could not move {} to {}: {e}", old.display(), new.display());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_folder_moves_once() {
+        let root = std::env::temp_dir().join(format!("aegiron-migrate-test-{}", std::process::id()));
+        let (old, new) = (root.join("ReDesk"), root.join("Aegiron"));
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("agent.toml"), "id = \"1\"").unwrap();
+        migrate_legacy_dir(&old, &new);
+        assert!(new.join("agent.toml").is_file() && !old.exists());
+        // A second old folder never overwrites the migrated one.
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("agent.toml"), "id = \"2\"").unwrap();
+        migrate_legacy_dir(&old, &new);
+        assert_eq!(std::fs::read_to_string(new.join("agent.toml")).unwrap(), "id = \"1\"");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

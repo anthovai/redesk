@@ -1,13 +1,13 @@
-//! ReDesk desktop app: the agent with a window and a tray icon.
+//! Aegiron desktop app: the agent with a window and a tray icon.
 //!
-//!   redesk [--config PATH] [--background] [redesk://connect/<id>]
+//!   aegiron [--config PATH] [--background] [aegiron://connect/<id>]
 //!
 //! `--background` starts hidden in the tray (used by autostart). Launching it again while it
-//! runs just brings the existing window to the front, or hands it the `redesk://` link
+//! runs just brings the existing window to the front, or hands it the `aegiron://` link
 //! (registered as a URL handler by the Windows installer, which passes it as "%1").
 //! macOS delivers URL-scheme launches as an Apple Event (`application:openURLs:`), not as an
 //! argument; winit 0.30 / eframe 0.37 do not expose that event, so on macOS a link currently
-//! works only when passed explicitly (`open -a ReDesk --args redesk://connect/<id>`).
+//! works only when passed explicitly (`open -a Aegiron --args aegiron://connect/<id>`).
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::io::{Read, Write};
@@ -18,10 +18,11 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use eframe::egui;
-use redesk_agent::config::Config;
-use redesk_agent::local::{self, LocalState};
-use redesk_agent::signal::Agent;
-use redesk_agent::ui::{self, App, OpenRequests, Options, ShowSignal};
+use aegiron_agent::config::Config;
+use aegiron_agent::local::{self, LocalState};
+use aegiron_agent::service;
+use aegiron_agent::signal::Agent;
+use aegiron_agent::ui::{self, App, OpenRequests, Options, ShowSignal};
 
 /// Loopback port used to find an already running instance (per machine).
 const INSTANCE_PORT: u16 = 21119;
@@ -37,15 +38,15 @@ fn main() -> eframe::Result {
         match a.as_str() {
             "--background" => background = true,
             "--config" => config_path = args.next().map(PathBuf::from).unwrap_or(config_path),
-            url if url.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("redesk:")) => match local::parse_link(url) {
+            url if ["aegiron:", "redesk:"].iter().any(|s| url.get(..s.len()).is_some_and(|p| p.eq_ignore_ascii_case(s))) => match local::parse_link(url) {
                 Some(id) => link = Some(id),
                 None => bad_link = Some(url.chars().take(80).collect::<String>()),
             },
             _ => {}
         }
     }
-    let screenshot = std::env::var_os("REDESK_UI_SCREENSHOT").map(PathBuf::from);
-    let demo = std::env::var("REDESK_UI_DEMO").ok();
+    let screenshot = std::env::var_os("AEGIRON_UI_SCREENSHOT").map(PathBuf::from);
+    let demo = std::env::var("AEGIRON_UI_DEMO").ok();
     init_logging();
     if let Some(u) = bad_link {
         tracing::warn!("ignoring invalid link {u:?}");
@@ -67,12 +68,20 @@ fn main() -> eframe::Result {
         Some(v) if v == "setup" => None,
         Some(_) => {
             let key = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [7u8; 32]);
-            let mut c = Config::new("https://redesk.kgarden.co.th".into(), key).expect("demo config");
+            let mut c = Config::new("https://aegiron.kgarden.co.th".into(), key).expect("demo config");
             c.id = "895698986".into();
-            Agent::new(c, std::env::temp_dir().join("redesk-demo.toml"), None).ok()
+            Agent::new(c, std::env::temp_dir().join("aegiron-demo.toml"), None).ok()
         }
         None => match Config::load(&config_path) {
             Ok(c) => match Agent::new(c, config_path.clone(), None) {
+                Ok(a) if screenshot.is_none() => {
+                    match service::migrate_legacy(&config_path) {
+                        Ok(true) => tracing::info!("moved ReDesk's start-at-login entry to Aegiron"),
+                        Ok(false) => {}
+                        Err(e) => tracing::warn!("could not migrate ReDesk's start-at-login entry: {e:#}"),
+                    }
+                    Some(a)
+                }
                 Ok(a) => Some(a),
                 Err(e) => {
                     tracing::error!("invalid config {}: {e:#}", config_path.display());
@@ -105,14 +114,14 @@ fn main() -> eframe::Result {
     let launch = |renderer| {
         let (opts, agent, demo, ctx_cell, show, quit) =
             (opts.clone(), agent.clone(), demo.clone(), ctx_cell.clone(), show.clone(), quit.clone());
-        // REDESK_UI_SIZE="WxH" overrides the size (screenshots of long views).
-        let forced = std::env::var("REDESK_UI_SIZE").ok().and_then(|s| {
+        // AEGIRON_UI_SIZE="WxH" overrides the size (screenshots of long views).
+        let forced = std::env::var("AEGIRON_UI_SIZE").ok().and_then(|s| {
             let (w, h) = s.split_once('x')?;
             Some([w.parse::<f32>().ok()?, h.parse::<f32>().ok()?])
         });
         let size = forced.unwrap_or(geom.map_or(MAIN_SIZE, |g| [g.size[0].max(MAIN_MIN[0]), g.size[1].max(MAIN_MIN[1])]));
         let mut viewport = egui::ViewportBuilder::default()
-            .with_title("ReDesk")
+            .with_title("Aegiron")
             .with_inner_size(size)
             .with_min_inner_size(MAIN_MIN)
             .with_icon(Arc::new(egui::IconData { rgba: ui::icon_rgba(64), width: 64, height: 64 }))
@@ -126,7 +135,7 @@ fn main() -> eframe::Result {
             ..Default::default()
         };
         eframe::run_native(
-            "ReDesk",
+            "Aegiron",
             options,
             Box::new(move |cc| {
                 let _ = ctx_cell.set(cc.egui_ctx.clone());
@@ -148,13 +157,13 @@ fn main() -> eframe::Result {
 }
 
 /// Messages a second launch sends to the running instance (one per connection):
-/// `redesk-show`, or `redesk-open <9-digit id>` for a `redesk://` link.
+/// `aegiron-show`, or `aegiron-open <9-digit id>` for a `aegiron://` link.
 fn parse_instance_msg(raw: &[u8]) -> Option<Option<String>> {
     let msg = std::str::from_utf8(raw).ok()?.trim_end();
-    if msg == "redesk-show" {
+    if msg == "aegiron-show" {
         return Some(None);
     }
-    let id = msg.strip_prefix("redesk-open ")?;
+    let id = msg.strip_prefix("aegiron-open ")?;
     local::normalize_id(id).filter(|n| n == id).map(Some)
 }
 
@@ -183,8 +192,8 @@ fn claim_single_instance(show: ShowSignal, open: OpenRequests, ctx: Arc<OnceLock
         Err(_) => {
             if let Ok(mut s) = TcpStream::connect_timeout(&([127, 0, 0, 1], INSTANCE_PORT).into(), Duration::from_secs(1)) {
                 let msg = match link {
-                    Some(id) => format!("redesk-open {id}"),
-                    None => "redesk-show".to_string(),
+                    Some(id) => format!("aegiron-open {id}"),
+                    None => "aegiron-show".to_string(),
                 };
                 let _ = s.write_all(msg.as_bytes());
                 return false;
@@ -195,9 +204,9 @@ fn claim_single_instance(show: ShowSignal, open: OpenRequests, ctx: Arc<OnceLock
 }
 
 fn init_logging() {
-    let dir = dirs::data_local_dir().unwrap_or_else(std::env::temp_dir).join("ReDesk");
+    let dir = dirs::data_local_dir().unwrap_or_else(std::env::temp_dir).join("Aegiron");
     let _ = std::fs::create_dir_all(&dir);
-    let file = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("redesk.log"));
+    let file = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("aegiron.log"));
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
     match file {
         Ok(f) => tracing_subscriber::fmt().with_env_filter(filter).with_ansi(false).with_writer(std::sync::Mutex::new(f)).init(),
@@ -212,8 +221,8 @@ mod tray {
     use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 
     pub fn create(ctx: &egui::Context, show: ShowSignal, quit: Arc<AtomicBool>) {
-        let open = MenuItem::new("เปิด ReDesk", true, None);
-        let exit = MenuItem::new("ออกจาก ReDesk", true, None);
+        let open = MenuItem::new("เปิด Aegiron", true, None);
+        let exit = MenuItem::new("ออกจาก Aegiron", true, None);
         let menu = Menu::new();
         let _ = menu.append(&open);
         let _ = menu.append(&PredefinedMenuItem::separator());
@@ -221,7 +230,7 @@ mod tray {
         let (open_id, exit_id) = (open.id().clone(), exit.id().clone());
 
         let Ok(icon) = Icon::from_rgba(ui::icon_rgba(32), 32, 32) else { return };
-        match TrayIconBuilder::new().with_menu(Box::new(menu)).with_tooltip("ReDesk").with_icon(icon).build() {
+        match TrayIconBuilder::new().with_menu(Box::new(menu)).with_tooltip("Aegiron").with_icon(icon).build() {
             Ok(tray) => {
                 // Lives for the whole process.
                 Box::leak(Box::new(tray));
@@ -263,10 +272,10 @@ mod tests {
 
     #[test]
     fn instance_messages() {
-        assert_eq!(parse_instance_msg(b"redesk-show"), Some(None));
-        assert_eq!(parse_instance_msg(b"redesk-open 123456789"), Some(Some("123456789".into())));
-        assert_eq!(parse_instance_msg(b"redesk-open 123456789\n"), Some(Some("123456789".into())));
-        for bad in [&b"redesk-open 12345678"[..], b"redesk-open 123 456 789", b"redesk-open 123456789x", b"redesk-open ", b"hello", b"\xff\xfe", b""] {
+        assert_eq!(parse_instance_msg(b"aegiron-show"), Some(None));
+        assert_eq!(parse_instance_msg(b"aegiron-open 123456789"), Some(Some("123456789".into())));
+        assert_eq!(parse_instance_msg(b"aegiron-open 123456789\n"), Some(Some("123456789".into())));
+        for bad in [&b"aegiron-open 12345678"[..], b"aegiron-open 123 456 789", b"aegiron-open 123456789x", b"aegiron-open ", b"hello", b"\xff\xfe", b""] {
             assert_eq!(parse_instance_msg(bad), None);
         }
     }

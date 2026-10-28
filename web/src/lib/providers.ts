@@ -7,7 +7,7 @@ export interface ProviderInfo {
 	kind: 'vendor' | 'protocol';
 	addressLabel: string;
 	addressHint: string;
-	gateway: boolean; // can open in the browser through the ReDesk gateway
+	gateway: boolean; // can open in the browser through the Aegiron gateway
 }
 
 export const providers: Record<Provider, ProviderInfo> = {

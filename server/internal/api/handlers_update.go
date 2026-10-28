@@ -15,7 +15,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 
-	"redesk/server/internal/store"
+	"aegiron/server/internal/store"
 )
 
 // Agent update distribution: admins upload vetted builds, apps ask for the newest enabled
@@ -162,7 +162,7 @@ func releaseFilename(name, version, osName, arch string) string {
 		out = out[len(out)-128:]
 	}
 	if out == "" || out == "_" {
-		out = "redesk-" + version + "-" + osName + "-" + arch
+		out = "aegiron-" + version + "-" + osName + "-" + arch
 	}
 	return out
 }

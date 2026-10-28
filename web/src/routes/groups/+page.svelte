@@ -61,7 +61,7 @@
 	}
 </script>
 
-<svelte:head><title>กลุ่มอุปกรณ์ · ReDesk</title></svelte:head>
+<svelte:head><title>กลุ่มอุปกรณ์ · Aegiron</title></svelte:head>
 
 <div class="mb-6 flex flex-wrap items-end justify-between gap-4">
 	<div>

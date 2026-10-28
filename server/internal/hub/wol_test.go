@@ -4,7 +4,7 @@ import (
 	"reflect"
 	"testing"
 
-	"redesk/server/internal/store"
+	"aegiron/server/internal/store"
 )
 
 func TestCleanMacs(t *testing.T) {

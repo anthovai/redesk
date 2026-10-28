@@ -86,7 +86,7 @@
 		setTimeout(() => (toast = null), 4000);
 	}
 
-	let view = $state(savedView('redesk.devices.view'));
+	let view = $state(savedView('aegiron.devices.view'));
 
 	const canConnect = (d: Device) => d.online && !d.disabled;
 	function peerActions(d: Device): PeerAction[] {
@@ -103,7 +103,7 @@
 	}
 </script>
 
-<svelte:head><title>อุปกรณ์ทั้งหมด · ReDesk</title></svelte:head>
+<svelte:head><title>อุปกรณ์ทั้งหมด · Aegiron</title></svelte:head>
 
 <div class="mb-6 flex flex-wrap items-end justify-between gap-4">
 	<div>
@@ -121,7 +121,7 @@
 			<Icon name="search" class="pointer-events-none absolute top-1/2 left-3 -translate-y-1/2 text-muted" />
 			<input class="input w-64 pl-9" placeholder="ค้นหา ID, ชื่อเครื่อง, IP" bind:value={filter} />
 		</div>
-		<ViewToggle bind:value={view} onchange={(v) => saveView('redesk.devices.view', v)} />
+		<ViewToggle bind:value={view} onchange={(v) => saveView('aegiron.devices.view', v)} />
 	</div>
 </div>
 

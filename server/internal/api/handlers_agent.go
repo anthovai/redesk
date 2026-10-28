@@ -9,8 +9,8 @@ import (
 
 	"github.com/pquerna/otp/totp"
 
-	"redesk/server/internal/auth"
-	"redesk/server/internal/store"
+	"aegiron/server/internal/auth"
+	"aegiron/server/internal/store"
 )
 
 const agentSessionLifetime = 30 * 24 * time.Hour
@@ -77,7 +77,7 @@ func (a *API) issueAppSession(w http.ResponseWriter, r *http.Request, u *store.U
 	ip := a.clientIP(r)
 	device = trim(device, 80)
 	tok := auth.RandomToken(32)
-	if err := a.store.CreateAuthSession(r.Context(), auth.HashToken(tok), u.ID, ip, "ReDesk app: "+device,
+	if err := a.store.CreateAuthSession(r.Context(), auth.HashToken(tok), u.ID, ip, "Aegiron app: "+device,
 		time.Now().Add(agentSessionLifetime)); err != nil {
 		a.internal(w, err)
 		return

@@ -55,7 +55,7 @@
 	}
 </script>
 
-<svelte:head><title>บัญชีของฉัน · ReDesk</title></svelte:head>
+<svelte:head><title>บัญชีของฉัน · Aegiron</title></svelte:head>
 
 <h1 class="mb-1 text-2xl font-semibold tracking-tight">บัญชีของฉัน</h1>
 <p class="mb-6 text-sm text-muted">{auth.user?.email}</p>

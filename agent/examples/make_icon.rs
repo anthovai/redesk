@@ -1,4 +1,4 @@
-//! Regenerates assets/redesk.ico and assets/redesk.png from the app's icon drawing.
+//! Regenerates assets/aegiron.ico and assets/aegiron.png from the app's icon drawing.
 //!   cargo run --example make_icon
 //!   cargo run --example make_icon -- --iconset DIR   # macOS .iconset for iconutil (build-app.sh)
 use image::codecs::ico::{IcoEncoder, IcoFrame};
@@ -13,12 +13,12 @@ fn main() {
     }
     let frames: Vec<IcoFrame> = [16u32, 24, 32, 48, 64, 128, 256]
         .iter()
-        .map(|&s| IcoFrame::as_png(&redesk_agent::ui::icon_rgba(s), s, s, image::ExtendedColorType::Rgba8).unwrap())
+        .map(|&s| IcoFrame::as_png(&aegiron_agent::ui::icon_rgba(s), s, s, image::ExtendedColorType::Rgba8).unwrap())
         .collect();
-    let f = std::fs::File::create("assets/redesk.ico").unwrap();
+    let f = std::fs::File::create("assets/aegiron.ico").unwrap();
     IcoEncoder::new(f).encode_images(&frames).unwrap();
-    image::RgbaImage::from_raw(256, 256, redesk_agent::ui::icon_rgba(256)).unwrap().save("assets/redesk.png").unwrap();
-    println!("wrote assets/redesk.ico, assets/redesk.png");
+    image::RgbaImage::from_raw(256, 256, aegiron_agent::ui::icon_rgba(256)).unwrap().save("assets/aegiron.png").unwrap();
+    println!("wrote assets/aegiron.ico, assets/aegiron.png");
 }
 
 /// macOS app icon sizes. The artwork sits on the standard grid (824 of 1024 px, centred) so it
@@ -28,7 +28,7 @@ fn iconset(dir: &std::path::Path) {
     for (pt, scale) in [16u32, 32, 128, 256, 512].iter().flat_map(|&p| [(p, 1u32), (p, 2)]) {
         let px = pt * scale;
         let body = (px as f32 * 824.0 / 1024.0).round() as u32;
-        let art = image::RgbaImage::from_raw(body, body, redesk_agent::ui::icon_rgba(body)).unwrap();
+        let art = image::RgbaImage::from_raw(body, body, aegiron_agent::ui::icon_rgba(body)).unwrap();
         let mut canvas = image::RgbaImage::new(px, px);
         let off = ((px - body) / 2) as i64;
         image::imageops::overlay(&mut canvas, &art, off, off);

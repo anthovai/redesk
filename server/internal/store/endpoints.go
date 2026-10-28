@@ -211,7 +211,7 @@ func (s *Store) ListExternalSessions(ctx context.Context, limit int) ([]*Externa
 	return out, rows.Err()
 }
 
-// --- gateway sessions (stored alongside ReDesk sessions) ---
+// --- gateway sessions (stored alongside Aegiron sessions) ---
 
 func (s *Store) CreateGatewaySession(ctx context.Context, id string, endpointID, userID int64, viewerIP string) error {
 	_, err := s.DB.Exec(ctx, `INSERT INTO remote_sessions(id, endpoint_id, user_id, viewer_ip, started_at) VALUES ($1,$2,$3,$4,now())`,

@@ -12,9 +12,9 @@ import (
 
 	"github.com/coder/websocket"
 
-	"redesk/server/internal/auth"
-	"redesk/server/internal/gateway"
-	"redesk/server/internal/store"
+	"aegiron/server/internal/auth"
+	"aegiron/server/internal/gateway"
+	"aegiron/server/internal/store"
 )
 
 // Guacamole status codes, sent as the WebSocket close reason (the JS client parses them).

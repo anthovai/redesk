@@ -6,7 +6,7 @@ import (
 
 	"github.com/pquerna/otp/totp"
 
-	"redesk/server/internal/auth"
+	"aegiron/server/internal/auth"
 )
 
 func (a *API) serverInfo(w http.ResponseWriter, r *http.Request) {
@@ -21,7 +21,7 @@ func (a *API) serverInfo(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"oidc":           oidcInfo,
-		"name":           "ReDesk",
+		"name":           "Aegiron",
 		"version":        Version,
 		"public_key":     auth.PublicKeyB64(a.key),
 		"require_enroll": st.RequireEnroll,
@@ -117,7 +117,7 @@ func (a *API) totpSetup(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusConflict, "two-factor authentication is already enabled")
 		return
 	}
-	key, err := totp.Generate(totp.GenerateOpts{Issuer: "ReDesk", AccountName: u.Email})
+	key, err := totp.Generate(totp.GenerateOpts{Issuer: "Aegiron", AccountName: u.Email})
 	if err != nil {
 		a.internal(w, err)
 		return

@@ -493,7 +493,7 @@ fn start_upload(v: Arc<Viewer>, id: u32, path: PathBuf, out: mpsc::Sender<Vec<u8
             let mut f = tokio::fs::File::open(&path).await?;
             let size = f.metadata().await?.len();
             v.update(|st| st.transfers.push(Transfer { id, name: name.clone(), size, sent: 0, status: TransferStatus::Active }));
-            // Empty dir = the agent's ~/Downloads/ReDesk.
+            // Empty dir = the agent's ~/Downloads/Aegiron.
             out.send(proto::json(&json!({"t": "put", "id": id, "dir": "", "name": name, "size": size}))).await?;
             let mut buf = vec![0u8; 64 * 1024];
             let mut sent = 0u64;

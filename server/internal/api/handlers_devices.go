@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"redesk/server/internal/hub"
-	"redesk/server/internal/store"
+	"aegiron/server/internal/hub"
+	"aegiron/server/internal/store"
 )
 
 var deviceIDPattern = regexp.MustCompile(`^[0-9]{9}$`)

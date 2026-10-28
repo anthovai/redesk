@@ -22,7 +22,7 @@
 		no_email: 'บัญชี SSO ไม่มีอีเมล',
 		email_unverified: 'อีเมลของบัญชี SSO ยังไม่ได้รับการยืนยัน',
 		domain_not_allowed: 'โดเมนอีเมลนี้ไม่ได้รับอนุญาต',
-		no_account: 'ยังไม่มีบัญชี ReDesk สำหรับอีเมลนี้ กรุณาติดต่อผู้ดูแลระบบ',
+		no_account: 'ยังไม่มีบัญชี Aegiron สำหรับอีเมลนี้ กรุณาติดต่อผู้ดูแลระบบ',
 		disabled_account: 'บัญชีนี้ถูกปิดใช้งาน'
 	};
 	const ssoError = $derived.by(() => {
@@ -61,14 +61,14 @@
 	}
 </script>
 
-<svelte:head><title>เข้าสู่ระบบ · ReDesk</title></svelte:head>
+<svelte:head><title>เข้าสู่ระบบ · Aegiron</title></svelte:head>
 
 <div class="grid min-h-screen place-items-center px-4">
 	<div class="w-full max-w-sm">
 		<div class="mb-8 flex flex-col items-center gap-3 text-center">
 			<img src="/favicon.svg" alt="" class="size-12" />
 			<div>
-				<h1 class="text-xl font-semibold tracking-tight">ReDesk</h1>
+				<h1 class="text-xl font-semibold tracking-tight">Aegiron</h1>
 				<p class="mt-1 text-sm text-muted">ระบบรีโมตเดสก์ท็อปที่โฮสต์เอง</p>
 			</div>
 		</div>
@@ -94,7 +94,7 @@
 						required
 						bind:value={totp}
 					/>
-					<p class="mt-2 text-xs text-muted">เปิดแอป Authenticator แล้วใส่รหัสของ ReDesk</p>
+					<p class="mt-2 text-xs text-muted">เปิดแอป Authenticator แล้วใส่รหัสของ Aegiron</p>
 				</div>
 			{/if}
 			{#if error || ssoError}

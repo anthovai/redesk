@@ -1,9 +1,9 @@
-; ReDesk agent installer for Windows (NSIS 3, per-user: no administrator rights needed).
+; Aegiron agent installer for Windows (NSIS 3, per-user: no administrator rights needed).
 ;
 ; Build:   deploy/windows/build-installer.sh            (see that script for options)
 ; Install: double-click, or silently for mass deployment (GPO / Intune / RMM):
-;   ReDesk-Agent-Setup.exe /S /SERVER=https://redesk.example.com /KEY=<server key> [/TOKEN=rdk_...]
-; Uninstall silently: "%LOCALAPPDATA%\Programs\ReDesk\uninstall.exe" /S   (keeps device identity)
+;   Aegiron-Agent-Setup.exe /S /SERVER=https://aegiron.example.com /KEY=<server key> [/TOKEN=rdk_...]
+; Uninstall silently: "%LOCALAPPDATA%\Programs\Aegiron\uninstall.exe" /S   (keeps device identity)
 
 Unicode true
 !include "MUI2.nsh"
@@ -28,33 +28,37 @@ Unicode true
   !define SERVER_KEY ""
 !endif
 !ifndef OUTFILE
-  !define OUTFILE "ReDesk-Agent-Setup-${VERSION}.exe"
+  !define OUTFILE "Aegiron-Agent-Setup-${VERSION}.exe"
 !endif
 
-!define UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\ReDesk"
+!define UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\Aegiron"
 !define RUN_KEY "Software\Microsoft\Windows\CurrentVersion\Run"
-; redesk://connect/<id> links open the app (per user, like RustDesk's rustdesk:// scheme).
-!define URL_KEY "Software\Classes\redesk"
+; aegiron://connect/<id> links open the app (per user, like RustDesk's rustdesk:// scheme).
+!define URL_KEY "Software\Classes\aegiron"
+; Names from before the rename to Aegiron: the old install is replaced, its settings kept and
+; its redesk:// links keep working.
+!define LEGACY_URL_KEY "Software\Classes\redesk"
+!define LEGACY_UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\ReDesk"
 
-Name "ReDesk"
+Name "Aegiron"
 OutFile "${OUTFILE}"
-InstallDir "$LOCALAPPDATA\Programs\ReDesk"
+InstallDir "$LOCALAPPDATA\Programs\Aegiron"
 RequestExecutionLevel user
 SetCompressor /SOLID lzma
-BrandingText "ReDesk ${VERSION}"
+BrandingText "Aegiron ${VERSION}"
 ShowInstDetails nevershow
 
 VIProductVersion "${VERSION}.0"
-VIAddVersionKey /LANG=1033 "ProductName" "ReDesk"
-VIAddVersionKey /LANG=1033 "FileDescription" "ReDesk agent setup"
+VIAddVersionKey /LANG=1033 "ProductName" "Aegiron"
+VIAddVersionKey /LANG=1033 "FileDescription" "Aegiron agent setup"
 VIAddVersionKey /LANG=1033 "FileVersion" "${VERSION}"
 VIAddVersionKey /LANG=1033 "ProductVersion" "${VERSION}"
-VIAddVersionKey /LANG=1033 "LegalCopyright" "ReDesk"
+VIAddVersionKey /LANG=1033 "LegalCopyright" "Aegiron"
 
-!define MUI_ICON "${ASSETS}\redesk.ico"
-!define MUI_UNICON "${ASSETS}\redesk.ico"
+!define MUI_ICON "${ASSETS}\aegiron.ico"
+!define MUI_UNICON "${ASSETS}\aegiron.ico"
 !define MUI_ABORTWARNING
-!define MUI_FINISHPAGE_RUN "$INSTDIR\redesk.exe"
+!define MUI_FINISHPAGE_RUN "$INSTDIR\aegiron.exe"
 !define MUI_FINISHPAGE_RUN_TEXT "$(RunNow)"
 
 !insertmacro MUI_PAGE_WELCOME
@@ -67,10 +71,10 @@ Page custom ServerPage ServerPageLeave
 !insertmacro MUI_LANGUAGE "Thai"
 !insertmacro MUI_LANGUAGE "English"
 
-LangString ServerTitle ${LANG_THAI} "เชื่อมต่อกับเซิร์ฟเวอร์ ReDesk"
-LangString ServerTitle ${LANG_ENGLISH} "Connect to your ReDesk server"
-LangString ServerSub ${LANG_THAI} "เว้นว่างไว้ได้ แล้วเข้าสู่ระบบด้วยบัญชี ReDesk ในโปรแกรม (ข้อมูลกุญแจอยู่ในคอนโซล หน้า ตั้งค่าเซิร์ฟเวอร์)"
-LangString ServerSub ${LANG_ENGLISH} "Optional: leave empty and sign in with your ReDesk account in the app instead (keys are under Server settings in the console)."
+LangString ServerTitle ${LANG_THAI} "เชื่อมต่อกับเซิร์ฟเวอร์ Aegiron"
+LangString ServerTitle ${LANG_ENGLISH} "Connect to your Aegiron server"
+LangString ServerSub ${LANG_THAI} "เว้นว่างไว้ได้ แล้วเข้าสู่ระบบด้วยบัญชี Aegiron ในโปรแกรม (ข้อมูลกุญแจอยู่ในคอนโซล หน้า ตั้งค่าเซิร์ฟเวอร์)"
+LangString ServerSub ${LANG_ENGLISH} "Optional: leave empty and sign in with your Aegiron account in the app instead (keys are under Server settings in the console)."
 LangString LblServer ${LANG_THAI} "ที่อยู่เซิร์ฟเวอร์"
 LangString LblServer ${LANG_ENGLISH} "Server address"
 LangString LblKey ${LANG_THAI} "กุญแจสาธารณะของเซิร์ฟเวอร์"
@@ -83,10 +87,10 @@ LangString ErrChars ${LANG_THAI} "ข้อมูลมีอักขระท�
 LangString ErrChars ${LANG_ENGLISH} "The values contain characters that are not allowed (spaces or quotes)."
 LangString ErrScheme ${LANG_THAI} "ที่อยู่เซิร์ฟเวอร์ต้องขึ้นต้นด้วย https://"
 LangString ErrScheme ${LANG_ENGLISH} "The server address must start with https://"
-LangString InitFailed ${LANG_THAI} "ตั้งค่าการเชื่อมต่อไม่สำเร็จ สามารถตั้งค่าใหม่ได้ในโปรแกรม ReDesk:"
-LangString InitFailed ${LANG_ENGLISH} "Could not configure the connection. You can set it up in the ReDesk app:"
-LangString RunNow ${LANG_THAI} "เปิด ReDesk ตอนนี้"
-LangString RunNow ${LANG_ENGLISH} "Start ReDesk now"
+LangString InitFailed ${LANG_THAI} "ตั้งค่าการเชื่อมต่อไม่สำเร็จ สามารถตั้งค่าใหม่ได้ในโปรแกรม Aegiron:"
+LangString InitFailed ${LANG_ENGLISH} "Could not configure the connection. You can set it up in the Aegiron app:"
+LangString RunNow ${LANG_THAI} "เปิด Aegiron ตอนนี้"
+LangString RunNow ${LANG_ENGLISH} "Start Aegiron now"
 LangString RemoveData ${LANG_THAI} "ลบการตั้งค่าและตัวตนของเครื่องนี้ด้วยหรือไม่?$\r$\n(ถ้าลบ เครื่องจะได้ ID ใหม่เมื่อติดตั้งอีกครั้ง)"
 LangString RemoveData ${LANG_ENGLISH} "Also remove settings and this device's identity?$\r$\n(If removed, the device gets a new ID when reinstalled.)"
 
@@ -136,7 +140,8 @@ Function .onInit
     StrCpy $Token $R1
   ${EndIf}
   StrCpy $Configured 0
-  ${If} ${FileExists} "$APPDATA\ReDesk\agent.toml"
+  ${If} ${FileExists} "$APPDATA\Aegiron\agent.toml"
+  ${OrIf} ${FileExists} "$APPDATA\ReDesk\agent.toml"
     StrCpy $Configured 1
   ${EndIf}
 FunctionEnd
@@ -193,16 +198,29 @@ Function ServerPageLeave
   ${Next}
 FunctionEnd
 
-Section "ReDesk" SecMain
-  ; Replace a running copy (upgrade).
+Section "Aegiron" SecMain
+  ; Replace a running copy (upgrade), including a ReDesk install from before the rename.
+  nsExec::Exec 'taskkill /IM aegiron.exe /F'
+  Pop $0
   nsExec::Exec 'taskkill /IM redesk.exe /F'
   Pop $0
+  nsExec::Exec 'taskkill /IM redesk-agent.exe /F'
+  Pop $0
   Sleep 800
+  ${If} ${FileExists} "$APPDATA\ReDesk\agent.toml"
+  ${AndIfNot} ${FileExists} "$APPDATA\Aegiron\agent.toml"
+    Rename "$APPDATA\ReDesk" "$APPDATA\Aegiron"
+  ${EndIf}
+  DeleteRegValue HKCU "${RUN_KEY}" "ReDesk"
+  DeleteRegKey HKCU "${LEGACY_UNINST_KEY}"
+  Delete "$SMPROGRAMS\ReDesk.lnk"
+  Delete "$DESKTOP\ReDesk.lnk"
+  RMDir /r "$LOCALAPPDATA\Programs\ReDesk"
 
   SetOutPath "$INSTDIR"
-  File "${SRC}\redesk.exe"
-  File "${SRC}\redesk-agent.exe"
-  File "${ASSETS}\redesk.ico"
+  File "${SRC}\aegiron.exe"
+  File "${SRC}\aegiron-agent.exe"
+  File "${ASSETS}\aegiron.ico"
 
   ; First install with server details: create this device's identity now.
   ${If} $Configured != 1
@@ -221,7 +239,7 @@ Section "ReDesk" SecMain
       ${If} $Token != ""
         StrCpy $R2 '--enroll-token "$Token"'
       ${EndIf}
-      nsExec::ExecToStack '"$INSTDIR\redesk-agent.exe" init --server "$Server" --key "$Key" $R2'
+      nsExec::ExecToStack '"$INSTDIR\aegiron-agent.exe" init --server "$Server" --key "$Key" $R2'
       Pop $0
       Pop $1
       ${If} $0 != 0
@@ -232,21 +250,25 @@ Section "ReDesk" SecMain
   ${EndIf}
 
   ; Start in the tray at logon (per user: screen capture needs the user's desktop session).
-  WriteRegStr HKCU "${RUN_KEY}" "ReDesk" '"$INSTDIR\redesk.exe" --background'
+  WriteRegStr HKCU "${RUN_KEY}" "Aegiron" '"$INSTDIR\aegiron.exe" --background'
 
-  WriteRegStr HKCU "${URL_KEY}" "" "URL:ReDesk"
+  WriteRegStr HKCU "${URL_KEY}" "" "URL:Aegiron"
   WriteRegStr HKCU "${URL_KEY}" "URL Protocol" ""
-  WriteRegStr HKCU "${URL_KEY}\DefaultIcon" "" '"$INSTDIR\redesk.exe",0'
-  WriteRegStr HKCU "${URL_KEY}\shell\open\command" "" '"$INSTDIR\redesk.exe" "%1"'
+  WriteRegStr HKCU "${URL_KEY}\DefaultIcon" "" '"$INSTDIR\aegiron.exe",0'
+  WriteRegStr HKCU "${URL_KEY}\shell\open\command" "" '"$INSTDIR\aegiron.exe" "%1"'
+  WriteRegStr HKCU "${LEGACY_URL_KEY}" "" "URL:Aegiron (ReDesk links)"
+  WriteRegStr HKCU "${LEGACY_URL_KEY}" "URL Protocol" ""
+  WriteRegStr HKCU "${LEGACY_URL_KEY}\DefaultIcon" "" '"$INSTDIR\aegiron.exe",0'
+  WriteRegStr HKCU "${LEGACY_URL_KEY}\shell\open\command" "" '"$INSTDIR\aegiron.exe" "%1"'
 
-  CreateShortcut "$SMPROGRAMS\ReDesk.lnk" "$INSTDIR\redesk.exe" "" "$INSTDIR\redesk.ico"
-  CreateShortcut "$DESKTOP\ReDesk.lnk" "$INSTDIR\redesk.exe" "" "$INSTDIR\redesk.ico"
+  CreateShortcut "$SMPROGRAMS\Aegiron.lnk" "$INSTDIR\aegiron.exe" "" "$INSTDIR\aegiron.ico"
+  CreateShortcut "$DESKTOP\Aegiron.lnk" "$INSTDIR\aegiron.exe" "" "$INSTDIR\aegiron.ico"
 
   WriteUninstaller "$INSTDIR\uninstall.exe"
-  WriteRegStr HKCU "${UNINST_KEY}" "DisplayName" "ReDesk"
+  WriteRegStr HKCU "${UNINST_KEY}" "DisplayName" "Aegiron"
   WriteRegStr HKCU "${UNINST_KEY}" "DisplayVersion" "${VERSION}"
-  WriteRegStr HKCU "${UNINST_KEY}" "Publisher" "ReDesk"
-  WriteRegStr HKCU "${UNINST_KEY}" "DisplayIcon" "$INSTDIR\redesk.ico"
+  WriteRegStr HKCU "${UNINST_KEY}" "Publisher" "Aegiron"
+  WriteRegStr HKCU "${UNINST_KEY}" "DisplayIcon" "$INSTDIR\aegiron.ico"
   WriteRegStr HKCU "${UNINST_KEY}" "InstallLocation" "$INSTDIR"
   WriteRegStr HKCU "${UNINST_KEY}" "UninstallString" '"$INSTDIR\uninstall.exe"'
   WriteRegStr HKCU "${UNINST_KEY}" "QuietUninstallString" '"$INSTDIR\uninstall.exe" /S'
@@ -257,26 +279,27 @@ Section "ReDesk" SecMain
 
   ; Silent installs have no finish page: start the agent in the tray right away.
   ${If} ${Silent}
-    Exec '"$INSTDIR\redesk.exe" --background'
+    Exec '"$INSTDIR\aegiron.exe" --background'
   ${EndIf}
 SectionEnd
 
 Section "Uninstall"
-  nsExec::Exec 'taskkill /IM redesk.exe /F'
+  nsExec::Exec 'taskkill /IM aegiron.exe /F'
   Pop $0
   Sleep 800
-  DeleteRegValue HKCU "${RUN_KEY}" "ReDesk"
+  DeleteRegValue HKCU "${RUN_KEY}" "Aegiron"
   DeleteRegKey HKCU "${URL_KEY}"
-  Delete "$SMPROGRAMS\ReDesk.lnk"
-  Delete "$DESKTOP\ReDesk.lnk"
-  Delete "$INSTDIR\redesk.exe"
-  Delete "$INSTDIR\redesk-agent.exe"
-  Delete "$INSTDIR\redesk.ico"
+  DeleteRegKey HKCU "${LEGACY_URL_KEY}"
+  Delete "$SMPROGRAMS\Aegiron.lnk"
+  Delete "$DESKTOP\Aegiron.lnk"
+  Delete "$INSTDIR\aegiron.exe"
+  Delete "$INSTDIR\aegiron-agent.exe"
+  Delete "$INSTDIR\aegiron.ico"
   Delete "$INSTDIR\uninstall.exe"
   RMDir "$INSTDIR"
   DeleteRegKey HKCU "${UNINST_KEY}"
   MessageBox MB_YESNO|MB_ICONQUESTION "$(RemoveData)" /SD IDNO IDNO keep
-    RMDir /r "$APPDATA\ReDesk"
-    RMDir /r "$LOCALAPPDATA\ReDesk"
+    RMDir /r "$APPDATA\Aegiron"
+    RMDir /r "$LOCALAPPDATA\Aegiron"
   keep:
 SectionEnd

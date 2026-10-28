@@ -48,7 +48,7 @@ export function formatId(id: string): string {
 	return id.replace(/(\d{3})(?=\d)/g, '$1 ');
 }
 
-/** SHA-256 based fingerprint of a base64 public key; matches `redesk-agent info`. */
+/** SHA-256 based fingerprint of a base64 public key; matches `aegiron-agent info`. */
 export async function fingerprint(b64: string): Promise<string> {
 	const raw = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
 	const h = new Uint8Array(await crypto.subtle.digest('SHA-256', raw)).slice(0, 8);

@@ -1,4 +1,4 @@
-// Typed client for the ReDesk server REST API.
+// Typed client for the Aegiron server REST API.
 
 export interface User {
 	id: number;
@@ -130,7 +130,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 		method,
 		credentials: 'same-origin',
 		headers: {
-			'X-ReDesk': '1',
+			'X-Aegiron': '1',
 			...(body !== undefined ? { 'Content-Type': 'application/json' } : {})
 		},
 		body: body !== undefined ? JSON.stringify(body) : undefined
@@ -142,7 +142,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 
 /** Multipart upload (e.g. agent releases); the browser sets the boundary header. */
 async function upload<T>(path: string, form: FormData): Promise<T> {
-	const res = await fetch(path, { method: 'POST', credentials: 'same-origin', headers: { 'X-ReDesk': '1' }, body: form });
+	const res = await fetch(path, { method: 'POST', credentials: 'same-origin', headers: { 'X-Aegiron': '1' }, body: form });
 	const data = await res.json().catch(() => ({}));
 	if (!res.ok) throw new ApiError(res.status, data.error ?? res.statusText);
 	return data as T;

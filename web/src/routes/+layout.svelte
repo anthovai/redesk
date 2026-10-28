@@ -41,7 +41,7 @@
 
 <svelte:head>
 	<link rel="icon" href="/favicon.svg" />
-	<title>ReDesk</title>
+	<title>Aegiron</title>
 </svelte:head>
 
 {#if !auth.loaded}
@@ -53,7 +53,7 @@
 		<aside class="flex shrink-0 flex-col border-line bg-surface md:sticky md:top-0 md:h-screen md:w-60 md:border-r">
 			<a href="/" class="flex items-center gap-2.5 px-5 py-4">
 				<img src="/favicon.svg" alt="" class="size-7" />
-				<span class="text-[15px] font-semibold tracking-tight">ReDesk</span>
+				<span class="text-[15px] font-semibold tracking-tight">Aegiron</span>
 			</a>
 			<nav class="flex gap-1 overflow-x-auto px-3 pb-3 md:flex-1 md:flex-col md:overflow-visible">
 				{#each nav.filter((n) => !n.admin || auth.user?.role === 'admin') as n (n.href)}

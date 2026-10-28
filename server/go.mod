@@ -1,4 +1,4 @@
-module redesk/server
+module aegiron/server
 
 go 1.27.2
 

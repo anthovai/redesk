@@ -1,5 +1,5 @@
 // Package integrations mirrors device inventories and connection reports from other
-// remote-desktop vendors into ReDesk.
+// remote-desktop vendors into Aegiron.
 //
 // TeamViewer: Web API v1 with a script token (Bearer). /devices lists the account's
 // devices; /reports/connections returns up to 1000 records per call and a next_offset
@@ -19,8 +19,8 @@ import (
 	"strings"
 	"time"
 
-	"redesk/server/internal/store"
-	"redesk/server/internal/vault"
+	"aegiron/server/internal/store"
+	"aegiron/server/internal/vault"
 )
 
 const TeamViewer = "teamviewer"

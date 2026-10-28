@@ -38,7 +38,7 @@
 			.join('  ');
 </script>
 
-<svelte:head><title>Audit log · ReDesk</title></svelte:head>
+<svelte:head><title>Audit log · Aegiron</title></svelte:head>
 
 <div class="mb-6 flex flex-wrap items-end justify-between gap-4">
 	<div>

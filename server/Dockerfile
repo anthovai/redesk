@@ -11,12 +11,12 @@ WORKDIR /src/server
 COPY server/go.mod server/go.sum ./
 RUN go mod download
 COPY server/ ./
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /redesk-server ./cmd/redesk-server
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /aegiron-server ./cmd/aegiron-server
 
 FROM gcr.io/distroless/static-debian12:nonroot
-COPY --from=server /redesk-server /redesk-server
+COPY --from=server /aegiron-server /aegiron-server
 COPY --from=web /src/web/build /web
-ENV REDESK_WEB_DIR=/web REDESK_DATA_DIR=/data
+ENV AEGIRON_WEB_DIR=/web AEGIRON_DATA_DIR=/data
 VOLUME /data
 EXPOSE 21114
-ENTRYPOINT ["/redesk-server"]
+ENTRYPOINT ["/aegiron-server"]

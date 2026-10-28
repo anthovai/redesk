@@ -79,7 +79,7 @@ pub enum ViewerMsg {
     /// List a directory ("" = home).
     #[serde(rename = "ls")]
     List { path: String },
-    /// Start an upload into `dir` ("" = ~/Downloads/ReDesk); chunks follow as MSG_FILE.
+    /// Start an upload into `dir` ("" = ~/Downloads/Aegiron); chunks follow as MSG_FILE.
     #[serde(rename = "put")]
     Put { id: u32, dir: String, name: String, size: u64 },
     #[serde(rename = "put_end")]
