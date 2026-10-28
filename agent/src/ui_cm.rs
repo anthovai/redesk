@@ -3,6 +3,57 @@
 use super::*;
 
 impl App {
+    /// Everything about incoming connections: approval requests and live sessions.
+    pub(super) fn connection_manager(&mut self, ui: &mut Ui) {
+        self.approval_modal(ui);
+    }
+
+    /// Who is controlling this machine right now, with a disconnect button each.
+    pub(super) fn sessions_list(&mut self, ui: &mut Ui, agent: &Agent) {
+        let pal = Palette::of(ui);
+        let sessions = agent.status.lock().unwrap().sessions.clone();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("ผู้ที่กำลังควบคุมเครื่องนี้").font(semi(16.0)).color(pal.fg));
+            if !sessions.is_empty() {
+                Frame::new().fill(pal.accent_soft).corner_radius(10).inner_margin(Margin::symmetric(8, 1)).show(ui, |ui| {
+                    ui.label(RichText::new(sessions.len().to_string()).font(semi(12.5)).color(pal.accent));
+                });
+            }
+        });
+        ui.add_space(4.0);
+        if sessions.is_empty() {
+            Frame::new().fill(pal.side).corner_radius(12).inner_margin(Margin::symmetric(20, 26)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.vertical_centered(|ui| {
+                    let (r, _) = ui.allocate_exact_size(vec2(28.0, 28.0), Sense::hover());
+                    paint_icon(ui, r, Icon::Monitor, pal.muted);
+                    ui.label(RichText::new("ยังไม่มีใครเชื่อมต่อกับเครื่องนี้").color(pal.fg));
+                    ui.label(RichText::new("เมื่อมีผู้ควบคุม จะแสดงที่นี่ และตัดการเชื่อมต่อได้ทุกเมื่อ").size(12.5).color(pal.muted));
+                });
+            });
+        }
+        for s in sessions {
+            Frame::new().stroke(Stroke::new(1.0, pal.line)).corner_radius(12).inner_margin(Margin::symmetric(14, 12)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    avatar(ui, &initials(&s.name, &s.email), 40.0);
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        let who = if s.name.is_empty() { s.email.clone() } else { s.name.clone() };
+                        ui.label(RichText::new(who).font(semi(14.5)).color(pal.fg));
+                        ui.label(RichText::new(format!("{} · {}", s.email, s.ip)).size(12.5).color(pal.muted));
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if secondary(ui, "ตัดการเชื่อมต่อ", Some(pal.danger)).clicked() {
+                            s.kill.notify_one();
+                        }
+                        ui.label(RichText::new(elapsed(s.started)).font(mono(13.0)).color(pal.muted));
+                    });
+                });
+            });
+        }
+    }
+
     pub(super) fn approval_modal(&mut self, ui: &mut Ui) {
         let Some((req, at)) = self.pending.front() else { return };
         let pal = Palette::of(ui);

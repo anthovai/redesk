@@ -3,7 +3,21 @@
 use super::*;
 
 impl App {
+    /// Gets the whole window below the tab bar.
     pub(super) fn settings(&mut self, ui: &mut Ui, agent: &Agent) {
+        Frame::new().inner_margin(Margin::symmetric(36, 28)).show(ui, |ui| {
+            if ui.add(Button::new(RichText::new("‹ กลับหน้าหลัก").color(Palette::of(ui).accent)).frame(false)).clicked() {
+                self.view = View::Home;
+            }
+            let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
+            if let Some(y) = self.demo_scroll {
+                scroll = scroll.vertical_scroll_offset(y);
+            }
+            scroll.show(ui, |ui| self.settings_body(ui, agent));
+        });
+    }
+
+    fn settings_body(&mut self, ui: &mut Ui, agent: &Agent) {
         let pal = Palette::of(ui);
         let c = agent.config.lock().unwrap().clone();
         ui.label(RichText::new("ตั้งค่า").font(semi(20.0)).color(pal.fg));

@@ -1283,30 +1283,29 @@ impl eframe::App for App {
             None => {
                 egui::CentralPanel::default().frame(Frame::new().fill(pal.side)).show(ui, |ui| self.welcome_view(ui));
             }
-            Some(agent) => {
-                egui::Panel::bottom("status")
-                    .exact_size(34.0)
-                    .resizable(false)
-                    .show_separator_line(false)
-                    .frame(Frame::new().fill(pal.side).inner_margin(Margin::symmetric(18, 0)).stroke(Stroke::new(1.0, pal.line)))
-                    .show(ui, |ui| self.status_bar(ui, &agent));
-                egui::Panel::left("this-device")
-                    .exact_size(SIDEBAR_WIDTH)
-                    .resizable(false)
-                    .show_separator_line(false)
-                    .frame(Frame::new().fill(pal.side).inner_margin(Margin { left: 28, right: 24, top: 24, bottom: 18 }))
-                    .show(ui, |ui| self.sidebar(ui, &agent));
-                egui::CentralPanel::default().frame(Frame::new().fill(pal.bg).inner_margin(Margin::symmetric(36, 28))).show(ui, |ui| {
-                    let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
-                    if let Some(y) = self.demo_scroll {
-                        scroll = scroll.vertical_scroll_offset(y);
-                    }
-                    scroll.show(ui, |ui| match self.view {
-                        View::Home => self.home(ui, &agent),
-                        View::Settings => self.settings(ui, &agent),
+            Some(agent) => match self.view {
+                // Settings take the whole window (own navigation and scrolling).
+                View::Settings => {
+                    egui::CentralPanel::default().frame(Frame::new().fill(pal.bg)).show(ui, |ui| self.settings(ui, &agent));
+                }
+                View::Home => {
+                    egui::Panel::bottom("status")
+                        .exact_size(34.0)
+                        .resizable(false)
+                        .show_separator_line(false)
+                        .frame(Frame::new().fill(pal.side).inner_margin(Margin::symmetric(18, 0)).stroke(Stroke::new(1.0, pal.line)))
+                        .show(ui, |ui| self.status_bar(ui, &agent));
+                    egui::Panel::left("this-device")
+                        .exact_size(SIDEBAR_WIDTH)
+                        .resizable(false)
+                        .show_separator_line(false)
+                        .frame(Frame::new().fill(pal.side).inner_margin(Margin { left: 28, right: 24, top: 24, bottom: 18 }))
+                        .show(ui, |ui| self.sidebar(ui, &agent));
+                    egui::CentralPanel::default().frame(Frame::new().fill(pal.bg).inner_margin(Margin::symmetric(36, 28))).show(ui, |ui| {
+                        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.home(ui, &agent));
                     });
-                });
-            }
+                }
+            },
         }
         if self.login_modal {
             self.login_modal(ui);
@@ -1319,7 +1318,7 @@ impl eframe::App for App {
             }
         }
         self.show_viewers(ui.ctx());
-        self.approval_modal(ui);
+        self.connection_manager(ui);
         self.toast_view(ui);
     }
 }
@@ -1518,47 +1517,7 @@ impl App {
         ui.add_space(28.0);
         self.address_book(ui, agent);
         ui.add_space(28.0);
-        let sessions = agent.status.lock().unwrap().sessions.clone();
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("ผู้ที่กำลังควบคุมเครื่องนี้").font(semi(16.0)).color(pal.fg));
-            if !sessions.is_empty() {
-                Frame::new().fill(pal.accent_soft).corner_radius(10).inner_margin(Margin::symmetric(8, 1)).show(ui, |ui| {
-                    ui.label(RichText::new(sessions.len().to_string()).font(semi(12.5)).color(pal.accent));
-                });
-            }
-        });
-        ui.add_space(4.0);
-        if sessions.is_empty() {
-            Frame::new().fill(pal.side).corner_radius(12).inner_margin(Margin::symmetric(20, 26)).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.vertical_centered(|ui| {
-                    let (r, _) = ui.allocate_exact_size(vec2(28.0, 28.0), Sense::hover());
-                    paint_icon(ui, r, Icon::Monitor, pal.muted);
-                    ui.label(RichText::new("ยังไม่มีใครเชื่อมต่อกับเครื่องนี้").color(pal.fg));
-                    ui.label(RichText::new("เมื่อมีผู้ควบคุม จะแสดงที่นี่ และตัดการเชื่อมต่อได้ทุกเมื่อ").size(12.5).color(pal.muted));
-                });
-            });
-        }
-        for s in sessions {
-            Frame::new().stroke(Stroke::new(1.0, pal.line)).corner_radius(12).inner_margin(Margin::symmetric(14, 12)).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    avatar(ui, &initials(&s.name, &s.email), 40.0);
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 0.0;
-                        let who = if s.name.is_empty() { s.email.clone() } else { s.name.clone() };
-                        ui.label(RichText::new(who).font(semi(14.5)).color(pal.fg));
-                        ui.label(RichText::new(format!("{} · {}", s.email, s.ip)).size(12.5).color(pal.muted));
-                    });
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if secondary(ui, "ตัดการเชื่อมต่อ", Some(pal.danger)).clicked() {
-                            s.kill.notify_one();
-                        }
-                        ui.label(RichText::new(elapsed(s.started)).font(mono(13.0)).color(pal.muted));
-                    });
-                });
-            });
-        }
+        self.sessions_list(ui, agent);
     }
 
     fn book_entry(&self, id: &str) -> Option<&BookEntry> {
