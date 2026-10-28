@@ -1743,7 +1743,7 @@ impl App {
             let edit = TextEdit::singleline(&mut self.remote_id)
                 .hint_text(RichText::new("ใส่ ID ของเครื่องปลายทาง").size(17.0))
                 .font(FontId::proportional(21.0))
-                .vertical_align(Align::Center)
+                .align(Align2::LEFT_CENTER)
                 .min_size(vec2(0.0, 46.0))
                 .margin(Margin::symmetric(14, 6))
                 .desired_width(f32::INFINITY);
