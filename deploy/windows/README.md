@@ -32,7 +32,7 @@ SERVER_URL=https://aegiron.kgarden.co.th SERVER_KEY='<server key>' deploy/window
 **หลายเครื่องพร้อมกัน (GPO / Intune / RMM):** รันในบริบทของผู้ใช้ (user context) ไม่ใช่ SYSTEM
 
 ```bat
-Aegiron-Agent-Setup-0.3.0.exe /S /SERVER=https://aegiron.kgarden.co.th /KEY=<server key> /TOKEN=rdk_...
+Aegiron-Agent-Setup-<version>.exe /S /SERVER=https://aegiron.kgarden.co.th /KEY=<server key> /TOKEN=rdk_...
 "%LOCALAPPDATA%\Programs\Aegiron\uninstall.exe" /S          :: ถอนการติดตั้งแบบเงียบ (เก็บ ID เครื่องไว้)
 ```
 

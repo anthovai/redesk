@@ -40,7 +40,7 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
-    /// Sign in with a Aegiron account. On a new machine this also creates the device identity
+    /// Sign in with an Aegiron account. On a new machine this also creates the device identity
     /// and enrolls it under that account (no server key or token needed).
     Login {
         /// Server URL (only needed the first time), e.g. https://aegiron.example.com

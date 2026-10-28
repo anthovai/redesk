@@ -458,7 +458,7 @@ func (a *API) oidcCallback(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, f.next, http.StatusSeeOther)
 }
 
-// oidcResolveUser maps verified claims to a Aegiron account. reason != "" means rejected.
+// oidcResolveUser maps verified claims to an Aegiron account. reason != "" means rejected.
 func (a *API) oidcResolveUser(ctx context.Context, s *store.OIDCSettings, cl *oidcClaims) (u *store.User, created bool, reason, email string) {
 	email = cl.Email
 	if email == "" && strings.Contains(cl.PreferredUsername, "@") {

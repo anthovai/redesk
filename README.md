@@ -1,186 +1,231 @@
-<p align="center"><img src="agent/assets/aegiron.png" width="96" alt="Aegiron"></p>
+<p align="center"><img src="agent/assets/aegiron.png" width="104" alt="Aegiron"></p>
 
-# Aegiron
+<h1 align="center">Aegiron</h1>
 
-> เดิมชื่อ **ReDesk** (ถึงเวอร์ชัน 0.4.0) — ดู [อัปเกรดจาก ReDesk](#อัปเกรดจาก-redesk)
+<p align="center">
+  <b>รีโมตเดสก์ท็อปที่องค์กรติดตั้งบนเซิร์ฟเวอร์ของตัวเอง</b><br>
+  ใช้งานแบบ RustDesk · เข้ารหัสต้นทาง-ปลายทาง · มีคอนโซลจัดการเครื่อง ผู้ใช้ และ audit ในที่เดียว
+</p>
 
-ระบบ remote desktop แบบโฮสต์เอง ออกแบบตามผลวิเคราะห์ใน [การวิเคราะห์ RustDesk.app (macOS).md](การวิเคราะห์%20RustDesk.app%20(macOS).md) และแก้จุดเสี่ยงที่พบในเอกสารนั้น
+<p align="center">
+  <a href="#ดาวน์โหลด">ดาวน์โหลด</a> ·
+  <a href="#เริ่มต้นใช้งาน">เริ่มต้นใช้งาน</a> ·
+  <a href="#ความปลอดภัย">ความปลอดภัย</a> ·
+  <a href="#พัฒนาต่อ">พัฒนาต่อ</a> ·
+  <a href="#อัปเกรดจาก-redesk">อัปเกรดจาก ReDesk</a>
+</p>
 
-| ส่วน | Stack | หน้าที่ (เทียบ RustDesk) |
-|---|---|---|
-| `server/` | Go 1.27, PostgreSQL 16, `coder/websocket`, `pgx` | hbbs (rendezvous) + hbbr (relay) + API server (Pro) รวมในไบนารีเดียว พอร์ตเดียว `21114` |
-| `agent/` | Rust (tokio, xcap, enigo, x25519/ed25519-dalek, aes-gcm) | ฝั่งเครื่องที่ถูกควบคุม: จับภาพจอ, รับ input, clipboard, เข้ารหัส E2E |
-| `web/` | Bun, SvelteKit 3 (Svelte 5), Tailwind 4, guacamole-common-js | เว็บคอนโซล (สมุดที่อยู่, อุปกรณ์, ผู้ใช้, audit, ตั้งค่า) + **ตัวควบคุมผ่านเบราว์เซอร์** |
-| guacd | Apache Guacamole (Docker) | engine โปรโตคอล RDP / VNC / SSH สำหรับ gateway ในเบราว์เซอร์ |
+<p align="center"><img src="docs/images/agent-home.png" width="760" alt="หน้าหลักของแอป Aegiron"></p>
 
-**รวมผู้ให้บริการอื่นไว้ในคอนโซลเดียว** (หน้า "การเชื่อมต่อ"): AnyDesk, TeamViewer, RustDesk (เปิดแอปของเจ้านั้น), RDP / VNC / SSH (เปิดในเบราว์เซอร์ผ่าน gateway) พร้อม vault รหัสผ่านที่เข้ารหัส, สิทธิ์ตามกลุ่ม, audit, ซิงก์อุปกรณ์และประวัติการเชื่อมต่อจาก TeamViewer API และนำเข้า CSV — รายละเอียด: [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md)
+> Aegiron เดิมชื่อ **ReDesk** (ถึงเวอร์ชัน 0.4.0) เครื่องและเซิร์ฟเวอร์ที่ติดตั้งไว้แล้วอัปเกรดได้โดยไม่ต้องตั้งค่าใหม่ — ดู [อัปเกรดจาก ReDesk](#อัปเกรดจาก-redesk)
 
-```
- Browser (viewer) ──HTTPS/WSS──┐                ┌──WSS── aegiron-agent (Rust)
-   WebCrypto E2E               │  aegiron-server │          xcap · enigo · arboard
-                               └──  (Go) ───────┘
-                                     │  signaling · blind relay · REST API
-                                  PostgreSQL  (users, devices, address book, audit, sessions)
-```
+## ทำอะไรได้บ้าง
 
-## สิ่งที่แก้จากผลวิเคราะห์ RustDesk
+**ควบคุมเครื่องจากระยะไกล**
+- แอปบน macOS และ Windows หน้าตาแบบ RustDesk: ID 9 หลักกับรหัสผ่านใช้ครั้งเดียว, ใส่ ID แล้วกดเชื่อมต่อ, รายชื่อเครื่องเป็นการ์ดหรือรายการ
+- หน้าต่างควบคุมแยกต่อเครื่อง พร้อมแถบเครื่องมือลอย: เลือกจอ, ปรับคุณภาพ, ขนาดจริง 1:1, Ctrl+Alt+Del, เต็มจอ, ข้อมูลคุณภาพการเชื่อมต่อ
+- วิดีโอ H.264 ส่งเฉพาะตอนจอเปลี่ยน (สำรองเป็น JPEG อัตโนมัติ), แสดงเคอร์เซอร์ของเครื่องปลายทาง
+- เมาส์/คีย์บอร์ด (พิมพ์ไทยได้, ⌘ บน Mac แปลงเป็น Ctrl บน Windows), คลิปบอร์ดสองทาง, ส่ง/รับไฟล์ (ลากวางได้)
+- ควบคุมผ่านเบราว์เซอร์ได้ด้วย ไม่ต้องติดตั้งอะไรที่ฝั่งผู้ควบคุม
 
-| ประเด็นในเอกสาร | Aegiron |
+**ฝั่งเครื่องที่ถูกควบคุม**
+- หน้าต่างการเชื่อมต่อเข้าแยกแท็บต่อผู้ควบคุม: อนุญาต/ปฏิเสธ (ปฏิเสธอัตโนมัติใน 30 วินาที), ตัดการเชื่อมต่อได้ทุกเมื่อ
+- เลือกได้ว่าจะใช้รหัสผ่าน, ให้คนกดอนุญาต หรือทั้งสองอย่าง; กำหนดสิทธิ์เมาส์/คีย์บอร์ด, คลิปบอร์ด, ไฟล์
+- ล็อกหน้าตั้งค่าด้วย PIN, กันเครื่องหลับระหว่างมีผู้ควบคุม, เริ่มอัตโนมัติตอนเข้าเครื่อง
+
+**จัดการทั้งองค์กร (เว็บคอนโซล)**
+- สมุดที่อยู่, อุปกรณ์ทั้งหมด, กลุ่มอุปกรณ์และสิทธิ์ตามกลุ่ม, ผู้ใช้และ 2FA (TOTP)
+- เข้าสู่ระบบด้วย SSO ขององค์กร (OpenID Connect: Google Workspace, Microsoft Entra ID, Keycloak ฯลฯ) ทั้งในเว็บและในแอป
+- Audit log ทุกการเข้าสู่ระบบ, เซสชัน, การโอนไฟล์ และการเปลี่ยนแปลงตั้งค่า
+- ปลุกเครื่อง (Wake-on-LAN), ค้นหาเครื่องในวงแลนเดียวกัน, ลิงก์ `aegiron://connect/<id>`
+- แจกจ่ายเวอร์ชันใหม่ของแอปผ่านเซิร์ฟเวอร์ตัวเอง (ตรวจ SHA-256 ก่อนเก็บไฟล์, ไม่ติดตั้งเองโดยไม่ถาม)
+
+**รวมเครื่องมืออื่นไว้ในคอนโซลเดียว** — AnyDesk, TeamViewer, RustDesk (เปิดแอปของเจ้านั้น) และ RDP / VNC / SSH (เปิดในเบราว์เซอร์ผ่าน gateway) พร้อม vault รหัสผ่านที่เข้ารหัส, ซิงก์จาก TeamViewer API และนำเข้า CSV — ดู [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md)
+
+## ภาพหน้าจอ
+
+| ควบคุมเครื่อง | คำขอเชื่อมต่อเข้า |
 |---|---|
-| ใช้เซิร์ฟเวอร์สาธารณะ `rs-ny.rustdesk.com` | ไม่มีค่า default ภายนอก ต้อง `init --server` กับเซิร์ฟเวอร์ของบริษัทเอง |
-| fallback "danger accept invalid cert" | ไม่มี fallback ใดๆ agent ใช้ rustls ตรวจ cert เต็มรูปแบบ และปฏิเสธ `ws://` ไปยัง host ที่ไม่ใช่ localhost เว้นแต่สั่ง `--insecure` เอง |
-| ตรึง public key ของเซิร์ฟเวอร์ | เซิร์ฟเวอร์เซ็น challenge ทุกครั้งที่ลงทะเบียน; key ไม่ตรง → agent ตัดทันที |
-| relay อ่านได้? | E2E: X25519 + Ed25519 (ผูกกับเครื่องตอนลงทะเบียน) + AES-256-GCM; relay เห็นแค่ ciphertext |
-| 2FA ผ่าน Telegram | TOTP มาตรฐาน ไม่มีการส่งข้อมูลออกไปบริการภายนอก |
-| approve-mode / รหัสชั่วคราว | `--verification temporary/permanent/both`, `--approve-mode password/click/both`; รหัสชั่วคราวใช้ครั้งเดียวแล้วเปลี่ยนทันที; ผิด 5 ครั้งล็อก 60 วิ |
-| daemon ระดับ root | agent รันเป็นผู้ใช้ปกติ ไม่ติดตั้ง LaunchDaemon เอง |
-| ควบคุมเครื่องใหม่ | Enrollment token (ตั้งให้บังคับได้), ปิดใช้งาน/รีเซ็ตกุญแจอุปกรณ์ได้จากคอนโซล |
-| ตรวจสอบย้อนหลัง | Audit log ทุก login, เซสชัน (ระยะเวลา, bytes), การเปลี่ยนแปลงอุปกรณ์/ผู้ใช้/ตั้งค่า และเหตุการณ์ที่ agent รายงาน (ใส่รหัสผิด, ถูกปฏิเสธ, ล็อก, ส่ง/รับไฟล์) |
-| ใครเข้าเครื่องไหนได้ | นโยบาย "ตามกลุ่ม": ผู้ใช้ทั่วไปเชื่อมต่อได้เฉพาะเครื่องในกลุ่มอุปกรณ์ที่ตนเป็นสมาชิก, enrollment token ผูกกลุ่มให้เครื่องใหม่อัตโนมัติ |
-| ติดตั้งแบบ unattended | `aegiron-agent install` ใช้ LaunchAgent / systemd **ระดับผู้ใช้** (ไม่ใช่ root daemon); การกดยอมรับขึ้นเป็นกล่องโต้ตอบบนหน้าจอ |
-| Mac ชิป Apple รันผ่าน Rosetta | build native arm64 (`cargo build --release`) |
+| ![](docs/images/agent-viewer.png) | ![](docs/images/agent-approval.png) |
+| **ตั้งค่า** | **เครื่องในวงแลน** |
+| ![](docs/images/agent-settings.png) | ![](docs/images/agent-lan.png) |
+| **เว็บคอนโซล: อุปกรณ์ทั้งหมด** | **ควบคุมผ่านเบราว์เซอร์** |
+| ![](docs/images/web-devices.png) | ![](docs/images/web-viewer-h264.png) |
 
-รายละเอียดโปรโตคอล: [docs/PROTOCOL.md](docs/PROTOCOL.md) · ผู้ให้บริการอื่นและ gateway: [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md)
+## ดาวน์โหลด
 
-## เริ่มใช้งาน (เครื่องพัฒนา)
+ไฟล์ติดตั้งอยู่ที่หน้า [Releases](https://github.com/anthovai/redesk/releases)
 
-ต้องมี Go 1.27+, Rust 1.85+, Bun 1.2+, PostgreSQL 16
+| ไฟล์ | ใช้กับ |
+|---|---|
+| `Aegiron-<version>.dmg` | แอปสำหรับ macOS 11 ขึ้นไป (Apple Silicon และ Intel) |
+| `Aegiron-Agent-Setup-<version>.exe` | ตัวติดตั้งสำหรับ Windows 10/11 (ไม่ต้องใช้สิทธิ์ admin, ติดตั้งแบบเงียบได้) |
+| `aegiron-server-macos-<version>.tar.gz` | ชุดติดตั้งเซิร์ฟเวอร์บน Mac |
+| `aegiron-agent-macos-<version>.tar.gz` | agent แบบ command line สำหรับ macOS |
+| `SHA256SUMS` | ค่า checksum ของทุกไฟล์ |
 
-```sh
-make dev-db                      # Postgres + role/db "aegiron"
-cd web && bun install && bun run build && cd ..
-make dev-guacd                   # (ไม่บังคับ) gateway RDP/VNC/SSH — ต้องมี Docker
-AEGIRON_ADMIN_PASSWORD='change-me-now-123' make server
-#   log จะแสดง server public_key — ใช้ตอน init agent
-```
+ไฟล์ยังไม่ได้เซ็นด้วยใบรับรองขององค์กร: macOS ให้คลิกขวาแล้วเลือก "เปิด" ในครั้งแรก, Windows จะมีคำเตือนจาก SmartScreen
 
-เปิด http://localhost:21114 แล้วล็อกอิน `admin@aegiron.local` (ถ้าไม่ตั้ง `AEGIRON_ADMIN_PASSWORD` รหัสสุ่มจะพิมพ์ใน log)
+## เริ่มต้นใช้งาน
 
-**โปรแกรม Aegiron (หน้าต่าง + tray)** — หน้าตาแบบ RustDesk: แท็บด้านบน, แผง "เครื่องของคุณ" (ID/รหัสผ่านใช้ครั้งเดียว), การ์ด "ควบคุมเครื่องอื่น", รายชื่อเครื่องแบบการ์ดสีตาม ID หรือแบบรายการ, หน้าต่างการเชื่อมต่อเข้า (อนุญาต/ปฏิเสธ/ตัดการเชื่อมต่อ แยกแท็บต่อผู้ควบคุม) และหน้าตั้งค่าแบบเมนูซ้าย:
+### 1. ติดตั้งเซิร์ฟเวอร์
 
-| หน้าหลัก | คำขอควบคุม | ตั้งค่า | เข้าสู่ระบบ |
-|---|---|---|---|
-| ![](docs/images/agent-home.png) | ![](docs/images/agent-approval.png) | ![](docs/images/agent-settings.png) | ![](docs/images/agent-login.png) |
-
-**ควบคุมเครื่องในหน้าต่างโปรแกรม (เหมือน RustDesk):** กดเชื่อมต่อจากสมุดที่อยู่หรือใส่ ID แล้วจะเปิดหน้าต่างแยกต่อเครื่อง — ภาพหน้าจอ, เมาส์/คีย์บอร์ด (พิมพ์ไทยได้, Cmd บน Mac = Ctrl บน Windows), คลิปบอร์ดสองทาง, หลายจอ, ปรับคุณภาพ, Ctrl+Alt+Del, เต็มจอ และ**ลากไฟล์มาวางเพื่อส่ง** เข้ารหัส E2E แบบเดียวกับเว็บ (ตรวจลายเซ็นเครื่องปลายทาง)
-
-![](docs/images/agent-viewer.png)
-
-หน้าต่างควบคุมใช้แถบเครื่องมือลอยกลางจอ (ปักหมุด/ซ่อนเองได้), เมนูจอ, คำสั่ง, คุณภาพภาพ, คีย์บอร์ด, ขนาดจริง 1:1 และหน้าต่างข้อมูลคุณภาพการเชื่อมต่อ — เว็บคอนโซลใช้รูปแบบเดียวกัน
-
-![](docs/images/web-devices.png)
-
-**วิดีโอ H.264 (0.4.0):** agent เข้ารหัสด้วย OpenH264 แบบปรับสำหรับภาพหน้าจอ ส่งเฉพาะเมื่อจอเปลี่ยน ทั้งแอปและเว็บ (WebCodecs) ถอดรหัสได้ ถ้าฝั่งใดไม่รองรับจะกลับไปใช้ JPEG อัตโนมัติ และแสดงเคอร์เซอร์ของเครื่องปลายทางให้ด้วย — รายละเอียดใน [PROTOCOL.md](docs/PROTOCOL.md#video-codecs)
-
-![](docs/images/web-viewer-h264.png)
-
-**หน้าแรกแบบ RustDesk:** แท็บ ล่าสุด / รายการโปรด / สมุดที่อยู่ / ในเครือข่าย (ค้นหาเครื่อง Aegiron ในวงแลนเดียวกัน), ค้นหาด้วยชื่อ ID หรือแท็ก, ลิงก์ `aegiron://connect/<id>` (ถามยืนยันก่อนเชื่อมต่อ), ล็อกหน้าตั้งค่าด้วย PIN, จำขนาดหน้าต่าง
-
-![](docs/images/agent-lan.png)
-
-**ปลุกเครื่อง (Wake-on-LAN):** ปุ่ม "ปลุกเครื่อง" ในคอนโซล ให้ agent ที่ออนไลน์ในวงแลนเดียวกันส่ง magic packet ให้
-
-**SSO ขององค์กร (OIDC):** ตั้งค่าในคอนโซล (Google Workspace, Entra ID, Keycloak ฯลฯ) ใช้ได้ทั้งเว็บและปุ่ม "เข้าสู่ระบบด้วย SSO ขององค์กร" ในแอป
-
-**อัปเดต agent:** แอดมินอัปโหลดไฟล์ติดตั้งในคอนโซล แอปตรวจหาอัปเดตในหน้าตั้งค่า ดาวน์โหลดเมื่อผู้ใช้กด และตรวจ SHA-256 ก่อนเก็บไฟล์ (ไม่ติดตั้งเอง)
-
-![](docs/images/agent-update.png)
-
-**macOS:** `Aegiron.app` + `.dmg` (มีการ์ดขอสิทธิ์ Screen Recording / Accessibility ในหน้าตั้งค่า) และกันเครื่องหลับระหว่างมีผู้ควบคุม
-
-**เข้าสู่ระบบในโปรแกรม (เหมือน RustDesk):** เปิดโปรแกรมครั้งแรกแล้วเข้าสู่ระบบด้วยบัญชีคอนโซล เครื่องจะลงทะเบียนเป็นของผู้ใช้นั้นเอง (ดึงกุญแจเซิร์ฟเวอร์ผ่าน HTTPS) แสดงสมุดที่อยู่พร้อมสถานะออนไลน์ ปุ่ม "เชื่อมต่อ" เปิดหน้าต่างควบคุมในโปรแกรม และปุ่ม "เปิดคอนโซล" ในตั้งค่าเปิดเว็บคอนโซล — CLI: `aegiron-agent login --server https://… --email …`
-
-**Windows:** ตัวติดตั้ง `Aegiron-Agent-Setup-*.exe` (ไม่ต้องใช้สิทธิ์ admin, ติดตั้งแบบเงียบได้) — ดู [deploy/windows/README.md](deploy/windows/README.md)
-
-ติดตั้ง agent บนเครื่องที่จะถูกควบคุม (คำสั่งพร้อม key อยู่ในหน้า **ตั้งค่าเซิร์ฟเวอร์**):
+**Mac Server (แนะนำ)** — ติดตั้งครบชุด: Aegiron server, HTTPS อัตโนมัติ (Caddy + Let's Encrypt), PostgreSQL, gateway RDP/VNC/SSH และสำรองข้อมูลทุกวัน
 
 ```sh
-cd agent && cargo build --release
-./target/release/aegiron-agent init --server https://aegiron.example.com --key <SERVER_PUBLIC_KEY>
-./target/release/aegiron-agent run          # แสดง ID 9 หลัก + รหัสผ่านชั่วคราว
-./target/release/aegiron-agent set-password # (ถ้าต้องการ unattended access)
-./target/release/aegiron-agent set --approve-mode both   # ต้องมีคนกดยอมรับที่เครื่องด้วย
-./target/release/aegiron-agent install       # เริ่มอัตโนมัติเมื่อล็อกอิน (uninstall เพื่อลบ)
-./target/release/aegiron-agent show-password # ดูรหัสชั่วคราวของ agent ที่รันเป็น service
-./target/release/aegiron-agent set --allow-file-transfer false   # ปิดการโอนไฟล์
+tar xzf aegiron-server-macos-<version>.tar.gz && cd aegiron-server-macos-<version>
+sudo ./install.sh --domain aegiron.example.com --email it@example.com
 ```
 
-เมื่อใช้ approve-mode `click`/`both` agent จะเปิดกล่องโต้ตอบ "อนุญาต/ปฏิเสธ" บนหน้าจอ (macOS: osascript, Linux: zenity) และถามใน terminal ด้วยถ้ามี ถ้าไม่มีใครตอบภายใน 30 วินาทีจะถือว่าปฏิเสธ
+เมื่อเสร็จจะแสดงรหัสผ่านแอดมินครั้งแรกและกุญแจเซิร์ฟเวอร์ — รายละเอียดใน [deploy/macos/README.md](deploy/macos/README.md)
 
-### ฟีเจอร์ในหน้าควบคุม
-
-- ภาพหน้าจอ + เมาส์/คีย์บอร์ด (พิมพ์ภาษาไทยได้), เลือกจอ, ปรับคุณภาพ, เต็มจอ, Ctrl+Alt+Del
-- คลิปบอร์ดสองทาง และ "พิมพ์จากคลิปบอร์ด"
-- **โอนไฟล์**: ปุ่ม "ไฟล์" เปิดตัวเรียกดูไฟล์ของเครื่องปลายทาง (ดาวน์โหลด/อัปโหลด) หรือลากไฟล์มาวางบนหน้าจอเพื่อส่ง (ไปที่โฟลเดอร์ที่เปิดอยู่ หรือ `~/Downloads/Aegiron`)
-
-### กลุ่มอุปกรณ์และสิทธิ์
-
-1. **กลุ่มอุปกรณ์** → สร้างกลุ่มและเลือกสมาชิก
-2. กำหนดกลุ่มให้เครื่องที่หน้า **อุปกรณ์ทั้งหมด** หรือสร้าง enrollment token ที่ผูกกลุ่มไว้ (`init --enroll-token ...`) เพื่อให้เครื่องใหม่เข้ากลุ่มเอง
-3. **ตั้งค่าเซิร์ฟเวอร์** → การเข้าถึง: "ตามกลุ่ม" แล้วผู้ใช้ทั่วไปจะเห็นเครื่องของกลุ่มตนที่หน้าแรก และเชื่อมต่อเครื่องอื่นไม่ได้ (ถูกบันทึกเป็น `session.denied`)
-
-macOS: อนุญาต **Screen Recording** และ **Accessibility** ให้ terminal/ไบนารีที่รัน agent ใน System Settings → Privacy & Security
-
-พัฒนาเว็บแบบ hot reload: `make web` (http://localhost:5173 proxy ไปที่ server)
-
-## Production
-
-**Mac server (แนะนำ):** `deploy/macos/build-kit.sh` สร้างชุดติดตั้งใน `dist/` แล้วรัน `sudo ./install.sh --domain <โดเมน> --email <อีเมล>` บนเครื่อง Mac server — ดู [deploy/macos/README.md](deploy/macos/README.md)
-
-**Linux / Docker:**
+**Linux / Docker**
 
 ```sh
 echo "POSTGRES_PASSWORD=$(openssl rand -hex 16)" > .env
-echo "AEGIRON_ADMIN_PASSWORD=..." >> .env
+echo "AEGIRON_ADMIN_PASSWORD=<รหัสผ่านแอดมินครั้งแรก>" >> .env
 docker compose up -d --build
 ```
 
-วาง reverse proxy ที่มี TLS (เช่น Caddy: `reverse_proxy localhost:21114`) ไว้ข้างหน้า หรือกำหนด `AEGIRON_TLS_CERT`/`AEGIRON_TLS_KEY` **สำรองไฟล์ `/data/server_ed25519.key` และ `/data/vault.key`** — ถ้า server key หาย agent ทุกเครื่องต้อง init ใหม่ ถ้า vault key หาย รหัสผ่านที่เก็บไว้ทั้งหมดใช้ไม่ได้ (เก็บ vault key แยกจาก backup ฐานข้อมูล)
+แล้ววาง reverse proxy ที่มี TLS ไว้ข้างหน้า (เช่น Caddy: `reverse_proxy localhost:21114`) หรือตั้ง `AEGIRON_TLS_CERT` / `AEGIRON_TLS_KEY`
 
-| ตัวแปร | ค่าเริ่มต้น | |
-|---|---|---|
-| `AEGIRON_LISTEN` | `:21114` | |
-| `AEGIRON_DATABASE_URL` | `postgres://aegiron:aegiron@localhost:5432/aegiron?sslmode=disable` | |
-| `AEGIRON_DATA_DIR` | `./data` | เก็บ server identity key |
-| `AEGIRON_WEB_DIR` | `../web/build` | |
-| `AEGIRON_TLS_CERT` / `AEGIRON_TLS_KEY` | — | เปิด HTTPS ในตัว |
-| `AEGIRON_TRUST_PROXY` | `false` | อ่าน IP จาก `X-Forwarded-For` |
-| `AEGIRON_COOKIE_SECURE` | true เมื่อเปิด TLS | |
-| `AEGIRON_ALLOWED_ORIGINS` | — | origin เพิ่มเติมสำหรับ WebSocket (dev: `localhost:5173`) |
-| `AEGIRON_ADMIN_EMAIL` / `AEGIRON_ADMIN_PASSWORD` | — | สร้าง admin คนแรกเมื่อ DB ว่าง |
-| `AEGIRON_VAULT_KEY` | `<data>/vault.key` | กุญแจ AES-256 (base64) สำหรับรหัสผ่านใน vault — เก็บแยกจาก backup DB |
-| `AEGIRON_GUACD_ADDR` | — (ปิด gateway) | `host:4822` ของ guacd |
-| `AEGIRON_GATEWAY_RECORDING_PATH` | — (ไม่บันทึก) | โฟลเดอร์ใน container ของ guacd สำหรับบันทึกเซสชัน RDP/VNC/SSH |
-| `AEGIRON_TIMEZONE` | `Asia/Bangkok` | timezone ที่ส่งให้เซสชัน gateway |
-| `AEGIRON_SYNC_MINUTES` | `15` | รอบซิงก์ TeamViewer API |
+> **สำรองไฟล์ `server_ed25519.key` และ `vault.key` ในโฟลเดอร์ data แยกจาก backup ฐานข้อมูล** — ถ้ากุญแจเซิร์ฟเวอร์หาย ทุกเครื่องต้องลงทะเบียนใหม่ ถ้า vault key หาย รหัสผ่านที่เก็บไว้ใช้ไม่ได้ทั้งหมด
 
-## ทดสอบ
+### 2. ติดตั้งแอปบนเครื่อง
+
+- **macOS:** เปิด `.dmg` ลาก Aegiron ไปที่ Applications แล้วอนุญาต Screen Recording และ Accessibility ตามที่แอปแนะนำในหน้าตั้งค่า
+- **Windows:** รัน `Aegiron-Agent-Setup-<version>.exe` — ติดตั้งให้ทั้งองค์กรแบบเงียบได้ด้วย `/S /SERVER=https://… /KEY=…` ดู [deploy/windows/README.md](deploy/windows/README.md)
+
+เปิดแอปแล้ว **เข้าสู่ระบบด้วยบัญชีของคอนโซล** (หรือ SSO) เครื่องจะลงทะเบียนเป็นของผู้ใช้นั้นและเห็นสมุดที่อยู่ทันที
+
+### 3. เชื่อมต่อ
+
+ใส่ ID ของเครื่องปลายทางแล้วกด **เชื่อมต่อ** หรือดับเบิลคลิกการ์ดเครื่องในรายการ แล้วใส่รหัสผ่านที่แสดงบนเครื่องนั้น (หรือรอให้ปลายทางกดอนุญาต)
+
+### ใช้แบบ command line
+
+สำหรับเครื่องที่ไม่มีคนใช้ (เซิร์ฟเวอร์, kiosk) หรือการติดตั้งด้วยสคริปต์ — คำสั่งพร้อมกุญแจอยู่ในคอนโซลหน้า **ตั้งค่าเซิร์ฟเวอร์**
 
 ```sh
-make test                                   # go vet, cargo test (crypto + dirty-rect), svelte-check
+aegiron-agent init --server https://aegiron.example.com --key <SERVER_PUBLIC_KEY>
+aegiron-agent login --email it@example.com      # หรือเข้าสู่ระบบแทนการใช้ --key
+aegiron-agent set-password                      # รหัสผ่านถาวร สำหรับเครื่องที่ไม่มีคนเฝ้า
+aegiron-agent set --approve-mode both           # ต้องใส่รหัสผ่านและมีคนกดอนุญาต
+aegiron-agent install                           # เริ่มอัตโนมัติตอนเข้าเครื่อง (ระดับผู้ใช้ ไม่ใช่ root)
+aegiron-agent show-password                     # ดูรหัสผ่านใช้ครั้งเดียวปัจจุบัน
+aegiron-agent info                              # ID และลายนิ้วมือกุญแจของเครื่อง
+```
+
+## ความปลอดภัย
+
+Aegiron ออกแบบจาก [ผลวิเคราะห์ RustDesk.app](การวิเคราะห์%20RustDesk.app%20(macOS).md) และแก้จุดเสี่ยงที่พบ:
+
+| ประเด็นใน RustDesk | Aegiron |
+|---|---|
+| ค่าเริ่มต้นชี้ไปเซิร์ฟเวอร์สาธารณะ | ไม่มีเซิร์ฟเวอร์ภายนอกเลย ต้องตั้งค่าเซิร์ฟเวอร์ขององค์กรเอง |
+| มี fallback ยอมรับใบรับรองที่ไม่ถูกต้อง | ตรวจใบรับรองเต็มรูปแบบเสมอ ไม่มี fallback; ไม่ยอมใช้ `ws://` ที่ไม่เข้ารหัสกับเครื่องอื่นนอกจาก localhost เว้นแต่สั่ง `--insecure` เอง |
+| ตรึง public key ของเซิร์ฟเวอร์ | เซิร์ฟเวอร์เซ็น challenge ทุกครั้งที่ลงทะเบียน กุญแจไม่ตรงจะตัดทันที |
+| relay อ่านข้อมูลได้หรือไม่ | เข้ารหัสต้นทาง-ปลายทาง X25519 + AES-256-GCM และตรวจลายเซ็น Ed25519 ของเครื่องปลายทาง relay เห็นแค่ข้อมูลที่เข้ารหัสแล้ว |
+| 2FA ส่งผ่าน Telegram | TOTP มาตรฐาน ไม่ส่งข้อมูลออกไปบริการภายนอก |
+| service ระดับ root | agent รันเป็นผู้ใช้ปกติ ไม่ติดตั้ง daemon ระดับ root |
+| ใครเข้าเครื่องไหนก็ได้ที่รู้รหัส | สิทธิ์ตามกลุ่ม, enrollment token, ปิดใช้งาน/รีเซ็ตกุญแจเครื่องได้จากคอนโซล, audit log ครบ |
+| รหัสผ่านชั่วคราว | ใช้ได้ครั้งเดียวแล้วเปลี่ยนทันที, ผิด 3 ครั้งต่อเซสชัน, ผิด 5 ครั้งติดกันล็อก 60 วินาที |
+| บิลด์ x86_64 รันผ่าน Rosetta | บิลด์ native ทั้ง Apple Silicon และ Intel |
+
+รายละเอียดโปรโตคอลและการเข้ารหัส: [docs/PROTOCOL.md](docs/PROTOCOL.md)
+
+## สถาปัตยกรรม
+
+```
+ แอป Aegiron / เบราว์เซอร์ ──HTTPS/WSS──┐                  ┌──WSS── aegiron-agent
+   (ผู้ควบคุม, E2E)                     │  aegiron-server  │        (เครื่องที่ถูกควบคุม)
+                                        └──     (Go)    ───┘
+                                            │ signaling · relay แบบมองไม่เห็นข้อมูล · REST API
+                                         PostgreSQL (ผู้ใช้, อุปกรณ์, สมุดที่อยู่, audit, เซสชัน)
+```
+
+| ส่วน | เทคโนโลยี | หน้าที่ (เทียบ RustDesk) |
+|---|---|---|
+| `server/` | Go, PostgreSQL 16 | rendezvous + relay + API (เทียบ hbbs + hbbr + Pro) รวมในไบนารีเดียว พอร์ตเดียว `21114` |
+| `agent/` | Rust, egui, OpenH264 | แอปบนเครื่อง (`aegiron`) และ CLI (`aegiron-agent`): จับภาพจอ, input, คลิปบอร์ด, ไฟล์, หน้าต่างควบคุม |
+| `web/` | Bun, SvelteKit (Svelte 5), Tailwind | เว็บคอนโซลและตัวควบคุมผ่านเบราว์เซอร์ (WebCrypto, WebCodecs) |
+| guacd | Apache Guacamole | engine ของ gateway RDP / VNC / SSH ในเบราว์เซอร์ (ไม่บังคับ) |
+
+### ตั้งค่าเซิร์ฟเวอร์ (environment variables)
+
+| ตัวแปร | ค่าเริ่มต้น | ความหมาย |
+|---|---|---|
+| `AEGIRON_LISTEN` | `:21114` | พอร์ตของเซิร์ฟเวอร์ |
+| `AEGIRON_DATABASE_URL` | `postgres://aegiron:aegiron@localhost:5432/aegiron?sslmode=disable` | ฐานข้อมูล |
+| `AEGIRON_DATA_DIR` | `./data` | กุญแจเซิร์ฟเวอร์และ vault key |
+| `AEGIRON_WEB_DIR` | `../web/build` | ไฟล์เว็บคอนโซลที่ build แล้ว |
+| `AEGIRON_PUBLIC_URL` | — | URL ภายนอก (ใช้กับ SSO) |
+| `AEGIRON_TLS_CERT` / `AEGIRON_TLS_KEY` | — | เปิด HTTPS ในตัว |
+| `AEGIRON_TRUST_PROXY` | `false` | อ่าน IP ผู้ใช้จาก `X-Forwarded-For` (เปิดเมื่ออยู่หลัง reverse proxy) |
+| `AEGIRON_COOKIE_SECURE` | `true` เมื่อเปิด TLS | |
+| `AEGIRON_ALLOWED_ORIGINS` | — | origin เพิ่มเติมสำหรับ WebSocket |
+| `AEGIRON_ADMIN_EMAIL` / `AEGIRON_ADMIN_PASSWORD` | `admin@aegiron.local` / สุ่ม | แอดมินคนแรก (เฉพาะตอนฐานข้อมูลว่าง) |
+| `AEGIRON_VAULT_KEY` | `<data>/vault.key` | กุญแจ AES-256 (base64) ของ vault |
+| `AEGIRON_GUACD_ADDR` | — (ปิด gateway) | `host:4822` ของ guacd |
+| `AEGIRON_GATEWAY_RECORDING_PATH` | — (ไม่บันทึก) | โฟลเดอร์บันทึกเซสชัน RDP/VNC/SSH ใน container ของ guacd |
+| `AEGIRON_TIMEZONE` | `Asia/Bangkok` | timezone ของเซสชัน gateway |
+| `AEGIRON_SYNC_MINUTES` | `15` | รอบซิงก์ TeamViewer API |
+
+ชื่อเดิม `REDESK_*` ยังใช้ได้ถ้าไม่ได้ตั้ง `AEGIRON_*`
+
+## พัฒนาต่อ
+
+ต้องมี Go 1.27+, Rust 1.85+, Bun 1.2+ และ PostgreSQL 16
+
+```sh
+make dev-db                                       # PostgreSQL + role/database "aegiron"
+cd web && bun install && bun run build && cd ..
+make dev-guacd                                    # (ไม่บังคับ) gateway RDP/VNC/SSH ต้องมี Docker
+AEGIRON_ADMIN_PASSWORD='change-me-now-123' make server
+```
+
+เปิด http://localhost:21114 แล้วเข้าสู่ระบบด้วย `admin@aegiron.local` — log จะแสดงกุญแจเซิร์ฟเวอร์สำหรับ `aegiron-agent init`
+
+| คำสั่ง | |
+|---|---|
+| `make web` | เว็บแบบ hot reload ที่ http://localhost:5173 |
+| `make agent` | รัน agent (หลัง `aegiron-agent init`) |
+| `cd agent && cargo run --bin aegiron` | รันแอปบนเครื่อง |
+| `make test` | go vet + go test, cargo test, svelte-check |
+| `deploy/macos/build-kit.sh` | สร้างชุดติดตั้งเซิร์ฟเวอร์, agent และ `.dmg` ใน `dist/` |
+| `deploy/windows/build-installer.sh` | สร้างตัวติดตั้ง Windows (cross-compile จาก Mac/Linux) |
+
+ทดสอบการเชื่อมต่อจริงทั้งเส้นทาง (handshake → รหัสผิด → รหัสถูก → รับภาพ) ด้วยโค้ดเข้ารหัสชุดเดียวกับเบราว์เซอร์:
+
+```sh
 cd web && AEGIRON_PASSWORD=... bun scripts/e2e-viewer.ts <device-id> <device-password>
 ```
 
-`e2e-viewer.ts` ใช้โค้ด `src/lib/crypto.ts` ชุดเดียวกับเบราว์เซอร์ คุยกับ agent จริงผ่าน relay: handshake → ใส่รหัสผิด → ใส่รหัสถูก → รับเฟรมภาพ
+## ข้อจำกัดและแผนต่อไป
 
-## ข้อจำกัดของเวอร์ชันนี้ (roadmap)
-
-- H.264 เข้ารหัสด้วย CPU (ยังไม่ใช้ hardware encoder เช่น VideoToolbox/NVENC) และยังไม่มี VP9/AV1
-- วิ่งผ่าน relay เสมอ ยังไม่มี P2P/UDP hole punching
-- ยังไม่มี: เสียง, ไวท์บอร์ด, ควบคุมที่หน้าจอล็อกอินของ macOS (ต้องใช้ root daemon ซึ่งตั้งใจไม่ทำ)
-- ผู้ให้บริการอื่น: ยังไม่ได้ทดสอบกับบัญชี TeamViewer จริง (ทดสอบกับ mock ตามรูปแบบในเอกสาร), AnyDesk ไม่มี API สาธารณะสำหรับอุปกรณ์/เซสชัน, ยังไม่มีหน้าเล่นซ้ำ session recording, RDP ยังไม่ได้ทดสอบกับ Windows จริง (SSH และ VNC ทดสอบแล้ว)
-- ลิงก์ `aegiron://` บน macOS ใช้ได้เฉพาะตอนส่งเป็นอาร์กิวเมนต์ (eframe ยังไม่รับ event เปิด URL ของ macOS) — บน Windows ใช้ได้เต็มที่ผ่านตัวติดตั้ง
-- Wake-on-LAN ต้องมี agent อีกเครื่องออนไลน์ในวงแลนเดียวกัน และเครื่องเป้าหมายต้องเปิด WoL ใน BIOS/การ์ดแลน
-- service บน Windows ยังไม่รองรับ (ใช้ Task Scheduler รัน `aegiron-agent run` ตอน logon)
-- โอนไฟล์ทีละไฟล์ (ยังไม่รองรับทั้งโฟลเดอร์) และไฟล์ที่ดาวน์โหลดจะถูกเก็บในหน่วยความจำเบราว์เซอร์ก่อนบันทึก
+- ทุกการเชื่อมต่อวิ่งผ่าน relay ของเซิร์ฟเวอร์ ยังไม่มี P2P / UDP hole punching
+- H.264 เข้ารหัสด้วย CPU ยังไม่ใช้ hardware encoder และยังไม่มี VP9/AV1
+- ยังไม่มีเสียง, ไวท์บอร์ด และการควบคุมที่หน้าจอล็อกอินของ macOS (ต้องใช้ daemon ระดับ root ซึ่งตั้งใจไม่ทำ)
+- โอนไฟล์ทีละไฟล์ ยังไม่รองรับทั้งโฟลเดอร์
+- ลิงก์ `aegiron://` บน macOS ใช้ได้เมื่อส่งเป็นอาร์กิวเมนต์เท่านั้น (บน Windows ใช้ได้เต็มที่)
+- Wake-on-LAN ต้องมี agent อีกเครื่องออนไลน์ในวงแลนเดียวกัน และเครื่องเป้าหมายต้องเปิด WoL ไว้
+- ผู้ให้บริการอื่น: TeamViewer ทดสอบกับ mock เท่านั้น, AnyDesk ไม่มี API สาธารณะ, RDP ยังไม่ได้ทดสอบกับ Windows จริง
 
 ## อัปเกรดจาก ReDesk
 
-เวอร์ชัน 0.5.0 เปลี่ยนชื่อเป็น Aegiron โดยข้อมูล กุญแจ และฐานข้อมูลเดิมใช้ต่อได้ทั้งหมด:
+เวอร์ชัน 0.5.0 เปลี่ยนชื่อจาก ReDesk เป็น Aegiron ข้อมูล กุญแจ และฐานข้อมูลเดิมใช้ต่อได้ทั้งหมด
 
-- **เซิร์ฟเวอร์ Mac:** รัน `sudo ./install.sh` จากชุดติดตั้งใหม่ตามปกติ สคริปต์จะย้าย `/usr/local/{etc,var,var/log}/redesk` → `…/aegiron`, เปลี่ยน `REDESK_*` ในไฟล์ตั้งค่าเป็น `AEGIRON_*`, เปลี่ยน daemon `co.redesk.*` → `co.aegiron.*` และบัญชีบริการ `_redesk` → `_aegiron` ฐานข้อมูลเดิม (role/database `redesk`) ใช้ต่อตามเดิม
-- **เซิร์ฟเวอร์ยังอ่าน `REDESK_*`** ได้ (ถ้าไม่มี `AEGIRON_*`) — docker-compose หรือสคริปต์เดิมไม่ต้องแก้ทันที แต่ docker-compose ใหม่ใช้ฐานข้อมูลชื่อ `aegiron` ถ้าใช้ volume เดิมให้ตั้ง `AEGIRON_DATABASE_URL` ชี้ไปที่ฐานข้อมูล `redesk`
-- **agent / แอปเดิม (0.4.x) ต่อกับเซิร์ฟเวอร์ใหม่ได้** โปรโตคอลไม่เปลี่ยน
-- **ติดตั้งแอปใหม่ทับ:** Windows installer จะถอด ReDesk เดิม ย้ายการตั้งค่า (ID, กุญแจ, บัญชี, ประวัติ) และให้ลิงก์ `redesk://` ยังเปิดได้ บน macOS ลาก Aegiron.app ไปที่ Applications แล้วลบ ReDesk.app — แอปจะย้ายการตั้งค่าให้เองตอนเปิดครั้งแรก
-- **macOS ต้องอนุญาตสิทธิ์ใหม่** (Screen Recording / Accessibility) เพราะชื่อแอปและ bundle ID เปลี่ยน
-- **ผู้ใช้เว็บคอนโซลต้องเข้าสู่ระบบใหม่หนึ่งครั้ง** (ชื่อคุกกี้เปลี่ยน)
+- **เซิร์ฟเวอร์ Mac:** รัน `sudo ./install.sh` จากชุดติดตั้งใหม่ตามปกติ สคริปต์จะย้าย `/usr/local/{etc,var,var/log}/redesk` ไปที่ `…/aegiron`, เปลี่ยน `REDESK_*` ในไฟล์ตั้งค่าเป็น `AEGIRON_*`, เปลี่ยน daemon `co.redesk.*` เป็น `co.aegiron.*` และบัญชีบริการ `_redesk` เป็น `_aegiron` ฐานข้อมูลเดิมใช้ต่อตามเดิม **แนะนำให้สำรองข้อมูลก่อน**
+- **Docker:** เซิร์ฟเวอร์ยังอ่าน `REDESK_*` ได้ แต่ `docker-compose.yml` ใหม่ใช้ฐานข้อมูลชื่อ `aegiron` ถ้าใช้ volume เดิมให้ตั้ง `AEGIRON_DATABASE_URL` ชี้ไปที่ฐานข้อมูล `redesk`
+- **แอปและ agent 0.4.x** ต่อกับเซิร์ฟเวอร์ใหม่ได้ เพราะโปรโตคอลไม่เปลี่ยน
+- **ติดตั้งแอปใหม่:** ตัวติดตั้ง Windows จะถอด ReDesk เดิมออกและย้ายการตั้งค่า (ID, กุญแจ, บัญชี, ประวัติ) มาให้ บน macOS ลาก Aegiron.app ไปที่ Applications แล้วลบ ReDesk.app แอปจะย้ายการตั้งค่าและการเปิดอัตโนมัติให้เองตอนเปิดครั้งแรก ลิงก์ `redesk://` เดิมยังเปิดได้
+- **macOS ต้องอนุญาตสิทธิ์ใหม่** (Screen Recording / Accessibility) เพราะชื่อแอปเปลี่ยน
+- **ผู้ใช้เว็บคอนโซลต้องเข้าสู่ระบบใหม่หนึ่งครั้ง**
+
+## เอกสารเพิ่มเติม
+
+- [docs/PROTOCOL.md](docs/PROTOCOL.md) — โปรโตคอล, การเข้ารหัส, codec วิดีโอ, SSO, การอัปเดต
+- [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md) — AnyDesk, TeamViewer, RustDesk, RDP / VNC / SSH gateway
+- [deploy/macos/README.md](deploy/macos/README.md) — ติดตั้งและดูแลเซิร์ฟเวอร์บน Mac, ติดตั้งแอปบน Mac, MDM
+- [deploy/windows/README.md](deploy/windows/README.md) — ตัวติดตั้ง Windows และการติดตั้งแบบเงียบ
+- [การวิเคราะห์ RustDesk.app (macOS).md](การวิเคราะห์%20RustDesk.app%20(macOS).md) — ผลวิเคราะห์ที่เป็นที่มาของการออกแบบ
