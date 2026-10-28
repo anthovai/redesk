@@ -133,6 +133,7 @@ type agentMsg struct {
 var agentEvents = map[string]bool{
 	"auth_failed": true, "auth_ok": true, "denied": true, "locked": true,
 	"file_upload": true, "file_download": true, "wol_sent": true,
+	"file_delete": true, "file_rename": true,
 }
 
 func (h *Hub) HandleAgent(w http.ResponseWriter, r *http.Request) {

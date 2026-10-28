@@ -1,7 +1,9 @@
 //! Native viewer: controls another machine from the desktop app (one window per connection,
 //! like RustDesk). Speaks the same end-to-end protocol as the browser viewer.
 
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -17,6 +19,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::codec::H264Decoder;
 use crate::crypto::{Channel, ViewerKeys};
+use crate::files::{self, ensure_dirs, rel_components, unique_path};
 use crate::{account, fingerprint, proto};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -54,10 +57,36 @@ pub struct Info {
     pub clipboard: bool,
     #[serde(default)]
     pub files: bool,
+    /// Optional capabilities of the agent ("fs2", "clipfiles"); empty on older agents.
+    #[serde(default)]
+    pub features: Vec<String>,
+}
+
+impl Info {
+    pub fn has(&self, feature: &str) -> bool {
+        self.features.iter().any(|f| f == feature)
+    }
+
+    /// Folder transfer and file management.
+    pub fn fs2(&self) -> bool {
+        self.files && self.has("fs2")
+    }
+
+    /// Copy/paste of files through the clipboard (needs both permissions).
+    pub fn clip_files(&self) -> bool {
+        self.files && self.clipboard && self.has("clipfiles")
+    }
 }
 
 /// Video codecs this viewer decodes, best first.
 const CODECS: [&str; 2] = ["h264", "jpeg"];
+/// Optional protocol features this viewer supports (sent in `auth`).
+const FEATURES: [&str; 1] = ["clipfiles"];
+
+fn clip_tmp_dir() -> PathBuf {
+    static N: AtomicU32 = AtomicU32::new(0);
+    std::env::temp_dir().join(format!("{}{}-{}", files::CLIP_TMP_PREFIX, std::process::id(), N.fetch_add(1, Ordering::Relaxed)))
+}
 
 /// Remote screen; `dirty` lists rectangles (x, y, w, h) not yet uploaded to the GPU.
 #[derive(Default)]
@@ -102,20 +131,64 @@ impl Framebuffer {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Default)]
 pub enum TransferStatus {
+    #[default]
     Active,
     Done(String),
     Failed(String),
 }
 
-#[derive(Clone, Debug)]
+/// One upload or download; a folder counts as one transfer with per-file detail.
+#[derive(Clone, Debug, Default)]
 pub struct Transfer {
     pub id: u32,
     pub name: String,
+    /// Viewer → agent.
+    pub up: bool,
+    pub folder: bool,
+    /// Total bytes and bytes done.
     pub size: u64,
     pub sent: u64,
+    pub files: u32,
+    pub files_done: u32,
+    pub failed: u32,
+    /// File in progress (relative path inside a folder) and its progress.
+    pub current: String,
+    pub cur_size: u64,
+    pub cur_sent: u64,
     pub status: TransferStatus,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct RemoteEntry {
+    pub name: String,
+    #[serde(default)]
+    pub dir: bool,
+    #[serde(default)]
+    pub size: u64,
+}
+
+/// The remote directory shown in the file panel.
+#[derive(Clone, Debug, Default)]
+pub struct RemoteDir {
+    pub path: String,
+    pub parent: Option<String>,
+    pub sep: String,
+    pub entries: Vec<RemoteEntry>,
+    pub error: Option<String>,
+    pub loading: bool,
+}
+
+/// A file or folder copied on the remote machine (`clip_files`).
+#[derive(Clone, Debug, Deserialize)]
+pub struct ClipEntry {
+    pub name: String,
+    pub path: String,
+    #[serde(default)]
+    pub dir: bool,
+    #[serde(default)]
+    pub size: u64,
 }
 
 pub struct State {
@@ -135,18 +208,63 @@ pub struct State {
     /// Codec the agent chose ("h264" or "jpeg").
     pub codec: String,
     pub transfers: Vec<Transfer>,
+    pub browser: RemoteDir,
+    /// Files copied on the remote machine that are too big to fetch without asking.
+    pub clip_offer: Option<Vec<ClipEntry>>,
+    /// Message for the window to show once (from background transfers).
+    pub notice: Option<String>,
 }
 
 enum Cmd {
     Json(Value),
-    Upload(PathBuf),
+    /// Local file or folder → remote directory ("" = ~/Downloads/Aegiron).
+    Upload(PathBuf, String),
+    /// Remote file or folder → local ~/Downloads/Aegiron.
+    Download(String, bool),
+    Cancel(u32),
+    /// Clipboard paste: upload, put on the remote clipboard, then send these key events.
+    PasteFiles(Vec<PathBuf>, Vec<Value>),
+    /// Remote clipboard files → local clipboard (`true` = into a temporary folder).
+    FetchClip(Vec<ClipEntry>, bool),
     Close,
 }
+
+/// Messages for a running transfer, routed by transfer id.
+enum Ev {
+    Json(Value),
+    Chunk(Vec<u8>),
+}
+
+/// Files that were last pasted or fetched through the clipboard: (path, size, mtime).
+type ClipSig = Vec<(PathBuf, u64, Option<std::time::SystemTime>)>;
+
+fn clip_sig(paths: &[PathBuf]) -> ClipSig {
+    paths
+        .iter()
+        .map(|p| {
+            let m = std::fs::metadata(p).ok();
+            // Canonical, so a list we set compares equal to what the clipboard reports back.
+            (p.canonicalize().unwrap_or_else(|_| p.clone()), m.as_ref().map(|m| m.len()).unwrap_or(0), m.and_then(|m| m.modified().ok()))
+        })
+        .collect()
+}
+
+/// Remote clipboard selections up to this size (files only) are fetched without asking.
+const AUTO_FETCH_FILES: usize = 20;
+const AUTO_FETCH_BYTES: u64 = 32 << 20;
+/// A paste that needed longer than this to upload is not pressed automatically any more.
+const PASTE_DEADLINE: Duration = Duration::from_secs(10);
 
 pub struct Viewer {
     pub state: Mutex<State>,
     tx: mpsc::UnboundedSender<Cmd>,
     repaint: Arc<dyn Fn() + Send + Sync>,
+    routes: Mutex<HashMap<u32, mpsc::UnboundedSender<Ev>>>,
+    next_id: AtomicU32,
+    cancels: Mutex<HashSet<u32>>,
+    last_clip_files: Mutex<ClipSig>,
+    /// Temporary folder for small clipboard fetches; removed when the session ends.
+    clip_tmp: PathBuf,
 }
 
 /// What a connection needs from the signed-in app.
@@ -177,9 +295,17 @@ impl Viewer {
                 cursor: None,
                 codec: String::new(),
                 transfers: Vec::new(),
+                browser: RemoteDir::default(),
+                clip_offer: None,
+                notice: None,
             }),
             tx,
             repaint,
+            routes: Mutex::default(),
+            next_id: AtomicU32::new(1),
+            cancels: Mutex::default(),
+            last_clip_files: Mutex::default(),
+            clip_tmp: clip_tmp_dir(),
         });
         let task = v.clone();
         crate::runtime().spawn(async move {
@@ -194,6 +320,7 @@ impl Viewer {
             }
             st.phase = Phase::Closed;
             drop(st);
+            let _ = std::fs::remove_dir_all(&task.clip_tmp);
             (task.repaint)();
         });
         v
@@ -215,6 +342,7 @@ impl Viewer {
             input: true,
             clipboard: true,
             files: true,
+            features: crate::files::FEATURES.iter().map(|f| f.to_string()).collect(),
         };
         Arc::new(Viewer {
             state: Mutex::new(State {
@@ -231,10 +359,18 @@ impl Viewer {
                 remote_clipboard: None,
                 cursor: None,
                 codec: String::new(),
-                transfers: vec![Transfer { id: 1, name: "รายงานประจำเดือน.xlsx".into(), size: 100, sent: 64, status: TransferStatus::Active }],
+                transfers: vec![Transfer { id: 1, name: "รายงานประจำเดือน.xlsx".into(), size: 100, sent: 64, files: 1, ..Default::default() }],
+                browser: RemoteDir::default(),
+                clip_offer: None,
+                notice: None,
             }),
             tx,
             repaint: Arc::new(|| {}),
+            routes: Mutex::default(),
+            next_id: AtomicU32::new(1),
+            cancels: Mutex::default(),
+            last_clip_files: Mutex::default(),
+            clip_tmp: clip_tmp_dir(),
         })
     }
 
@@ -244,11 +380,75 @@ impl Viewer {
 
     pub fn submit_password(&self, pw: &str) {
         self.state.lock().unwrap().error = None;
-        self.send(json!({"t": "auth", "password": pw, "codecs": CODECS}));
+        self.send(json!({"t": "auth", "password": pw, "codecs": CODECS, "features": FEATURES}));
     }
 
-    pub fn upload(&self, path: PathBuf) {
-        let _ = self.tx.send(Cmd::Upload(path));
+    /// Uploads a local file or folder into `remote_dir` ("" = the agent's ~/Downloads/Aegiron).
+    pub fn upload(&self, path: PathBuf, remote_dir: String) {
+        let _ = self.tx.send(Cmd::Upload(path, remote_dir));
+    }
+
+    /// Downloads a remote file or folder into this machine's ~/Downloads/Aegiron.
+    pub fn download(&self, remote: String, dir: bool) {
+        let _ = self.tx.send(Cmd::Download(remote, dir));
+    }
+
+    pub fn cancel(&self, id: u32) {
+        let _ = self.tx.send(Cmd::Cancel(id));
+    }
+
+    pub fn list_dir(&self, path: &str) {
+        {
+            let mut st = self.state.lock().unwrap();
+            st.browser.loading = true;
+            st.browser.error = None;
+        }
+        self.send(json!({"t": "ls", "path": path}));
+    }
+
+    /// Sends a file-management request (`mkdir`, `rm`, `mv`); the listing refreshes on `fs_ok`.
+    pub fn fs_op(&self, mut msg: Value) {
+        msg["id"] = json!(self.next_id.fetch_add(1, Ordering::Relaxed));
+        self.send(msg);
+    }
+
+    pub fn clear_finished(&self) {
+        self.state.lock().unwrap().transfers.retain(|t| t.status == TransferStatus::Active);
+    }
+
+    /// Paste in the remote window. If this machine's clipboard holds files (and the agent
+    /// allows clipboard files), uploads them, puts them on the remote clipboard and then sends
+    /// `paste_keys`. The result says what the caller still has to do.
+    pub fn paste_files(&self, paste_keys: Vec<Value>) -> Paste {
+        let ok = {
+            let st = self.state.lock().unwrap();
+            st.phase == Phase::Connected && st.info.as_ref().is_some_and(Info::clip_files)
+        };
+        if !ok {
+            return Paste::Text;
+        }
+        let files = arboard::Clipboard::new().and_then(|mut c| c.get().file_list()).unwrap_or_default();
+        if files.is_empty() {
+            return Paste::Text;
+        }
+        let sig = clip_sig(&files);
+        {
+            let mut last = self.last_clip_files.lock().unwrap();
+            if *last == sig {
+                // Already on the remote clipboard (pasted before, or it came from there).
+                return Paste::KeysOnly;
+            }
+            *last = sig;
+        }
+        let _ = self.tx.send(Cmd::PasteFiles(files, paste_keys));
+        Paste::Files
+    }
+
+    /// Fetches files the remote side copied and puts them on this machine's clipboard.
+    pub fn accept_clip_offer(&self) {
+        if let Some(entries) = self.state.lock().unwrap().clip_offer.take() {
+            let _ = self.tx.send(Cmd::FetchClip(entries, false));
+        }
     }
 
     pub fn close(&self) {
@@ -348,9 +548,8 @@ async fn run(v: &Arc<Viewer>, t: Target, mut cmds: mpsc::UnboundedReceiver<Cmd>)
     let sig: [u8; 64] = B64.decode(hello.sig)?.try_into().map_err(|_| anyhow!("bad signature"))?;
     let mut ch: Channel = keys.finish(&ticket.ticket.sid, agent_epk, &sig, &device_key)?;
 
-    // File uploads read on their own task and feed this bounded queue (back-pressure).
+    // Transfers run on their own tasks and feed this bounded queue (back-pressure).
     let (up_tx, mut up_rx) = mpsc::channel::<Vec<u8>>(8);
-    let mut next_transfer = 1u32;
     let (mut frames, mut bytes, mut stats_at) = (0u32, 0usize, Instant::now());
     let mut h264: Option<H264Decoder> = None;
 
@@ -400,9 +599,18 @@ async fn run(v: &Arc<Viewer>, t: Target, mut cmds: mpsc::UnboundedReceiver<Cmd>)
                             }
                         }
                     }
+                    Some(&proto::MSG_FILE) if plain.len() >= 5 => {
+                        let id = u32::from_be_bytes(plain[1..5].try_into().unwrap());
+                        if let Some(r) = v.routes.lock().unwrap().get(&id) {
+                            let _ = r.send(Ev::Chunk(plain[5..].to_vec()));
+                        }
+                    }
                     Some(&proto::MSG_JSON) => {
                         let m: Value = serde_json::from_slice(&plain[1..])?;
-                        if let Some(reply) = control(v, &m) {
+                        let route = m["id"].as_u64().and_then(|id| v.routes.lock().unwrap().get(&(id as u32)).cloned());
+                        if let Some(r) = route {
+                            let _ = r.send(Ev::Json(m));
+                        } else if let Some(reply) = control(v, &m) {
                             tx.send(Message::Binary(ch.seal(&proto::json(&reply))?.into())).await?;
                         }
                     }
@@ -416,10 +624,24 @@ async fn run(v: &Arc<Viewer>, t: Target, mut cmds: mpsc::UnboundedReceiver<Cmd>)
             }
             c = cmds.recv() => match c {
                 Some(Cmd::Json(j)) => tx.send(Message::Binary(ch.seal(&proto::json(&j))?.into())).await?,
-                Some(Cmd::Upload(path)) => {
-                    let id = next_transfer;
-                    next_transfer += 1;
-                    start_upload(v.clone(), id, path, up_tx.clone());
+                Some(Cmd::Upload(path, dir)) => {
+                    let link = Link { v: v.clone(), out: up_tx.clone() };
+                    tokio::spawn(async move { link.upload(&path, &dir).await; });
+                }
+                Some(Cmd::Download(path, dir)) => {
+                    let link = Link { v: v.clone(), out: up_tx.clone() };
+                    tokio::spawn(async move { link.download(&path, dir, &files::default_upload_dir()).await; });
+                }
+                Some(Cmd::Cancel(id)) => {
+                    v.cancels.lock().unwrap().insert(id);
+                }
+                Some(Cmd::PasteFiles(paths, keys)) => {
+                    let link = Link { v: v.clone(), out: up_tx.clone() };
+                    tokio::spawn(async move { link.paste(paths, keys).await; });
+                }
+                Some(Cmd::FetchClip(entries, temp)) => {
+                    let link = Link { v: v.clone(), out: up_tx.clone() };
+                    tokio::spawn(async move { link.fetch_clip(entries, temp).await; });
                 }
                 Some(Cmd::Close) | None => {
                     let _ = tx.send(Message::Binary(ch.seal(&proto::json(&json!({"t": "bye"})))?.into())).await;
@@ -442,7 +664,7 @@ fn control(v: &Viewer, m: &Value) -> Option<Value> {
                 st.phase = Phase::Password;
             } else {
                 st.phase = Phase::Approval;
-                reply = Some(json!({"t": "auth", "password": null, "codecs": CODECS}));
+                reply = Some(json!({"t": "auth", "password": null, "codecs": CODECS, "features": FEATURES}));
             }
         }
         "auth_pending" => st.phase = Phase::Approval,
@@ -472,53 +694,586 @@ fn control(v: &Viewer, m: &Value) -> Option<Value> {
             st.cursor = m["visible"].as_bool().unwrap_or(false).then_some((x, y));
         }
         "clip" => st.remote_clipboard = m["s"].as_str().map(str::to_owned),
-        "put_done" => set_transfer(st, m, TransferStatus::Done(m["path"].as_str().unwrap_or("").to_owned())),
-        "fs_error" => set_transfer(st, m, TransferStatus::Failed(m["message"].as_str().unwrap_or("").to_owned())),
+        "clip_files" => {
+            let entries: Vec<ClipEntry> = serde_json::from_value(m["files"].clone()).unwrap_or_default();
+            if entries.is_empty() || !st.info.as_ref().is_some_and(Info::clip_files) {
+                return;
+            }
+            let small = entries.len() <= AUTO_FETCH_FILES
+                && entries.iter().all(|e| !e.dir)
+                && entries.iter().map(|e| e.size).sum::<u64>() <= AUTO_FETCH_BYTES;
+            if small {
+                st.clip_offer = None;
+                let _ = v.tx.send(Cmd::FetchClip(entries, true));
+            } else {
+                st.clip_offer = Some(entries);
+            }
+        }
+        "ls" => {
+            st.browser = RemoteDir {
+                path: m["path"].as_str().unwrap_or("").to_owned(),
+                parent: m["parent"].as_str().map(str::to_owned),
+                sep: m["sep"].as_str().unwrap_or("/").to_owned(),
+                entries: serde_json::from_value(m["entries"].clone()).unwrap_or_default(),
+                error: None,
+                loading: false,
+            };
+        }
+        "fs_ok" => {
+            if !st.browser.path.is_empty() {
+                st.browser.loading = true;
+                reply = Some(json!({"t": "ls", "path": st.browser.path}));
+            }
+        }
+        "fs_error" => {
+            let msg = m["message"].as_str().unwrap_or("").to_owned();
+            let id = m["id"].as_u64().map(|i| i as u32);
+            match st.transfers.iter_mut().find(|t| Some(t.id) == id) {
+                Some(t) => t.status = TransferStatus::Failed(msg),
+                // A late answer for a file of a finished/cancelled transfer: not a panel error.
+                None if matches!(m["op"].as_str(), Some("put" | "get" | "get_dir")) => {}
+                None => {
+                    st.browser.error = Some(msg);
+                    st.browser.loading = false;
+                }
+            }
+        }
         _ => {}
     });
     reply
 }
 
-fn set_transfer(st: &mut State, m: &Value, status: TransferStatus) {
-    let id = m["id"].as_u64().unwrap_or(0) as u32;
-    if let Some(t) = st.transfers.iter_mut().find(|t| t.id == id) {
-        t.status = status;
+
+/// What a paste in the remote window should do.
+#[derive(Debug, PartialEq)]
+pub enum Paste {
+    /// No files on this clipboard: hand over the text and press paste remotely.
+    Text,
+    /// Files are being uploaded; paste is pressed remotely when they are there.
+    Files,
+    /// The same files are already on the remote clipboard: only press paste remotely.
+    KeysOnly,
+}
+
+const CLOSED: &str = "การเชื่อมต่อถูกปิด";
+const CANCELLED: &str = "ยกเลิกแล้ว";
+const NO_REPLY: &str = "เครื่องปลายทางไม่ตอบ";
+/// Progress is pushed to the window at most this often.
+const PROGRESS_EVERY: Duration = Duration::from_millis(100);
+
+/// A transfer task's handle on the session: the outgoing queue plus reply routing by id.
+struct Link {
+    v: Arc<Viewer>,
+    out: mpsc::Sender<Vec<u8>>,
+}
+
+impl Link {
+    fn next_id(&self) -> u32 {
+        self.v.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn route(&self, id: u32, tx: mpsc::UnboundedSender<Ev>) {
+        self.v.routes.lock().unwrap().insert(id, tx);
+    }
+
+    fn unroute(&self, id: u32) {
+        self.v.routes.lock().unwrap().remove(&id);
+    }
+
+    fn cancelled(&self, id: u32) -> bool {
+        self.v.cancels.lock().unwrap().contains(&id)
+    }
+
+    async fn send(&self, m: Value) -> Result<()> {
+        self.out.send(proto::json(&m)).await.map_err(|_| anyhow!(CLOSED))
+    }
+
+    /// Sends a request carrying `id` and returns its first reply (`fs_error` becomes an error).
+    async fn request(&self, id: u32, m: Value) -> Result<Value> {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        self.route(id, tx);
+        let res = async {
+            self.send(m).await?;
+            loop {
+                match tokio::time::timeout(Duration::from_secs(60), rx.recv()).await {
+                    Err(_) => bail!(NO_REPLY),
+                    Ok(None) => bail!(CLOSED),
+                    Ok(Some(Ev::Json(r))) if r["t"] == "fs_error" => bail!("{}", r["message"].as_str().unwrap_or("error")),
+                    Ok(Some(Ev::Json(r))) => return Ok(r),
+                    Ok(Some(Ev::Chunk(_))) => {}
+                }
+            }
+        }
+        .await;
+        self.unroute(id);
+        res
+    }
+
+    fn add(&self, t: Transfer) {
+        self.v.update(|st| st.transfers.push(t));
+    }
+
+    fn update(&self, id: u32, f: impl FnOnce(&mut Transfer)) {
+        self.v.update(|st| {
+            if let Some(t) = st.transfers.iter_mut().find(|t| t.id == id) {
+                f(t)
+            }
+        });
+    }
+
+    fn notice(&self, msg: impl Into<String>) {
+        let msg = msg.into();
+        self.v.update(|st| st.notice = Some(msg));
+    }
+
+    fn finish<T: std::fmt::Display>(&self, id: u32, res: Result<T>) -> Option<T> {
+        self.v.cancels.lock().unwrap().remove(&id);
+        match res {
+            Ok(v) => {
+                let path = v.to_string();
+                self.update(id, |t| {
+                    t.status = TransferStatus::Done(path);
+                    t.current.clear();
+                });
+                Some(v)
+            }
+            Err(e) => {
+                tracing::warn!("transfer {id}: {e:#}");
+                self.update(id, |t| t.status = TransferStatus::Failed(format!("{e:#}")));
+                None
+            }
+        }
+    }
+
+    // ---- upload (viewer → agent) ----
+
+    /// Uploads a local file or folder into `remote_dir`; returns what was created remotely.
+    async fn upload(&self, path: &Path, remote_dir: &str) -> Option<String> {
+        let id = self.next_id();
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
+        self.add(Transfer { id, name: name.clone(), up: true, ..Default::default() });
+        let res = self.upload_inner(id, path, &name, remote_dir).await;
+        self.finish(id, res)
+    }
+
+    async fn upload_inner(&self, id: u32, path: &Path, name: &str, remote_dir: &str) -> Result<String> {
+        let meta = tokio::fs::metadata(path).await?;
+        if !meta.is_dir() {
+            self.update(id, |t| {
+                t.files = 1;
+                t.size = meta.len();
+                t.current = name.to_owned();
+            });
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            self.route(id, tx);
+            let res = async {
+                self.send_file(id, id, path, json!({"t": "put", "id": id, "dir": remote_dir, "name": name})).await?;
+                loop {
+                    match tokio::time::timeout(Duration::from_secs(120), rx.recv()).await {
+                        Err(_) => bail!(NO_REPLY),
+                        Ok(None) => bail!(CLOSED),
+                        Ok(Some(Ev::Json(m))) if m["t"] == "put_done" => return Ok(m["path"].as_str().unwrap_or("").to_owned()),
+                        Ok(Some(Ev::Json(m))) if m["t"] == "fs_error" => bail!("{}", m["message"].as_str().unwrap_or("error")),
+                        Ok(Some(_)) => {}
+                    }
+                }
+            }
+            .await;
+            self.unroute(id);
+            if res.is_ok() {
+                self.update(id, |t| t.files_done = 1);
+            }
+            return res;
+        }
+
+        // A folder: create it (uniquely named) on the agent, then send its files one by one.
+        let local_root = path.to_path_buf();
+        let tree = tokio::task::spawn_blocking(move || files::walk(&local_root)).await??;
+        let (count, total) = (tree.files.len() as u32, tree.size());
+        self.update(id, |t| {
+            t.folder = true;
+            t.files = count;
+            t.size = total;
+        });
+        let rid = self.next_id();
+        let reply = self.request(rid, json!({"t": "mkdir", "id": rid, "dir": remote_dir, "name": name})).await?;
+        let root = reply["path"].as_str().ok_or_else(|| anyhow!("bad mkdir reply"))?.to_owned();
+        for d in tree.empty_dirs() {
+            let rid = self.next_id();
+            if let Err(e) = self.request(rid, json!({"t": "mkdir", "id": rid, "dir": root, "name": d})).await {
+                tracing::warn!("upload: mkdir {d}: {e:#}");
+            }
+        }
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut pending = HashSet::new();
+        let mut result = Ok(());
+        for (rel, file, _) in &tree.files {
+            if self.cancelled(id) {
+                result = Err(anyhow!(CANCELLED));
+                break;
+            }
+            let sub = self.next_id();
+            self.route(sub, tx.clone());
+            pending.insert(sub);
+            self.update(id, |t| t.current = rel.clone());
+            let file_name = rel.rsplit('/').next().unwrap_or(rel);
+            let put = json!({"t": "put", "id": sub, "dir": root, "name": file_name, "rel": rel});
+            if let Err(e) = self.send_file(id, sub, file, put).await {
+                let fatal = self.cancelled(id) || e.to_string() == CLOSED;
+                pending.remove(&sub);
+                self.unroute(sub);
+                if fatal {
+                    result = Err(e);
+                    break;
+                }
+                tracing::warn!("upload {rel}: {e:#}");
+                self.update(id, |t| t.failed += 1);
+            }
+            while let Ok(ev) = rx.try_recv() {
+                self.upload_reply(id, ev, &mut pending);
+            }
+        }
+        while result.is_ok() && !pending.is_empty() {
+            match tokio::time::timeout(Duration::from_secs(120), rx.recv()).await {
+                Ok(Some(ev)) => self.upload_reply(id, ev, &mut pending),
+                _ => result = Err(anyhow!(NO_REPLY)),
+            }
+        }
+        for sub in pending {
+            self.unroute(sub);
+        }
+        result.map(|()| root)
+    }
+
+    /// Counts the agent's answer for one file of a folder upload.
+    fn upload_reply(&self, id: u32, ev: Ev, pending: &mut HashSet<u32>) {
+        let Ev::Json(m) = ev else { return };
+        let sub = m["id"].as_u64().unwrap_or(0) as u32;
+        let ok = match m["t"].as_str() {
+            Some("put_done") => true,
+            Some("fs_error") => false,
+            _ => return,
+        };
+        if pending.remove(&sub) {
+            self.unroute(sub);
+            if !ok {
+                tracing::warn!("upload: {}", m["message"]);
+            }
+            self.update(id, |t| if ok { t.files_done += 1 } else { t.failed += 1 });
+        }
+    }
+
+    /// Streams one local file as `put` (+ chunks) + `put_end` under transfer id `sub`;
+    /// progress goes to transfer `id`.
+    async fn send_file(&self, id: u32, sub: u32, path: &Path, mut put: Value) -> Result<()> {
+        let f = tokio::fs::File::open(path).await?;
+        let size = f.metadata().await?.len();
+        put["size"] = json!(size);
+        self.update(id, |t| {
+            t.cur_size = size;
+            t.cur_sent = 0;
+        });
+        self.send(put).await?;
+        let mut f = f.take(size);
+        let mut buf = vec![0u8; 64 * 1024];
+        let (mut sent, mut shown, mut at) = (0u64, 0u64, Instant::now());
+        loop {
+            if self.cancelled(id) {
+                let _ = self.send(json!({"t": "cancel", "id": sub})).await;
+                bail!(CANCELLED);
+            }
+            let n = match f.read(&mut buf).await {
+                Ok(n) => n,
+                Err(e) => {
+                    let _ = self.send(json!({"t": "cancel", "id": sub})).await;
+                    return Err(e.into());
+                }
+            };
+            if n == 0 {
+                break;
+            }
+            self.out.send(proto::file_chunk(sub, &buf[..n])).await.map_err(|_| anyhow!(CLOSED))?;
+            sent += n as u64;
+            if at.elapsed() >= PROGRESS_EVERY {
+                let delta = sent - shown;
+                self.update(id, |t| {
+                    t.cur_sent = sent;
+                    t.sent += delta;
+                });
+                (shown, at) = (sent, Instant::now());
+            }
+        }
+        let delta = sent - shown;
+        self.update(id, |t| {
+            t.cur_sent = sent;
+            t.sent += delta;
+        });
+        if sent != size {
+            let _ = self.send(json!({"t": "cancel", "id": sub})).await;
+            bail!("ไฟล์ถูกแก้ไขระหว่างส่ง");
+        }
+        self.send(json!({"t": "put_end", "id": sub})).await
+    }
+
+    // ---- download (agent → viewer) ----
+
+    /// Downloads a remote file or folder into `dest`; returns the local path created.
+    async fn download(&self, remote: &str, dir: bool, dest: &Path) -> Option<PathBuf> {
+        let id = self.next_id();
+        let name = remote.rsplit(['/', '\\']).find(|s| !s.is_empty()).unwrap_or(remote).to_owned();
+        self.add(Transfer { id, name, folder: dir, ..Default::default() });
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.route(id, tx);
+        let mut partial = None;
+        let res = self.download_inner(id, remote, dir, dest, rx, &mut partial).await;
+        self.unroute(id);
+        if res.is_err() {
+            if self.cancelled(id) {
+                let _ = self.send(json!({"t": "cancel", "id": id})).await;
+            }
+            if let Some(p) = partial {
+                let _ = tokio::fs::remove_file(p).await;
+            }
+        }
+        self.finish(id, res.map(|p| p.display().to_string())).map(PathBuf::from)
+    }
+
+    async fn download_inner(
+        &self,
+        id: u32,
+        remote: &str,
+        dir: bool,
+        dest: &Path,
+        mut rx: mpsc::UnboundedReceiver<Ev>,
+        partial: &mut Option<PathBuf>,
+    ) -> Result<PathBuf> {
+        use tokio::io::AsyncWriteExt;
+        let op = if dir { "get_dir" } else { "get" };
+        self.send(json!({"t": op, "id": id, "path": remote})).await?;
+        let create = |p: PathBuf| async move { tokio::fs::OpenOptions::new().write(true).create_new(true).open(p).await };
+        let mut root: Option<PathBuf> = None;
+        let mut cur: Option<tokio::fs::File> = None;
+        let (mut cur_sent, mut shown, mut at, mut idle) = (0u64, 0u64, Instant::now(), Duration::ZERO);
+        loop {
+            let ev = match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+                Err(_) => {
+                    if self.cancelled(id) {
+                        bail!(CANCELLED);
+                    }
+                    idle += Duration::from_millis(500);
+                    if idle > Duration::from_secs(120) {
+                        bail!(NO_REPLY);
+                    }
+                    continue;
+                }
+                Ok(None) => bail!(CLOSED),
+                Ok(Some(ev)) => ev,
+            };
+            idle = Duration::ZERO;
+            if self.cancelled(id) {
+                bail!(CANCELLED);
+            }
+            let m = match ev {
+                Ev::Chunk(data) => {
+                    if let Some(f) = cur.as_mut() {
+                        f.write_all(&data).await?;
+                    }
+                    cur_sent += data.len() as u64;
+                    if at.elapsed() >= PROGRESS_EVERY {
+                        let delta = cur_sent - shown;
+                        self.update(id, |t| {
+                            t.cur_sent = cur_sent;
+                            t.sent += delta;
+                        });
+                        (shown, at) = (cur_sent, Instant::now());
+                    }
+                    continue;
+                }
+                Ev::Json(m) => m,
+            };
+            let t = m["t"].as_str().unwrap_or("");
+            // These end the file in progress (if any).
+            if matches!(t, "dir_file" | "dir_skip" | "get_end") {
+                let delta = cur_sent - shown;
+                let done = match cur.take() {
+                    Some(mut f) => {
+                        f.flush().await?;
+                        *partial = None;
+                        true
+                    }
+                    None => false,
+                };
+                self.update(id, |t| {
+                    t.cur_sent = cur_sent;
+                    t.sent += delta;
+                    if done {
+                        t.files_done += 1;
+                    }
+                });
+                (cur_sent, shown) = (0, 0);
+            }
+            match t {
+                "get_start" => {
+                    let name = files::sanitize(m["name"].as_str().unwrap_or(""));
+                    let size = m["size"].as_u64().unwrap_or(0);
+                    let p = unique_path(dest, &name);
+                    cur = Some(create(p.clone()).await?);
+                    *partial = Some(p.clone());
+                    root = Some(p);
+                    self.update(id, |t| {
+                        t.files = 1;
+                        t.size = size;
+                        t.cur_size = size;
+                        t.current = name;
+                    });
+                }
+                "dir_start" => {
+                    // The folder name and every relative path come from the remote side: untrusted.
+                    let name = rel_components(m["name"].as_str().unwrap_or(""))
+                        .ok()
+                        .filter(|c| c.len() == 1)
+                        .map(|mut c| c.remove(0))
+                        .unwrap_or_else(|| "folder".into());
+                    let p = unique_path(dest, &name);
+                    std::fs::create_dir(&p)?;
+                    let mut bad = 0;
+                    for d in m["dirs"].as_array().into_iter().flatten() {
+                        if rel_components(d.as_str().unwrap_or("")).and_then(|c| ensure_dirs(&p, &c)).is_err() {
+                            bad += 1;
+                        }
+                    }
+                    root = Some(p);
+                    let (files, size) = (m["files"].as_u64().unwrap_or(0) as u32, m["size"].as_u64().unwrap_or(0));
+                    self.update(id, |t| {
+                        t.files = files;
+                        t.size = size;
+                        t.failed += bad;
+                    });
+                }
+                "dir_file" => {
+                    let Some(root) = root.as_ref() else { bail!("unexpected dir_file") };
+                    let rel = m["rel"].as_str().unwrap_or("");
+                    let size = m["size"].as_u64().unwrap_or(0);
+                    let target = rel_components(rel).and_then(|c| {
+                        let parent = ensure_dirs(root, &c[..c.len() - 1])?;
+                        Ok(unique_path(&parent, &c[c.len() - 1]))
+                    });
+                    match target {
+                        Ok(p) => {
+                            cur = Some(create(p.clone()).await?);
+                            *partial = Some(p);
+                        }
+                        Err(e) => {
+                            // Skip this file's chunks; the rest of the folder still comes.
+                            tracing::warn!("download: {e}");
+                            self.update(id, |t| t.failed += 1);
+                        }
+                    }
+                    self.update(id, |t| {
+                        t.current = rel.to_owned();
+                        t.cur_size = size;
+                        t.cur_sent = 0;
+                    });
+                }
+                "dir_skip" => {
+                    tracing::warn!("download: remote skipped {}: {}", m["rel"], m["message"]);
+                    self.update(id, |t| t.failed += 1);
+                }
+                "get_end" => return root.ok_or_else(|| anyhow!("empty download")),
+                "fs_error" => bail!("{}", m["message"].as_str().unwrap_or("error")),
+                _ => {}
+            }
+        }
+    }
+
+    // ---- clipboard files ----
+
+    /// Paste with files on this machine's clipboard: upload them to the agent's
+    /// ~/Downloads/Aegiron, put them on its clipboard, then press paste remotely.
+    async fn paste(&self, paths: Vec<PathBuf>, keys: Vec<Value>) {
+        let started = Instant::now();
+        let mut remote = Vec::new();
+        for p in &paths {
+            if let Some(r) = self.upload(p, "").await {
+                remote.push(r);
+            }
+        }
+        if remote.is_empty() {
+            self.v.last_clip_files.lock().unwrap().clear();
+            self.notice("ส่งไฟล์จากคลิปบอร์ดไม่สำเร็จ");
+            return;
+        }
+        let rid = self.next_id();
+        match self.request(rid, json!({"t": "clip_files", "id": rid, "paths": remote})).await {
+            Ok(_) if started.elapsed() <= PASTE_DEADLINE => {
+                for k in keys {
+                    let _ = self.send(k).await;
+                }
+                self.notice(format!("วางไฟล์ {} รายการแล้ว (สำเนาอยู่ที่ Downloads/Aegiron ของเครื่องปลายทาง)", remote.len()));
+            }
+            // Took long enough that the user may be doing something else: don't press paste.
+            Ok(_) => self.notice("ส่งไฟล์เสร็จแล้ว กดวางอีกครั้งเพื่อวางบนเครื่องปลายทาง"),
+            Err(e) => {
+                self.v.last_clip_files.lock().unwrap().clear();
+                self.notice(format!("ไฟล์อยู่ที่ Downloads/Aegiron ของเครื่องปลายทาง แต่ใส่คลิปบอร์ดไม่สำเร็จ: {e}"));
+            }
+        }
+    }
+
+    /// Files copied on the remote machine: download them, then put them on this clipboard.
+    async fn fetch_clip(&self, entries: Vec<ClipEntry>, temp: bool) {
+        let dest = if temp {
+            let d = self.v.clip_tmp.join(self.next_id().to_string());
+            if let Err(e) = std::fs::create_dir_all(&d) {
+                self.notice(format!("รับไฟล์จากคลิปบอร์ดไม่สำเร็จ: {e}"));
+                return;
+            }
+            d
+        } else {
+            files::default_upload_dir()
+        };
+        let mut local = Vec::new();
+        for e in &entries {
+            if let Some(p) = self.download(&e.path, e.dir, &dest).await {
+                local.push(p);
+            }
+        }
+        if local.is_empty() {
+            self.notice("รับไฟล์จากคลิปบอร์ดของเครื่องปลายทางไม่สำเร็จ");
+            return;
+        }
+        let list = local.clone();
+        let set = tokio::task::spawn_blocking(move || arboard::Clipboard::new().and_then(|mut c| c.set().file_list(&list))).await;
+        match set {
+            Ok(Ok(())) => {
+                // Pasting these back into the remote window must not upload them again.
+                *self.v.last_clip_files.lock().unwrap() = clip_sig(&local);
+                self.notice(if temp {
+                    format!("คัดลอก {} รายการจากเครื่องปลายทางแล้ว วางในเครื่องนี้ได้เลย", local.len())
+                } else {
+                    format!("บันทึก {} รายการไว้ที่ Downloads/Aegiron และคัดลอกไว้ในคลิปบอร์ดแล้ว", local.len())
+                });
+            }
+            _ => self.notice("บันทึกไฟล์ไว้ที่ Downloads/Aegiron แล้ว แต่ใส่คลิปบอร์ดไม่สำเร็จ"),
+        }
     }
 }
 
-fn start_upload(v: Arc<Viewer>, id: u32, path: PathBuf, out: mpsc::Sender<Vec<u8>>) {
-    tokio::spawn(async move {
-        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
-        let res: Result<()> = async {
-            let mut f = tokio::fs::File::open(&path).await?;
-            let size = f.metadata().await?.len();
-            v.update(|st| st.transfers.push(Transfer { id, name: name.clone(), size, sent: 0, status: TransferStatus::Active }));
-            // Empty dir = the agent's ~/Downloads/Aegiron.
-            out.send(proto::json(&json!({"t": "put", "id": id, "dir": "", "name": name, "size": size}))).await?;
-            let mut buf = vec![0u8; 64 * 1024];
-            let mut sent = 0u64;
-            loop {
-                let n = f.read(&mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                out.send(proto::file_chunk(id, &buf[..n])).await?;
-                sent += n as u64;
-                v.update(|st| {
-                    if let Some(t) = st.transfers.iter_mut().find(|t| t.id == id) {
-                        t.sent = sent;
-                    }
-                });
-            }
-            out.send(proto::json(&json!({"t": "put_end", "id": id}))).await?;
-            Ok(())
-        }
-        .await;
-        if let Err(e) = res {
-            v.update(|st| match st.transfers.iter_mut().find(|t| t.id == id) {
-                Some(t) => t.status = TransferStatus::Failed(e.to_string()),
-                None => st.transfers.push(Transfer { id, name, size: 0, sent: 0, status: TransferStatus::Failed(e.to_string()) }),
-            });
-        }
-    });
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn features_come_from_info() {
+        // An agent before folder transfer sends no `features`: only single files are offered.
+        let old: Info = serde_json::from_value(json!({"hostname": "pc", "os": "windows", "files": true, "clipboard": true})).unwrap();
+        assert!(!old.fs2() && !old.clip_files());
+        let new: Info = serde_json::from_value(json!({"files": true, "clipboard": true, "features": ["fs2", "clipfiles"]})).unwrap();
+        assert!(new.fs2() && new.clip_files());
+        // Clipboard files need both permissions.
+        let no_clip: Info = serde_json::from_value(json!({"files": true, "clipboard": false, "features": ["fs2", "clipfiles"]})).unwrap();
+        assert!(no_clip.fs2() && !no_clip.clip_files());
+        let no_files: Info = serde_json::from_value(json!({"files": false, "clipboard": true, "features": ["fs2", "clipfiles"]})).unwrap();
+        assert!(!no_files.fs2() && !no_files.clip_files());
+    }
 }

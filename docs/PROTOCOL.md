@@ -57,7 +57,7 @@ Byte 0 is the type: `0x01` JSON, `0x02` video rectangle (`x, y, frame_w, frame_h
 
 | Direction | Message |
 |---|---|
-| agent→viewer | `auth_required {password, click}`, `auth_pending`, `auth_result {ok, reason?, attempts_left?, retry_after?}`, `info {hostname, os, displays[], input, clipboard, files, codec}`, `cursor {x,y,visible}`, `clip {s}` |
+| agent→viewer | `auth_required {password, click}`, `auth_pending`, `auth_result {ok, reason?, attempts_left?, retry_after?}`, `info {hostname, os, displays[], input, clipboard, files, codec, features?}`, `cursor {x,y,visible}`, `clip {s}` |
 | viewer→agent | `auth {password, codecs[]}`, `mm {x,y}`, `mb {b,down,x,y}`, `wh {dx,dy}`, `key {code,key,down}`, `text {s}`, `clip {s}`, `cfg {fps,quality,max_width,display}`, `refresh` (alias `keyframe`), `bye` |
 | files viewer→agent | `ls {path}` (`""` = home), `put {id,dir,name,size}` followed by `0x03` chunks and then `put_end {id}`, `get {id,path}`, `cancel {id}` |
 | files agent→viewer | `ls {path,parent,sep,entries[{name,dir,size,mtime}]}`, `put_ok {id,path}`, `put_done {id,path}`, `get_start {id,name,size}` followed by `0x03` chunks and then `get_end {id}`, `fs_error {op,id?,message}` |
@@ -72,6 +72,35 @@ The viewer lists the codecs it can decode in `auth.codecs`, best first (`["h264"
 Screen captures do not include the pointer, so the agent sends `cursor` (normalised to the streamed display, `visible=false` when it is on another display) whenever the pointer moves. Viewers draw it while their own pointer is not over the remote screen.
 
 Uploads keep only the file name (any path the viewer sends is dropped), never overwrite an existing file (`name (1).ext`), must match the announced size, and are deleted if the session ends before `put_end`. Downloads are read on a separate task and share the session's back-pressured outbound queue with video.
+
+### Folders and file management (`info.features` contains `"fs2"`)
+
+Agents from 0.6 list optional capabilities in `info.features` (an array of strings; absent on older agents). Viewers only offer folder transfer, delete, rename, new folder and clipboard files when the matching feature is listed, so old agents and old viewers keep working with the single-file messages above. Everything here still requires the `files` permission; refused requests get `fs_error`.
+
+| Direction | Message |
+|---|---|
+| viewer→agent | `put {id,dir,name,size,rel}`: like `put`, but `rel` is a path inside `dir` (`/`-separated, e.g. `"Photos/2024/a.jpg"`); missing directories are created |
+| viewer→agent | `mkdir {id,dir,name}` (`dir` `""` = `~/Downloads/Aegiron`; `name` may be a relative path; the last component gets ` (1)` if it exists) → `fs_ok {op:"mkdir",id,path}` |
+| viewer→agent | `get_dir {id,path}` → `dir_start {id,name,files,size,dirs[]}`, then for each file `dir_file {id,rel,size}` followed by its `0x03` chunks (same transfer id), `dir_skip {id,rel,message}` for unreadable files, and finally `get_end {id}` |
+| viewer→agent | `rm {id,path}` (file or whole directory) → `fs_ok {op:"rm",id,path}` |
+| viewer→agent | `mv {id,path,name}` (rename inside the same directory; fails if `name` exists) → `fs_ok {op:"mv",id,path}` (new path) |
+| viewer→agent | `cancel {id}` now also stops a running `get` / `get_dir` |
+
+Folder upload: the viewer sends `mkdir {dir, name:"<folder>"}` and uses the returned path (so an existing folder is never merged into: `Photos (1)`), then one `put {dir:<path>, rel}` per file (and `mkdir` for empty sub-folders), one after another. Folder download streams files one at a time; the viewer creates `dirs[]` (including empty ones) and writes each `dir_file` until the next `dir_file` or `get_end`. The browser saves a downloaded folder as `<folder>.zip`; the desktop app writes it under `~/Downloads/Aegiron/<folder>` (` (1)` if taken).
+
+Relative paths are untrusted on both sides (agent for `put.rel`/`mkdir.name`, viewer for `dir_file.rel`/`dirs`): split on `/` and `\`; a path that is empty, absolute, has a drive/UNC prefix or contains `.`/`..` components is rejected; characters invalid on Windows (`<>:"|?*`, control characters) become `_`; a component is at most 255 bytes. While creating directories, an existing component that is a symlink or not a directory aborts that file, so a symlink inside the target cannot redirect writes elsewhere. `get_dir` never follows symlinks (they are skipped) and stops at 100,000 entries or depth 64. `rm` refuses the filesystem root and the home directory and removes a symlink itself, never its target. Every upload, download, delete and rename is reported as an agent event (`file_upload`, `file_download`, `file_delete`, `file_rename`).
+
+### Clipboard files (`info.features` contains `"clipfiles"`; desktop app only)
+
+Needs both the `clipboard` and `files` permissions. The viewer opts in with `auth {…, features:["clipfiles"]}`.
+
+| Direction | Message |
+|---|---|
+| agent→viewer | `clip_files {files[{name,path,dir,size}]}`: files/folders were copied on the agent (macOS `NSPasteboard` file URLs, Windows `CF_HDROP`) |
+| viewer→agent | `clip_files {id,paths[]}`: put these agent paths on the agent's clipboard as files → `fs_ok {op:"clip_files",id}` |
+
+- **Viewer → agent (paste):** when ⌘V/Ctrl+V is pressed in the remote window and this machine's clipboard holds files, the app uploads them (folders included) to `~/Downloads/Aegiron` on the agent, puts the uploaded paths on the agent's clipboard with `clip_files`, then presses paste on the remote side, so pasting into Finder/Explorer copies them there. The files also stay in `Downloads/Aegiron` (the app says so), which is the fallback when the focused remote app does not accept files. Pressing paste again without copying anything new only presses paste remotely.
+- **Agent → viewer (copy):** small selections (files only, at most 20 and 32 MiB in total) are fetched right away into a temporary folder and put on this machine's clipboard as files, so ⌘V/Ctrl+V in Finder/Explorer pastes them; larger selections and folders wait for the user to click *รับไฟล์* in the remote window, are saved under `~/Downloads/Aegiron` and then put on the clipboard. Files never flow to a viewer that did not opt in, and the agent does not echo back file lists it set itself.
 
 Pointer coordinates are normalised to 0–1 over the displayed frame. Plain typing uses the actual character (Thai and other layouts work). Shortcuts with Ctrl/Cmd/Alt use the physical key.
 

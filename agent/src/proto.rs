@@ -58,6 +58,9 @@ pub enum ViewerMsg {
         /// Video codecs the viewer can decode, e.g. ["h264", "jpeg"]; absent = JPEG only.
         #[serde(default)]
         codecs: Vec<String>,
+        /// Optional viewer capabilities, e.g. ["clipfiles"] (absent on older viewers).
+        #[serde(default)]
+        features: Vec<String>,
     },
     /// Pointer move; x, y are normalised to [0, 1] across the displayed frame.
     #[serde(rename = "mm")]
@@ -80,14 +83,56 @@ pub enum ViewerMsg {
     #[serde(rename = "ls")]
     List { path: String },
     /// Start an upload into `dir` ("" = ~/Downloads/Aegiron); chunks follow as MSG_FILE.
+    /// With `rel` (feature "fs2") the file goes to that relative path inside `dir`.
     #[serde(rename = "put")]
-    Put { id: u32, dir: String, name: String, size: u64 },
+    Put {
+        id: u32,
+        dir: String,
+        #[serde(default)]
+        name: String,
+        size: u64,
+        #[serde(default)]
+        rel: Option<String>,
+    },
     #[serde(rename = "put_end")]
     PutEnd { id: u32 },
     #[serde(rename = "get")]
     Get { id: u32, path: String },
     #[serde(rename = "cancel")]
     Cancel { id: u32 },
+    /// Download a whole directory tree (feature "fs2").
+    #[serde(rename = "get_dir")]
+    GetDir { id: u32, path: String },
+    /// Create a directory; `name` may be a relative path (feature "fs2").
+    #[serde(rename = "mkdir")]
+    Mkdir {
+        #[serde(default)]
+        id: Option<u32>,
+        dir: String,
+        name: String,
+    },
+    /// Delete a file or directory (feature "fs2").
+    #[serde(rename = "rm")]
+    Remove {
+        #[serde(default)]
+        id: Option<u32>,
+        path: String,
+    },
+    /// Rename inside the same directory (feature "fs2").
+    #[serde(rename = "mv")]
+    Rename {
+        #[serde(default)]
+        id: Option<u32>,
+        path: String,
+        name: String,
+    },
+    /// Put these agent paths on the agent's clipboard as files (feature "clipfiles").
+    #[serde(rename = "clip_files")]
+    ClipFiles {
+        #[serde(default)]
+        id: Option<u32>,
+        paths: Vec<String>,
+    },
     /// Resend the whole screen (JPEG) or a keyframe (H.264), e.g. after a decoder error.
     #[serde(rename = "refresh", alias = "keyframe")]
     Refresh,
