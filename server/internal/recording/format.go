@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 )
 
 const (
@@ -27,6 +28,7 @@ const (
 	msgVideo  = 0x04
 	msgAudio  = 0x05
 	videoH264 = 1
+	videoAV1  = 2
 	audioOpus = 1
 )
 
@@ -43,7 +45,7 @@ type Info struct {
 	Header       Header
 	DurationMS   int64
 	Frames       int
-	Codec        string // "h264", "jpeg", "h264+jpeg" or "" (no video)
+	Codec        string // codecs seen, "+"-joined in the order h264, av1, jpeg ("h264+jpeg"), or "" (no video)
 	Audio        string // "opus" or "" (no sound recorded)
 	AudioPackets int
 }
@@ -67,7 +69,7 @@ func Scan(r io.Reader) (*Info, error) {
 	if err := json.Unmarshal(hb, &info.Header); err != nil || info.Header.V != 1 {
 		return nil, errors.New("unsupported recording header")
 	}
-	var h264, jpeg bool
+	var h264, av1, jpeg bool
 	var hdr [8]byte
 	var typ [1]byte
 	for i := 0; ; i++ {
@@ -105,6 +107,7 @@ func Scan(r io.Reader) (*Info, error) {
 			}
 			rest--
 			h264 = h264 || codec[0] == videoH264
+			av1 = av1 || codec[0] == videoAV1
 		case msgAudio:
 			// codec u8, sequence u32 BE, then at least one byte of Opus.
 			var codec [1]byte
@@ -124,13 +127,15 @@ func Scan(r io.Reader) (*Info, error) {
 			return nil, fmt.Errorf("record %d: truncated", i)
 		}
 	}
-	switch {
-	case h264 && jpeg:
-		info.Codec = "h264+jpeg"
-	case h264:
-		info.Codec = "h264"
-	case jpeg:
-		info.Codec = "jpeg"
+	var codecs []string
+	for _, c := range []struct {
+		seen bool
+		name string
+	}{{h264, "h264"}, {av1, "av1"}, {jpeg, "jpeg"}} {
+		if c.seen {
+			codecs = append(codecs, c.name)
+		}
 	}
+	info.Codec = strings.Join(codecs, "+")
 	return info, nil
 }

@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aegiron_agent::account::{self, Login};
+use aegiron_agent::codec::Codec;
 use aegiron_agent::viewer::{Phase, Target, Viewer};
 
 fn main() -> anyhow::Result<()> {
@@ -23,7 +24,9 @@ fn main() -> anyhow::Result<()> {
     let password = std::env::var("AEGIRON_PASSWORD")?;
     let Login::Ok(session) = account::login(&server, true, &account::LoginRequest { email, password, ..Default::default() })? else { anyhow::bail!("2FA not supported here") };
 
-    let target = Target { server, token: session.token, insecure: true, device_id: id, name: "probe".into(), direct: true, only: None };
+    // AEGIRON_CODEC=av1 asks for AV1 (the agent falls back to H.264 without an AV1 encoder).
+    let codec = std::env::var("AEGIRON_CODEC").ok().and_then(|c| Codec::from_name(&c)).unwrap_or(Codec::H264);
+    let target = Target { server, token: session.token, insecure: true, device_id: id, name: "probe".into(), direct: true, only: None, codec };
     let v = Viewer::connect(target, Arc::new(|| {}));
     let mut sent = false;
     let mut connected_for = 0;

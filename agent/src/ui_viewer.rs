@@ -6,6 +6,7 @@ use super::*;
 
 use egui::{Order, Popup, RectAlign, Shadow};
 
+use crate::codec::Codec;
 use crate::viewer::{ClipEntry, Info, Paste, Phase, RemoteDir, Transfer, TransferStatus};
 
 const QUALITY: [(&str, u8, u32); 3] = [("คมชัด", 85, 2560), ("สมดุล", 70, 1920), ("ประหยัดเน็ต", 45, 1280)];
@@ -478,6 +479,16 @@ impl ViewerWindow {
                 if menu_row(ui, Lead::Check(w.quality == q), QUALITY[q].0, "", true).clicked() && w.quality != q {
                     w.quality = q;
                     self.viewer.send(serde_json::json!({"t": "cfg", "quality": QUALITY[q].1, "max_width": QUALITY[q].2}));
+                }
+            }
+            menu_separator(ui);
+            // AV1 only when the remote machine can encode it (info.codecs, agents from 0.6).
+            menu_header(ui, "Codec วิดีโอ");
+            let want = self.viewer.state.lock().unwrap().want_codec;
+            let av1 = f.info.is_some_and(|i| i.codecs.iter().any(|c| c == "av1"));
+            for (c, label, hint, enabled) in [(Codec::H264, "H.264", "", true), (Codec::Av1, "AV1", if av1 { "" } else { "ปลายทางไม่รองรับ" }, av1)] {
+                if menu_row(ui, Lead::Check(want == c), label, hint, enabled).clicked() && want != c {
+                    self.viewer.set_codec(c);
                 }
             }
             menu_separator(ui);
@@ -978,6 +989,7 @@ fn codec_label(codec: &str, encoder: &str) -> String {
     match (codec, encoder) {
         ("", _) => "–".into(),
         ("h264", e) if !e.is_empty() => format!("H264 · {}", encoder_label(e)),
+        ("av1", e) if !e.is_empty() => format!("AV1 · {}", encoder_label(e)),
         (c, _) => c.to_uppercase(),
     }
 }

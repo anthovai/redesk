@@ -4,8 +4,9 @@
 //!   0x01  JSON control message (UTF-8)
 //!   0x02  video rectangle: x, y, frame_w, frame_h (u16 BE) followed by a JPEG
 //!   0x03  file chunk: transfer id (u32 BE) followed by raw bytes
-//!   0x04  video frame: codec (u8, 1 = H.264), flags (u8, bit 0 = keyframe), width, height
-//!         (u16 BE) followed by the encoded access unit (H.264: Annex B)
+//!   0x04  video frame: codec (u8, 1 = H.264, 2 = AV1), flags (u8, bit 0 = keyframe), width,
+//!         height (u16 BE) followed by the encoded access unit (H.264: Annex B; AV1: one
+//!         temporal unit of low-overhead OBUs)
 //!   0x05  audio packet: codec (u8, 1 = Opus 48 kHz stereo), sequence (u32 BE, one per 20 ms
 //!         frame) followed by one Opus packet. Only sent to viewers that asked for audio.
 
@@ -104,8 +105,9 @@ pub enum ViewerMsg {
     Text { s: String },
     #[serde(rename = "clip")]
     Clipboard { s: String },
+    /// Stream settings; `codec` ("av1", "h264", "jpeg") switches to one of `info.codecs`.
     #[serde(rename = "cfg")]
-    Config { fps: Option<u32>, quality: Option<u8>, max_width: Option<u32>, display: Option<usize> },
+    Config { fps: Option<u32>, quality: Option<u8>, max_width: Option<u32>, display: Option<usize>, codec: Option<String> },
     /// List a directory ("" = home).
     #[serde(rename = "ls")]
     List { path: String },

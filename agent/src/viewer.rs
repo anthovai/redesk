@@ -18,7 +18,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::audio::{self, OpusDecoder, Player};
-use crate::codec::H264Decoder;
+use crate::codec::{Codec, VideoDecoder};
 use crate::crypto::{Channel, ViewerKeys};
 use crate::files::{self, ensure_dirs, rel_components, unique_path};
 use crate::{account, fingerprint, proto};
@@ -70,6 +70,9 @@ pub struct Info {
     /// The agent streams its audio to this viewer.
     #[serde(default)]
     pub audio: bool,
+    /// Codecs this session can switch to with `cfg {codec}`; empty on agents before 0.6.
+    #[serde(default)]
+    pub codecs: Vec<String>,
 }
 
 impl Info {
@@ -88,8 +91,14 @@ impl Info {
     }
 }
 
-/// Video codecs this viewer decodes, best first.
-const CODECS: [&str; 2] = ["h264", "jpeg"];
+/// Video codecs this viewer decodes, best first: H.264 unless the user picked AV1. AV1 is
+/// listed either way, so the agent can say whether a switch to it is possible.
+fn codecs(prefer: Codec) -> [&'static str; 3] {
+    match prefer {
+        Codec::Av1 => ["av1", "h264", "jpeg"],
+        _ => ["h264", "av1", "jpeg"],
+    }
+}
 /// Optional protocol features this viewer supports (sent in `auth`).
 const FEATURES: [&str; 1] = ["clipfiles"];
 
@@ -220,8 +229,10 @@ pub struct State {
     pub remote_clipboard: Option<String>,
     /// Remote pointer, normalised to the screen; None while it is on another display.
     pub cursor: Option<(f32, f32)>,
-    /// Codec the agent chose ("h264" or "jpeg").
+    /// Codec the agent chose ("h264", "av1" or "jpeg").
     pub codec: String,
+    /// Codec the user asked for (H.264 or AV1); the agent may not have it.
+    pub want_codec: Codec,
     /// Encoder the agent uses ("videotoolbox", "mediafoundation", "openh264", "jpeg").
     pub encoder: String,
     /// Speaker muted by the user (the agent is asked to stop sending audio).
@@ -301,6 +312,8 @@ pub struct Target {
     pub direct: bool,
     /// Diagnostics (`aegiron-agent connect --only`): use just this path, no fallback.
     pub only: Option<crate::direct::Path>,
+    /// Video codec to ask for (Settings → General; H.264 unless the user picked AV1).
+    pub codec: Codec,
 }
 
 impl Viewer {
@@ -321,6 +334,7 @@ impl Viewer {
                 remote_clipboard: None,
                 cursor: None,
                 codec: String::new(),
+                want_codec: target.codec,
                 encoder: String::new(),
                 muted: false,
                 audio_level: None,
@@ -377,6 +391,7 @@ impl Viewer {
             whiteboard: true,
             features: crate::files::FEATURES.iter().map(|f| f.to_string()).collect(),
             audio: true,
+            codecs: vec!["av1".into(), "h264".into(), "jpeg".into()],
         };
         Arc::new(Viewer {
             state: Mutex::new(State {
@@ -393,6 +408,7 @@ impl Viewer {
                 remote_clipboard: None,
                 cursor: None,
                 codec: String::new(),
+                want_codec: Codec::H264,
                 encoder: String::new(),
                 muted: false,
                 audio_level: None,
@@ -417,8 +433,19 @@ impl Viewer {
     }
 
     pub fn submit_password(&self, pw: &str) {
-        self.state.lock().unwrap().error = None;
-        self.send(json!({"t": "auth", "password": pw, "codecs": CODECS, "features": FEATURES, "audio": audio_codecs()}));
+        let prefer = {
+            let mut st = self.state.lock().unwrap();
+            st.error = None;
+            st.want_codec
+        };
+        self.send(json!({"t": "auth", "password": pw, "codecs": codecs(prefer), "features": FEATURES, "audio": audio_codecs()}));
+    }
+
+    /// Switches the video codec for this session (H.264 or AV1). Agents that cannot, or that
+    /// predate codec switching, keep the current one; `codec` shows what is in use.
+    pub fn set_codec(&self, codec: Codec) {
+        self.update(|st| st.want_codec = codec);
+        self.send(json!({"t": "cfg", "codec": codec.name()}));
     }
 
     /// Mutes or unmutes the remote audio; the agent stops sending while muted.
@@ -612,7 +639,7 @@ async fn run(v: &Arc<Viewer>, t: Target, mut cmds: mpsc::UnboundedReceiver<Cmd>)
     // Transfers run on their own tasks and feed this bounded queue (back-pressure).
     let (up_tx, mut up_rx) = mpsc::channel::<Vec<u8>>(8);
     let (mut frames, mut bytes, mut stats_at) = (0u32, 0usize, Instant::now());
-    let mut h264: Option<H264Decoder> = None;
+    let mut video: Option<VideoDecoder> = None;
     let mut opus: Option<OpusDecoder> = None;
     let mut player: Option<Player> = None;
     // AEGIRON_AUDIO_OUT=0 decodes but does not play (tests on the same machine as the agent,
@@ -649,10 +676,16 @@ async fn run(v: &Arc<Viewer>, t: Target, mut cmds: mpsc::UnboundedReceiver<Cmd>)
                         frames += 1;
                     }
                     Some(&proto::MSG_VIDEO) if plain.len() > 7 => {
-                        if h264.is_none() {
-                            h264 = Some(H264Decoder::new()?);
+                        let Some(codec) = Codec::from_id(plain[1]) else { continue };
+                        if video.as_ref().is_none_or(|d| d.codec() != codec) {
+                            // A new decoder (first frame, codec switch, after an error) starts
+                            // at a keyframe; the agent sends one with every switch.
+                            if plain[2] & proto::VIDEO_KEYFRAME == 0 {
+                                continue;
+                            }
+                            video = Some(VideoDecoder::new(codec)?);
                         }
-                        match h264.as_mut().unwrap().decode(&plain[7..]) {
+                        match video.as_mut().unwrap().decode(&plain[7..]) {
                             Ok(Some((w, h, rgba))) => {
                                 v.update(|st| st.fb.set(w, h, rgba));
                                 frames += 1;
@@ -661,7 +694,7 @@ async fn run(v: &Arc<Viewer>, t: Target, mut cmds: mpsc::UnboundedReceiver<Cmd>)
                             Err(e) => {
                                 // Start over from the next keyframe rather than show a smeared picture.
                                 tracing::warn!("viewer: {e:#}; requesting a keyframe");
-                                h264 = None;
+                                video = None;
                                 tx.send(Message::Binary(ch.seal(&proto::json(&json!({"t": "keyframe"})))?.into())).await?;
                             }
                         }
@@ -764,7 +797,7 @@ fn control(v: &Viewer, m: &Value) -> Option<Value> {
                 st.phase = Phase::Password;
             } else {
                 st.phase = Phase::Approval;
-                reply = Some(json!({"t": "auth", "password": null, "codecs": CODECS, "features": FEATURES, "audio": audio_codecs()}));
+                reply = Some(json!({"t": "auth", "password": null, "codecs": codecs(st.want_codec), "features": FEATURES, "audio": audio_codecs()}));
             }
         }
         "auth_pending" => st.phase = Phase::Approval,

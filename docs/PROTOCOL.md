@@ -53,36 +53,49 @@ Every later message is binary ciphertext. A dropped, reordered, or replayed mess
 
 ## 4. Messages inside the encrypted channel
 
-Byte 0 is the type: `0x01` JSON, `0x02` video rectangle (`x, y, frame_w, frame_h` as u16 BE, followed by a JPEG), `0x03` file chunk (transfer id as u32 BE, followed by up to 64 KiB of data), `0x04` video frame (codec u8 `1` = H.264, flags u8 with bit 0 = keyframe, `width, height` as u16 BE, followed by one Annex B access unit), `0x05` audio packet (see [Audio](#audio)).
+Byte 0 is the type: `0x01` JSON, `0x02` video rectangle (`x, y, frame_w, frame_h` as u16 BE, followed by a JPEG), `0x03` file chunk (transfer id as u32 BE, followed by up to 64 KiB of data), `0x04` video frame (codec u8 `1` = H.264 or `2` = AV1, flags u8 with bit 0 = keyframe, `width, height` as u16 BE, followed by one access unit: Annex B for H.264, one temporal unit of low-overhead OBUs for AV1), `0x05` audio packet (see [Audio](#audio)).
 
 | Direction | Message |
 |---|---|
-| agent→viewer | `auth_required {password, click}`, `auth_pending`, `auth_result {ok, reason?, attempts_left?, retry_after?}`, `info {hostname, os, displays[], input, clipboard, files, codec, features?, encoder?, audio?, audio_codec?}`, `encoder {encoder,codec}`, `cursor {x,y,visible}`, `clip {s}` |
-| viewer→agent | `auth {password, codecs[], features?[], audio?[]}`, `audio {on}`, `mm {x,y}`, `mb {b,down,x,y}`, `wh {dx,dy}`, `key {code,key,down}`, `text {s}`, `clip {s}`, `cfg {fps,quality,max_width,display}`, `refresh` (alias `keyframe`), `bye` |
+| agent→viewer | `auth_required {password, click}`, `auth_pending`, `auth_result {ok, reason?, attempts_left?, retry_after?}`, `info {hostname, os, displays[], input, clipboard, files, codec, codecs?[], features?, encoder?, audio?, audio_codec?}`, `encoder {encoder,codec}`, `cursor {x,y,visible}`, `clip {s}` |
+| viewer→agent | `auth {password, codecs[], features?[], audio?[]}`, `audio {on}`, `mm {x,y}`, `mb {b,down,x,y}`, `wh {dx,dy}`, `key {code,key,down}`, `text {s}`, `clip {s}`, `cfg {fps,quality,max_width,display,codec?}`, `refresh` (alias `keyframe`), `bye` |
 | files viewer→agent | `ls {path}` (`""` = home), `put {id,dir,name,size}` followed by `0x03` chunks and then `put_end {id}`, `get {id,path}`, `cancel {id}` |
 | files agent→viewer | `ls {path,parent,sep,entries[{name,dir,size,mtime}]}`, `put_ok {id,path}`, `put_done {id,path}`, `get_start {id,name,size}` followed by `0x03` chunks and then `get_end {id}`, `fs_error {op,id?,message}` |
 
 ### Video codecs
 
-The viewer lists the codecs it can decode in `auth.codecs`, best first (`["h264","jpeg"]`). The agent picks H.264 when offered, otherwise JPEG, and reports the choice in `info.codec`.
+The viewer lists the codecs it can decode in `auth.codecs`, best first (`["h264","av1","jpeg"]`, or `["av1","h264","jpeg"]` when the user picked AV1). The agent picks AV1 only when it comes before `h264` in that list and this machine has an AV1 encoder; otherwise H.264 when offered, otherwise JPEG. It reports the choice in `info.codec`. H.264 stays the default: 0.4/0.5 viewers send `["h264","jpeg"]` and 0.4/0.5 agents pick H.264 whenever it is listed, so a list that starts with `av1` still gets H.264 from them.
 
 - **H.264** (OpenH264, Constrained Baseline, screen-content mode, rate control from resolution × fps × quality): whole frames as `0x04`, sent only when the screen changed. A keyframe goes out at start, after `cfg` changes, on `refresh`/`keyframe`, and every ~10 s of activity. Browsers decode with WebCodecs (`avc1.42E033`) and the native app with OpenH264. A viewer drops deltas until its first keyframe and sends `keyframe` after a decoder error. If the agent's encoder fails, it falls back to JPEG rectangles in the same session, so every viewer must accept both.
+- **AV1** (opt-in, hardware encoder only): whole frames as `0x04` with codec `2`, same keyframe and change-only rules as H.264. Each payload is one temporal unit in the low-overhead OBU format (AV1 spec section 5), and every keyframe carries the sequence header, so decoders are configured without a description. Browsers decode with WebCodecs (`av01.0.08M.08`, a higher level above 2048×1088) and the native app with rav1d. Only offered by a viewer that can decode it (the browser checks `VideoDecoder.isConfigSupported`).
 - **JPEG** (fallback): only the changed bounding rectangle as `0x02`.
+
+`info.codecs` (agents from 0.6) lists the codecs this session can switch to: the viewer's list, limited to what the agent can encode (`av1` only with an AV1 encoder). The viewer switches with `cfg {codec}`; the agent ignores codecs not in `info.codecs`, starts the new codec with a keyframe and announces it with `encoder`. Viewers pick the decoder from the codec byte of each `0x04` frame and, after a change, drop deltas until the next keyframe. Older agents ignore `cfg.codec` and send no `info.codecs`.
+
+The app chooses in Settings → General → Codec เมื่อควบคุมเครื่องอื่น (`viewer_codec` in the config, `h264` or `av1`, default `h264`; `aegiron-agent connect --codec av1` for one session) and per window in การแสดงผล → Codec วิดีโอ. The web viewer remembers the choice from its quality menu (การแสดงผล → Codec วิดีโอ) in the browser. Both show the codec actually in use in the menu and the quality monitor.
 
 ### Video encoders
 
-H.264 has several encoders behind it; the agent picks one per session and reports it in `info.encoder`:
+Each codec has one or more encoders behind it; the agent picks one per session and reports it in `info.encoder`:
 
 | `encoder` | Where | Notes |
 |---|---|---|
 | `videotoolbox` | macOS | Hardware only (`RequireHardwareAcceleratedVideoEncoder`), Constrained Baseline (Baseline before macOS 12), real time, no frame reordering, BT.601. AVCC output is rewritten to Annex B with SPS/PPS before every IDR. |
 | `mediafoundation` | Windows | First hardware H.264 MFT that accepts NV12 input (Quick Sync, NVENC, AMF), Baseline profile, low-latency mode. Untested on real hardware so far. |
+| `mediafoundation` (AV1) | Windows | First hardware AV1 MFT that accepts NV12 input (NVIDIA RTX 40, Intel Arc / Core Ultra, AMD RDNA 3 and newer), Main 4:2:0 8-bit, low-latency mode. The sequence header is copied in front of any keyframe that comes without one. Probed once per process; without one AV1 is not offered. Untested on real hardware so far. |
 | `openh264` | everywhere | Software fallback, unchanged. |
 | `jpeg` | | The session uses JPEG rectangles. |
 
-All of them produce Annex B Constrained Baseline, so `avc1.42E033` (WebCodecs) and OpenH264 (native app) decode any of them and nothing changes for older viewers. The choice is automatic: hardware, then OpenH264, then JPEG. The host can force software in the app (Settings → General → การเข้ารหัสวิดีโอ → ซอฟต์แวร์เท่านั้น) or with `aegiron-agent set --video-encoder software` (`video_encoder` in the config; default `auto`). If the encoder in use changes during a session (a hardware encoder fails and OpenH264 takes over, or H.264 fails and JPEG takes over), the agent sends `{"t":"encoder","encoder","codec"}`. Viewers that do not know this message ignore it. `AEGIRON_HW_ENCODER=0` on the agent turns hardware encoding off. Older agents send no `encoder`; for H.264 that means `openh264`.
+All H.264 encoders produce Annex B Constrained Baseline, so `avc1.42E033` (WebCodecs) and OpenH264 (native app) decode any of them and nothing changes for older viewers. The choice is automatic: hardware, then OpenH264, then JPEG. AV1 is hardware only, so "software only" also turns AV1 off. The host can force software in the app (Settings → General → การเข้ารหัสวิดีโอ → ซอฟต์แวร์เท่านั้น) or with `aegiron-agent set --video-encoder software` (`video_encoder` in the config; default `auto`). If the encoder or codec in use changes during a session (the AV1 encoder fails and H.264 takes over, a hardware encoder fails and OpenH264 takes over, H.264 fails and JPEG takes over, or the viewer switched with `cfg {codec}`), the agent sends `{"t":"encoder","encoder","codec"}`. Viewers that do not know this message ignore it. Every viewer that offers AV1 also decodes H.264, so an AV1 failure never ends the session. `AEGIRON_HW_ENCODER=0` on the agent turns hardware encoding off. Older agents send no `encoder`; for H.264 that means `openh264`.
 
-VP9 is not offered. libvpx is a C library that would have to be built for both macOS architectures and cross-compiled with mingw for Windows, and screen content at these bitrates gains little over hardware H.264.
+Why AV1 only in hardware, and no VP9:
+
+- **rav1e** (pure Rust AV1 encoder) is too slow for live screens and holds frames back. Even with `low_latency`, `rdo_lookahead_frames = 1`, speed 10 and 8 tiles it returns a frame's packet only after about four more frames, and sessions send frames only when the screen changes, so the last change would not show until the encoder is fed the same frame again. `examples/codec_bench.rs` measures that (the frame re-sent until its packet comes out) against the H.264 encoders on synthetic text at 1920×1080 on an Apple M4 (10 cores): typing 126 ms median / 306 ms p95 per change for rav1e vs 6 ms VideoToolbox and 13 ms OpenH264; scrolling 346 ms / 887 ms vs 6 ms and 25 ms. At 1280×720 rav1e still takes 75–96 ms. Its x86 assembly would also need nasm. rav1e is a dev-dependency for the AV1 round-trip test and the benchmark only.
+- **VideoToolbox** has no AV1 or VP9 encoder (Apple silicon up to M4 decodes AV1 in hardware but cannot encode it), so macOS agents never offer AV1.
+- **VP9** would need libvpx, a C library: the crates either link a system libvpx (pkg-config), download prebuilt binaries at build time, or run its configure/make, none of which builds from cargo alone for both macOS architectures and mingw. Hardware VP9 encoders are rare (Intel only), and screen content gains little over hardware H.264.
+- **libaom / SVT-AV1** need CMake and nasm.
+
+rav1d decodes without assembly (the x86 code needs nasm and the published crate lacks the headers its ARM code includes): about 5 ms per 1080p frame for typing and 11 ms for scrolling on the M4.
 
 ### Audio
 
@@ -203,7 +216,7 @@ u32 BE header length, JSON header {"v":1,"sid","device_id","hostname","os","star
 records until EOF: u32 BE milliseconds since start, u32 BE payload length (1..32 MiB), payload
 ```
 
-A payload is a plaintext channel message exactly as streamed: `0x04` H.264 frames, `0x02` JPEG rectangles (a session can switch from H.264 to JPEG), `0x01` `cursor` messages and `0x05` audio packets. Clipboard, file chunks and other control traffic are not recorded. The last record is `{"t":"end"}` so idle time at the end counts. The browser plays it with WebCodecs (H.264) and `createImageBitmap` (JPEG), seeking from the nearest H.264 keyframe or full-screen JPEG rectangle.
+A payload is a plaintext channel message exactly as streamed: `0x04` H.264 or AV1 frames, `0x02` JPEG rectangles (a session can switch codecs, e.g. from AV1 to H.264 or from H.264 to JPEG), `0x01` `cursor` messages and `0x05` audio packets. Clipboard, file chunks and other control traffic are not recorded. The last record is `{"t":"end"}` so idle time at the end counts. The browser plays it with WebCodecs (H.264, AV1) and `createImageBitmap` (JPEG), seeking from the nearest video keyframe or full-screen JPEG rectangle. The server's recording `codec` lists the codecs found, `+`-joined in the order h264, av1, jpeg (e.g. `h264+jpeg`).
 
 Audio (recordings made before audio was recorded have no `0x05` records and play as before):
 

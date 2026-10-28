@@ -43,6 +43,13 @@ func TestScan(t *testing.T) {
 		t.Fatalf("unexpected info with audio %+v", info)
 	}
 
+	// A session that switched from AV1 to H.264 (encoder failure) and to JPEG.
+	av1 := []byte{msgVideo, 2, 1, 0, 64, 0, 48, 0x12, 0x00, 0x32, 0x00}
+	info, err = Scan(bytes.NewReader(build(h, av1, video, jpeg)))
+	if err != nil || info.Frames != 3 || info.Codec != "h264+av1+jpeg" {
+		t.Fatalf("av1 recording: %+v %v", info, err)
+	}
+
 	info, err = Scan(bytes.NewReader(build(h)))
 	if err != nil || info.Frames != 0 || info.Codec != "" {
 		t.Fatalf("empty recording: %+v %v", info, err)

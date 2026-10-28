@@ -205,7 +205,8 @@ cd web && AEGIRON_PASSWORD=... bun scripts/e2e-viewer.ts <device-id> <device-pas
 
 ## ข้อจำกัดและแผนต่อไป
 
-- ยังไม่มี VP9/AV1 (H.264 ใช้ hardware encoder ของ VideoToolbox / Media Foundation และสำรองเป็น OpenH264); hardware encoder และเสียงบน Windows ยังไม่ได้ทดสอบกับเครื่องจริง
+- AV1 เป็นตัวเลือกเสริม ใช้ได้เฉพาะเมื่อเครื่องปลายทางเป็น Windows ที่มี AV1 hardware encoder (Mac ไม่มี AV1 encoder; encoder แบบ software ช้าเกินไปสำหรับใช้งานสด) ค่าเริ่มต้นยังเป็น H.264; ไม่มี VP9 เพราะ libvpx build จาก cargo อย่างเดียวไม่ได้
+- hardware encoder (H.264 และ AV1) และเสียงบน Windows ยังไม่ได้ทดสอบกับเครื่องจริง
 - เสียงจากเครื่องปลายทางต้องใช้ macOS 13 ขึ้นไป หรือ Windows
 - ยังไม่มีการควบคุมที่หน้าจอล็อกอินของ macOS (ต้องใช้ daemon ระดับ root ซึ่งตั้งใจไม่ทำ)
 - Wake-on-LAN ต้องมี agent อีกเครื่องออนไลน์ในวงแลนเดียวกัน และเครื่องเป้าหมายต้องเปิด WoL ไว้

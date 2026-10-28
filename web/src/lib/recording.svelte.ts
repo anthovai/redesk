@@ -1,22 +1,21 @@
 // Playback of Aegiron session recordings (.aerec, docs/PROTOCOL.md §7) in the browser.
 //
 // A recording is the plaintext stream the controlled machine sent during the session, with
-// timestamps: H.264 frames are decoded with WebCodecs (the same decoder setup as the live
+// timestamps: H.264 and AV1 frames are decoded with WebCodecs (the same decoder setup as the live
 // viewer), JPEG rectangles are drawn as images, pointer positions are replayed, and Opus audio
 // (when the session streamed it) plays through Web Audio on the same clock.
 
 import { RecordedAudio, type AudioPacket } from './audio.js';
+import { decoderConfig } from './videocodec';
 
 const MAGIC = 'AEGREC1\n';
 const MSG_JSON = 0x01;
 const MSG_FRAME = 0x02;
 const MSG_VIDEO = 0x04;
 const MSG_AUDIO = 0x05;
-const VIDEO_H264 = 1;
 const AUDIO_OPUS = 1;
 /** Audio plays up to this speed (faster is unintelligible); above it playback is silent. */
 const MAX_AUDIO_SPEED = 2;
-const H264_CONFIG: VideoDecoderConfig = { codec: 'avc1.42E033', optimizeForLatency: true, hardwareAcceleration: 'no-preference' };
 
 export interface RecordingHeader {
 	v: number;
@@ -103,7 +102,7 @@ function jpegSize(d: Uint8Array): [number, number] | null {
 /** A record playback can start from without anything before it. */
 function isKey(r: Rec): boolean {
 	const d = r.data;
-	if (d[0] === MSG_VIDEO) return d[1] === VIDEO_H264 && (d[2] & 1) === 1;
+	if (d[0] === MSG_VIDEO) return d.length > 7 && decoderConfig(d[1], 0, 0) !== null && (d[2] & 1) === 1;
 	if (d[0] === MSG_FRAME && d.length > 9) {
 		const v = new DataView(d.buffer, d.byteOffset, d.byteLength);
 		if (v.getUint16(1) !== 0 || v.getUint16(3) !== 0) return false;
@@ -128,6 +127,8 @@ export class RecordingPlayer {
 	private ctx: CanvasRenderingContext2D;
 	private audio: RecordedAudio | null = null;
 	private decoder: VideoDecoder | null = null;
+	/** WebCodecs codec string the decoder is configured for (a session can switch codecs). */
+	private decoderCodec = '';
 	private videoTs = 0;
 	private next = 0;
 	private wall = 0;
@@ -193,12 +194,17 @@ export class RecordingPlayer {
 
 	private apply(r: Rec) {
 		const d = r.data;
-		if (d[0] === MSG_VIDEO && d.length > 7 && d[1] === VIDEO_H264) {
+		const config = d[0] === MSG_VIDEO && d.length > 7 ? decoderConfig(d[1], (d[3] << 8) | d[4], (d[5] << 8) | d[6]) : null;
+		if (config) {
 			const key = (d[2] & 1) === 1;
+			if (config.codec !== this.decoderCodec) {
+				this.resetDecoder();
+				this.decoderCodec = config.codec;
+			}
 			if (!this.decoder) {
 				if (!key) return;
 				if (typeof VideoDecoder === 'undefined') {
-					this.error = 'เบราว์เซอร์นี้เล่นวิดีโอ H.264 ไม่ได้ (ต้องรองรับ WebCodecs)';
+					this.error = 'เบราว์เซอร์นี้เล่นวิดีโอในบันทึกไม่ได้ (ต้องรองรับ WebCodecs)';
 					return;
 				}
 				const gen = this.generation;
@@ -211,11 +217,11 @@ export class RecordingPlayer {
 						frame.close();
 					},
 					error: (e) => {
-						console.warn('recording: h264 decode error', e);
+						console.warn('recording: video decode error', e);
 						this.decoder = null;
 					}
 				});
-				this.decoder.configure(H264_CONFIG);
+				this.decoder.configure(config);
 			}
 			this.videoTs += 33_333;
 			this.decoder.decode(new EncodedVideoChunk({ type: key ? 'key' : 'delta', timestamp: this.videoTs, data: d.subarray(7) }));

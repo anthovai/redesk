@@ -18,7 +18,7 @@ use eframe::egui::{
 use tokio::sync::mpsc;
 
 use crate::account::{self, BookEntry};
-use crate::config::{Account, ApproveMode, Config, EncoderPref, Verification};
+use crate::config::{Account, ApproveMode, Config, EncoderPref, Verification, ViewerCodec};
 use crate::local::{self, LocalState, WindowGeom};
 use crate::signal::Agent;
 use crate::status::{ApprovalRequest, ServerState, SessionInfo, UiHooks};
@@ -1198,7 +1198,8 @@ impl App {
         };
         let insecure = agent.config.lock().unwrap().allow_insecure_transport;
         let direct = agent.config.lock().unwrap().direct_enabled;
-        let target = crate::viewer::Target { server, token: acc.token, insecure, device_id: id.to_string(), name: name.to_string(), direct, only: None };
+        let codec = agent.config.lock().unwrap().viewer_codec.codec();
+        let target = crate::viewer::Target { server, token: acc.token, insecure, device_id: id.to_string(), name: name.to_string(), direct, only: None, codec };
         // Frames arrive on the network thread: wake that connection's own window.
         let viewport = egui::ViewportId::from_hash_of(("remote", id, Instant::now()));
         let rctx = ctx.clone();

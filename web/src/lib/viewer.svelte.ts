@@ -5,6 +5,7 @@ import { b64decode, b64encode, completeHandshake, newViewerKeys, type Channel, t
 import { fingerprint } from './format';
 import { sanitizeRel, ZIP_LIMIT, ZipWriter, type LocalTree } from './filetree';
 import { RemoteAudio, supportedAudioCodecs } from './audio';
+import { decodableCodecs, decoderConfig, type VideoCodec } from './videocodec';
 
 export type Phase = 'requesting' | 'waiting' | 'handshake' | 'auth' | 'approval' | 'connected' | 'closed';
 
@@ -26,13 +27,15 @@ export interface AgentInfo {
 	files?: boolean;
 	max_fps: number;
 	codec?: string;
+	/** Codecs this session can switch to with `cfg {codec}` (agents from 0.6). */
+	codecs?: string[];
 	/** The controlled machine records this session (organisation policy). */
 	recording?: boolean;
 	/** The controlled machine shows annotations drawn by the viewer. */
 	whiteboard?: boolean;
 	/** Optional capabilities (agents from 0.6), e.g. "fs2" for folders and file management. */
 	features?: string[];
-	/** H.264 encoder on the agent: videotoolbox | mediafoundation | openh264 (jpeg for JPEG). */
+	/** Video encoder on the agent: videotoolbox | mediafoundation | openh264 (jpeg for JPEG). */
 	encoder?: string;
 	/** The agent streams its audio to this viewer (0x05 Opus packets). */
 	audio?: boolean;
@@ -90,20 +93,15 @@ const MSG_FRAME = 0x02;
 const MSG_FILE = 0x03;
 const MSG_VIDEO = 0x04;
 const MSG_AUDIO = 0x05;
-const VIDEO_H264 = 1;
 const AUDIO_OPUS = 1;
+const CODEC_KEY = 'aegiron.viewer.codec';
 
-// Constrained Baseline (what OpenH264 emits); Annex B, so no avcC description is needed.
-const H264_CONFIG: VideoDecoderConfig = { codec: 'avc1.42E033', optimizeForLatency: true, hardwareAcceleration: 'no-preference' };
-
-/** Codecs to offer the agent, best first. JPEG always works. */
-async function supportedCodecs(): Promise<string[]> {
+function storedCodec(): VideoCodec {
 	try {
-		if (typeof VideoDecoder !== 'undefined' && (await VideoDecoder.isConfigSupported(H264_CONFIG)).supported) return ['h264', 'jpeg'];
+		return localStorage.getItem(CODEC_KEY) === 'av1' ? 'av1' : 'h264';
 	} catch {
-		// fall through to JPEG
+		return 'h264';
 	}
-	return ['jpeg'];
 }
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -157,6 +155,10 @@ export class RemoteViewer {
 	audioLevel = $state<number | null>(null);
 	/** Audio is decoded but the browser has not allowed playback yet (needs a click). */
 	audioBlocked = $state(false);
+	/** Video codec the user asked for (H.264 unless they picked AV1); the agent may not have it. */
+	wantCodec = $state<VideoCodec>(storedCodec());
+	/** Codecs this browser decodes with WebCodecs. */
+	decodable = $state<VideoCodec[]>([]);
 
 	private ws: WebSocket | null = null;
 	private ch: Channel | null = null;
@@ -172,10 +174,12 @@ export class RemoteViewer {
 	private bytesIn = 0;
 	private statsTimer: ReturnType<typeof setInterval> | null = null;
 	private nextTransfer = 1;
-	private codecs: Promise<string[]> = supportedCodecs();
+	private codecs: Promise<VideoCodec[]> = decodableCodecs().then((c) => (this.decodable = c));
 	private audioCodecs: Promise<string[]> = supportedAudioCodecs();
 	private audio = new RemoteAudio();
 	private decoder: VideoDecoder | null = null;
+	/** WebCodecs codec string the decoder is configured for (codec, and level for AV1). */
+	private decoderCodec = '';
 	private needKeyframe = true;
 	private videoTs = 0;
 	private downloads = new Map<number, Uint8Array<ArrayBuffer>[]>();
@@ -376,10 +380,21 @@ export class RemoteViewer {
 		}
 	}
 
-	/** H.264 via WebCodecs. Deltas before the first keyframe are dropped; errors restart from one. */
+	/**
+	 * H.264 or AV1 via WebCodecs. Deltas before the first keyframe are dropped; errors and codec
+	 * switches restart from one (the agent sends a keyframe with every switch).
+	 */
 	private decodeVideo(p: Uint8Array<ArrayBuffer>) {
-		if (p[1] !== VIDEO_H264 || !this.canvas || !this.ctx) return;
+		if (!this.canvas || !this.ctx || p.length < 7) return;
+		const config = decoderConfig(p[1], (p[3] << 8) | p[4], (p[5] << 8) | p[6]);
+		if (!config) return;
 		const key = (p[2] & 1) === 1;
+		if (config.codec !== this.decoderCodec) {
+			if (this.decoder && this.decoder.state !== 'closed') this.decoder.close();
+			this.decoder = null;
+			this.decoderCodec = config.codec;
+			this.needKeyframe = true;
+		}
 		if (this.needKeyframe && !key) return;
 		if (!this.decoder || this.decoder.state === 'closed') {
 			const ctx = this.ctx;
@@ -391,13 +406,13 @@ export class RemoteViewer {
 					this.frames++;
 				},
 				error: (e) => {
-					console.warn('h264 decoder error, requesting keyframe', e);
+					console.warn('video decoder error, requesting keyframe', e);
 					this.decoder = null;
 					this.needKeyframe = true;
 					this.send({ t: 'keyframe' });
 				}
 			});
-			this.decoder.configure(H264_CONFIG);
+			this.decoder.configure(config);
 		}
 		this.needKeyframe = false;
 		this.videoTs += 33_333;
@@ -730,7 +745,12 @@ export class RemoteViewer {
 	}
 
 	private async authMessage(password: string | null) {
-		return { t: 'auth', password, codecs: await this.codecs, audio: await this.audioCodecs };
+		// Best first: the user's choice, then the other codec this browser decodes, then JPEG. AV1
+		// is listed even when not chosen so the agent reports whether a switch is possible.
+		const order: VideoCodec[] = this.wantCodec === 'av1' ? ['av1', 'h264'] : ['h264', 'av1'];
+		const decodable = await this.codecs;
+		const codecs = [...order.filter((c) => decodable.includes(c)), 'jpeg'];
+		return { t: 'auth', password, codecs, audio: await this.audioCodecs };
 	}
 
 	/** Lets audio play after a user gesture (browsers block autoplay until one). */
@@ -786,6 +806,17 @@ export class RemoteViewer {
 
 	refresh() {
 		this.send({ t: 'refresh' });
+	}
+
+	/** Switches the video codec (remembered for later sessions). Agents without it keep the current one. */
+	setCodec(codec: VideoCodec) {
+		this.wantCodec = codec;
+		try {
+			localStorage.setItem(CODEC_KEY, codec);
+		} catch {
+			// private mode: this session only
+		}
+		this.send({ t: 'cfg', codec });
 	}
 
 	// --- whiteboard (only when info.whiteboard) ---

@@ -1,13 +1,15 @@
-//! Hardware H.264 encoding with a Media Foundation transform (Windows: Intel Quick Sync,
-//! NVIDIA NVENC, AMD AMF expose their encoders as hardware MFTs).
+//! Hardware H.264 and AV1 encoding with a Media Foundation transform (Windows: Intel Quick
+//! Sync, NVIDIA NVENC, AMD AMF expose their encoders as hardware MFTs; AV1 needs NVIDIA RTX 40,
+//! Intel Arc / Core Ultra or AMD RDNA 3 and newer).
 //!
 //! UNTESTED on real Windows hardware: this compiles for x86_64-pc-windows-gnu but has only been
 //! exercised on macOS through the shared fallback logic. Any failure here (no hardware MFT,
-//! a type the MFT rejects, a timeout) makes the caller fall back to OpenH264.
+//! a type the MFT rejects, a timeout) makes the caller fall back to OpenH264 (AV1: to H.264).
 //!
-//! Configured as Baseline profile (MF_MT_MPEG2_PROFILE = 66), low-latency mode, no B-frames,
-//! BT.601 limited range NV12 input. Hardware MFTs are asynchronous: they ask for input and
-//! announce output through events, which this pumps synchronously per frame.
+//! Configured as H.264 Baseline profile (MF_MT_MPEG2_PROFILE = 66) or AV1 Main 4:2:0 8-bit,
+//! low-latency mode, no B-frames, BT.601 limited range NV12 input. Hardware MFTs are
+//! asynchronous: they ask for input and announce output through events, which this pumps
+//! synchronously per frame.
 
 use std::time::{Duration, Instant};
 
@@ -17,7 +19,7 @@ use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
 use windows::Win32::System::Variant::VARIANT;
 use windows_core::Interface;
 
-use super::{VideoEncoder, bitrate};
+use super::{Codec, VideoEncoder, av1_is_keyframe, av1_sequence_header, bitrate};
 
 const TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -33,10 +35,17 @@ pub struct MfEncoder {
     nv12: Vec<u8>,
     frame: i64,
     fps: u32,
+    codec: Codec,
+    /// Last AV1 sequence header seen, for keyframes that come without one.
+    seq_header: Option<Vec<u8>>,
 }
 
 pub fn new(w: usize, h: usize, fps: u32, quality: u8) -> Result<MfEncoder> {
-    unsafe { MfEncoder::new(w, h, fps, quality) }
+    unsafe { MfEncoder::new(Codec::H264, w, h, fps, quality) }
+}
+
+pub fn new_av1(w: usize, h: usize, fps: u32, quality: u8) -> Result<MfEncoder> {
+    unsafe { MfEncoder::new(Codec::Av1, w, h, fps, quality) }
 }
 
 fn pack(hi: u32, lo: u32) -> u64 {
@@ -44,7 +53,7 @@ fn pack(hi: u32, lo: u32) -> u64 {
 }
 
 impl MfEncoder {
-    unsafe fn new(w: usize, h: usize, fps: u32, quality: u8) -> Result<Self> {
+    unsafe fn new(codec: Codec, w: usize, h: usize, fps: u32, quality: u8) -> Result<Self> {
         unsafe {
             // S_FALSE / RPC_E_CHANGED_MODE are fine: COM is usable on this thread either way.
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -54,7 +63,11 @@ impl MfEncoder {
             }
 
             let input = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_NV12 };
-            let output = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_H264 };
+            let (subtype, label) = match codec {
+                Codec::Av1 => (MFVideoFormat_AV1, "AV1"),
+                _ => (MFVideoFormat_H264, "H.264"),
+            };
+            let output = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: subtype };
             let mut list: *mut Option<IMFActivate> = std::ptr::null_mut();
             let mut count = 0u32;
             MFTEnumEx(
@@ -67,14 +80,14 @@ impl MfEncoder {
             )
             .context("MFTEnumEx")?;
             if list.is_null() || count == 0 {
-                bail!("no hardware H.264 encoder (Media Foundation)");
+                bail!("no hardware {label} encoder (Media Foundation)");
             }
             let activates: Vec<Option<IMFActivate>> = (0..count as usize).map(|i| (*list.add(i)).take()).collect();
             windows::Win32::System::Com::CoTaskMemFree(Some(list as *const _));
 
-            let mut last = anyhow!("no usable hardware H.264 encoder");
+            let mut last = anyhow!("no usable hardware {label} encoder");
             for a in activates.into_iter().flatten() {
-                match Self::open(&a, w, h, fps, quality) {
+                match Self::open(&a, codec, w, h, fps, quality) {
                     Ok(e) => return Ok(e),
                     Err(e) => {
                         let _ = a.ShutdownObject();
@@ -86,7 +99,7 @@ impl MfEncoder {
         }
     }
 
-    unsafe fn open(a: &IMFActivate, w: usize, h: usize, fps: u32, quality: u8) -> Result<Self> {
+    unsafe fn open(a: &IMFActivate, codec: Codec, w: usize, h: usize, fps: u32, quality: u8) -> Result<Self> {
         unsafe {
             let transform: IMFTransform = a.ActivateObject().context("activate MFT")?;
             let attrs = transform.GetAttributes().context("MFT attributes")?;
@@ -99,14 +112,18 @@ impl MfEncoder {
             // Output first (encoders need it before the input type).
             let out = MFCreateMediaType()?;
             out.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-            out.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
+            let (subtype, profile) = match codec {
+                Codec::Av1 => (MFVideoFormat_AV1, eAVEncAV1VProfile_Main_420_8.0 as u32),
+                _ => (MFVideoFormat_H264, eAVEncH264VProfile_Base.0 as u32),
+            };
+            out.SetGUID(&MF_MT_SUBTYPE, &subtype)?;
             out.SetUINT32(&MF_MT_AVG_BITRATE, bitrate(w, h, fps, quality))?;
             out.SetUINT64(&MF_MT_FRAME_SIZE, pack(w as u32, h as u32))?;
             out.SetUINT64(&MF_MT_FRAME_RATE, pack(fps, 1))?;
             out.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack(1, 1))?;
             out.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
-            out.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base.0 as u32)?;
-            transform.SetOutputType(0, &out, 0).context("H.264 output type")?;
+            out.SetUINT32(&MF_MT_MPEG2_PROFILE, profile)?;
+            transform.SetOutputType(0, &out, 0).with_context(|| format!("{} output type", codec.name()))?;
 
             let inp = MFCreateMediaType()?;
             inp.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
@@ -143,6 +160,8 @@ impl MfEncoder {
                 nv12: vec![0; w * h * 3 / 2],
                 frame: 0,
                 fps,
+                codec,
+                seq_header: None,
             })
         }
     }
@@ -201,9 +220,13 @@ impl MfEncoder {
             mb.Lock(&mut ptr, None, Some(&mut len))?;
             let data = std::slice::from_raw_parts(ptr, len as usize).to_vec();
             mb.Unlock()?;
-            // Not every MFT sets CleanPoint; an IDR slice (NAL type 5) is the ground truth.
+            // Not every MFT sets CleanPoint; an IDR slice (NAL type 5) or an AV1 key frame
+            // header is the ground truth.
             let key = sample.GetUINT32(&MFSampleExtension_CleanPoint).unwrap_or(0) != 0
-                || data.windows(4).any(|w| w[..3] == [0, 0, 1] && w[3] & 0x1f == 5);
+                || match self.codec {
+                    Codec::Av1 => av1_is_keyframe(&data),
+                    _ => data.windows(4).any(|w| w[..3] == [0, 0, 1] && w[3] & 0x1f == 5),
+                };
             Ok(Some((data, key)))
         }
     }
@@ -267,7 +290,19 @@ impl VideoEncoder for MfEncoder {
             let before = out.len();
             self.pump(deadline, &mut out, |_, n| n > before)?;
             let key = out.iter().any(|(_, k)| *k);
-            let data: Vec<u8> = out.into_iter().flat_map(|(d, _)| d).collect();
+            let mut data: Vec<u8> = out.into_iter().flat_map(|(d, _)| d).collect();
+            if self.codec == Codec::Av1 && !data.is_empty() {
+                // Viewers configure their decoder from the keyframe, so every keyframe needs the
+                // sequence header in band.
+                match av1_sequence_header(&data) {
+                    Some(sh) => self.seq_header = Some(sh.to_vec()),
+                    None if key => {
+                        let sh = self.seq_header.as_deref().context("AV1 keyframe without a sequence header")?;
+                        data.splice(0..0, sh.iter().copied());
+                    }
+                    None => {}
+                }
+            }
             Ok((!data.is_empty()).then_some((data, key)))
         }
     }
@@ -278,6 +313,10 @@ impl VideoEncoder for MfEncoder {
 
     fn name(&self) -> &'static str {
         "mediafoundation"
+    }
+
+    fn codec(&self) -> Codec {
+        self.codec
     }
 }
 

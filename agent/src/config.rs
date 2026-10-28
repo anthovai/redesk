@@ -39,6 +39,25 @@ pub enum EncoderPref {
     Software,
 }
 
+/// Video codec this app asks for when it controls another machine.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum ViewerCodec {
+    #[default]
+    H264,
+    /// AV1 when the other machine has a hardware AV1 encoder, else H.264.
+    Av1,
+}
+
+impl ViewerCodec {
+    pub fn codec(self) -> crate::codec::Codec {
+        match self {
+            ViewerCodec::H264 => crate::codec::Codec::H264,
+            ViewerCodec::Av1 => crate::codec::Codec::Av1,
+        }
+    }
+}
+
 /// The person signed in from the desktop app (bearer token for the Aegiron API).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
@@ -111,6 +130,9 @@ pub struct Config {
     /// Hardware or software H.264 (absent in older configs = auto).
     #[serde(default)]
     pub video_encoder: EncoderPref,
+    /// Codec to ask for when controlling other machines (absent = H.264).
+    #[serde(default)]
+    pub viewer_codec: ViewerCodec,
     pub max_fps: u32,
     pub jpeg_quality: u8,
     pub max_width: u32,
@@ -171,6 +193,7 @@ impl Config {
             allow_file_transfer: true,
             allow_audio: true,
             video_encoder: EncoderPref::Auto,
+            viewer_codec: ViewerCodec::H264,
             max_fps: 15,
             jpeg_quality: 70,
             max_width: 1920,

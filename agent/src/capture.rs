@@ -182,17 +182,18 @@ impl Pointer {
 
 /// Runs on a dedicated thread until `stop` is set or the receiver goes away.
 /// `blocking_send` on a tiny channel paces capture to what the network can carry.
-/// `force_full` asks for a full JPEG frame or an H.264 keyframe.
-/// `reported` is the encoder named in `info`; a different one in use is announced with an
-/// `encoder` message (e.g. after the hardware encoder failed and OpenH264 took over).
-pub fn run(params: watch::Receiver<Params>, out: mpsc::Sender<Vec<u8>>, stop: Arc<AtomicBool>, force_full: Arc<AtomicBool>, reported: &'static str) {
+/// `force_full` asks for a full JPEG frame or a video keyframe.
+/// `reported` is the encoder named in `info`; a different encoder or codec in use is announced
+/// with an `encoder` message (e.g. after the hardware encoder failed and OpenH264 took over, or
+/// AV1 failed and H.264 took over). `h264` is the H.264 encoder the session's probe picked.
+pub fn run(params: watch::Receiver<Params>, out: mpsc::Sender<Vec<u8>>, stop: Arc<AtomicBool>, force_full: Arc<AtomicBool>, reported: &'static str, h264: &'static str) {
     let mut prev: Option<Frame> = None;
     let mut last_params = *params.borrow();
-    let mut h264: Option<Box<dyn VideoEncoder>> = None;
-    let mut h264_failed = false;
-    // Hardware is only tried when the session's probe picked it (and the settings allow it).
-    let mut hw_failed = !codec::is_hardware(reported);
-    let mut reported = reported;
+    let mut enc: Option<Box<dyn VideoEncoder>> = None;
+    let (mut av1_failed, mut h264_failed) = (false, false);
+    // Hardware H.264 is only tried when the session's probe picked it (and the settings allow it).
+    let mut hw_failed = !codec::is_hardware(h264);
+    let mut reported = (reported, last_params.codec);
     let mut pointer = Pointer::new();
     let mut warned = false;
     while !stop.load(Ordering::Relaxed) {
@@ -201,7 +202,7 @@ pub fn run(params: watch::Receiver<Params>, out: mpsc::Sender<Vec<u8>>, stop: Ar
         if p != last_params {
             last_params = p;
             prev = None;
-            h264 = None;
+            enc = None;
         }
         let monitors = Monitor::all().unwrap_or_default();
         let Some(m) = monitors.get(p.display).or(monitors.first()) else {
@@ -230,42 +231,56 @@ pub fn run(params: watch::Receiver<Params>, out: mpsc::Sender<Vec<u8>>, stop: Ar
                 continue;
             }
         };
-        let video = p.codec == Codec::H264 && !h264_failed;
-        let cur = downsample(&img, p.max_width, video);
+        // What this frame is encoded with: the requested codec unless it failed earlier in
+        // the session (AV1 -> H.264 -> JPEG).
+        let mut codec = match p.codec {
+            Codec::Av1 if !av1_failed => Codec::Av1,
+            Codec::Av1 | Codec::H264 if !h264_failed => Codec::H264,
+            _ => Codec::Jpeg,
+        };
+        let cur = downsample(&img, p.max_width, codec.is_video());
         let full = force_full.swap(false, Ordering::Relaxed);
         let rect = match &prev {
             Some(pf) if !full && pf.w == cur.w && pf.h == cur.h => dirty_rect(pf, &cur),
             _ => Some((0, 0, cur.w, cur.h)),
         };
         if let Some(r) = rect {
-            let msg = if video {
+            let msg = if codec.is_video() {
                 let key = full || prev.is_none();
-                let mut res = encode_video(&mut h264, &cur, p, key, !hw_failed);
-                if res.is_err() && h264.as_ref().is_some_and(|e| e.name() != "openh264") {
+                let mut res = encode_video(&mut enc, &cur, p, codec, key, !hw_failed);
+                if let (Err(e), Codec::Av1) = (&res, codec) {
+                    // Every viewer that can take AV1 also decodes H.264.
+                    tracing::warn!("{e:#}; switching to H.264");
+                    av1_failed = true;
+                    codec = Codec::H264;
+                    res = encode_video(&mut enc, &cur, p, codec, true, !hw_failed);
+                }
+                if res.is_err() && enc.as_ref().is_some_and(|e| e.name() != "openh264") {
                     // Hardware encoder broke mid-session: carry on in software.
                     tracing::warn!("{:#}; switching to OpenH264", res.as_ref().err().unwrap());
                     hw_failed = true;
-                    h264 = None;
-                    res = encode_video(&mut h264, &cur, p, true, false);
+                    enc = None;
+                    res = encode_video(&mut enc, &cur, p, codec, true, false);
                 }
                 res.unwrap_or_else(|e| {
                     // The viewer decodes JPEG rectangles too, so degrade instead of going dark.
                     tracing::error!("{e:#}; falling back to JPEG");
                     h264_failed = true;
-                    h264 = None;
+                    codec = Codec::Jpeg;
+                    enc = None;
                     Some(encode_rect(&cur, (0, 0, cur.w, cur.h), p.quality))
                 })
             } else {
                 Some(encode_rect(&cur, r, p.quality))
             };
-            let active = match &h264 {
-                Some(e) if video => e.name(),
-                _ => "jpeg",
+            let active = match &enc {
+                Some(e) if codec.is_video() => (e.name(), codec),
+                _ => ("jpeg", Codec::Jpeg),
             };
             if active != reported {
                 reported = active;
-                tracing::info!("video encoder: {active}");
-                let note = serde_json::json!({"t": "encoder", "encoder": active, "codec": if video { "h264" } else { "jpeg" }});
+                tracing::info!("video encoder: {} ({})", active.0, active.1.name());
+                let note = serde_json::json!({"t": "encoder", "encoder": active.0, "codec": active.1.name()});
                 if out.blocking_send(proto::json(&note)).is_err() {
                     return;
                 }
@@ -284,16 +299,21 @@ pub fn run(params: watch::Receiver<Params>, out: mpsc::Sender<Vec<u8>>, stop: Ar
     }
 }
 
-/// Encodes a whole frame as H.264, (re)creating the encoder when the size or settings change
-/// (a new encoder always starts with a keyframe). Ok(None) means the encoder dropped the frame.
-fn encode_video(enc: &mut Option<Box<dyn VideoEncoder>>, f: &Frame, p: Params, keyframe: bool, allow_hw: bool) -> anyhow::Result<Option<Vec<u8>>> {
+/// Encodes a whole frame as H.264 or AV1, (re)creating the encoder when the size, codec or
+/// settings change (a new encoder always starts with a keyframe). Ok(None) means the encoder
+/// dropped the frame.
+fn encode_video(enc: &mut Option<Box<dyn VideoEncoder>>, f: &Frame, p: Params, codec: Codec, keyframe: bool, allow_hw: bool) -> anyhow::Result<Option<Vec<u8>>> {
     let mut keyframe = keyframe;
-    if enc.as_ref().is_none_or(|e| e.size() != (f.w, f.h)) {
-        *enc = Some(codec::h264_encoder(f.w, f.h, p.fps, p.quality, allow_hw)?);
+    if enc.as_ref().is_none_or(|e| e.size() != (f.w, f.h) || e.codec() != codec) {
+        *enc = None;
+        *enc = Some(match codec {
+            Codec::Av1 => codec::av1_encoder(f.w, f.h, p.fps, p.quality)?,
+            _ => codec::h264_encoder(f.w, f.h, p.fps, p.quality, allow_hw)?,
+        });
         keyframe = true;
     }
     let e = enc.as_mut().unwrap();
-    Ok(e.encode(&f.rgb, keyframe)?.map(|(data, key)| proto::video(Codec::H264.id(), key, f.w as u16, f.h as u16, &data)))
+    Ok(e.encode(&f.rgb, keyframe)?.map(|(data, key)| proto::video(codec.id(), key, f.w as u16, f.h as u16, &data)))
 }
 
 #[cfg(test)]
