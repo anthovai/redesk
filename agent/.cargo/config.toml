@@ -2,3 +2,8 @@
 [target.x86_64-pc-windows-gnu]
 linker = "x86_64-w64-mingw32-gcc"
 ar = "x86_64-w64-mingw32-ar"
+
+# Link libstdc++ (used by OpenH264) statically: the installer ships only the two .exe files, and
+# a dynamic libstdc++-6.dll (plus libgcc_s/libwinpthread) does not exist on a clean Windows.
+[env]
+CXXSTDLIB_x86_64_pc_windows_gnu = ""

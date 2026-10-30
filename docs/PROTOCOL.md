@@ -81,8 +81,8 @@ Each codec has one or more encoders behind it; the agent picks one per session a
 | `encoder` | Where | Notes |
 |---|---|---|
 | `videotoolbox` | macOS | Hardware only (`RequireHardwareAcceleratedVideoEncoder`), Constrained Baseline (Baseline before macOS 12), real time, no frame reordering, BT.601. AVCC output is rewritten to Annex B with SPS/PPS before every IDR. |
-| `mediafoundation` | Windows | First hardware H.264 MFT that accepts NV12 input (Quick Sync, NVENC, AMF), Baseline profile, low-latency mode. Untested on real hardware so far. |
-| `mediafoundation` (AV1) | Windows | First hardware AV1 MFT that accepts NV12 input (NVIDIA RTX 40, Intel Arc / Core Ultra, AMD RDNA 3 and newer), Main 4:2:0 8-bit, low-latency mode. The sequence header is copied in front of any keyframe that comes without one. Probed once per process; without one AV1 is not offered. Untested on real hardware so far. |
+| `mediafoundation` | Windows | First hardware H.264 MFT that accepts NV12 input (Quick Sync, NVENC, AMF), Baseline profile, low-latency mode. Not yet run on GPU encoders; CI runs the same code (types, NV12 input, output, keyframes) on Windows with Microsoft's software H.264 MFT. |
+| `mediafoundation` (AV1) | Windows | First hardware AV1 MFT that accepts NV12 input (NVIDIA RTX 40, Intel Arc / Core Ultra, AMD RDNA 3 and newer), Main 4:2:0 8-bit, low-latency mode. The sequence header is copied in front of any keyframe that comes without one. Probed once per process; without one AV1 is not offered. Untested: no CI runner or test machine has an AV1 encoder yet. |
 | `openh264` | everywhere | Software fallback, unchanged. |
 | `jpeg` | | The session uses JPEG rectangles. |
 

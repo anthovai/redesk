@@ -478,7 +478,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         let peers = tokio::task::spawn_blocking(move || discover_on(port, Duration::from_millis(800))).await.unwrap();
         let me = peers.iter().find(|p| p.id == id).expect("agent answers discovery");
-        assert!(me.addr.is_loopback());
+        // Answered from this machine: the loopback probe, or (Windows loops the broadcast back
+        // first, from the interface address) one of its own LAN addresses.
+        let own = |a: IpAddr| a.is_loopback() || interfaces().iter().flat_map(|i| &i.v4).any(|v| IpAddr::V4(v.ip) == a);
+        assert!(own(me.addr), "reply from {}, not this machine", me.addr);
         assert_eq!(peers.iter().filter(|p| p.id == id).count(), 1);
 
         // Turned off at runtime: no answer.

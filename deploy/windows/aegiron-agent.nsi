@@ -125,23 +125,78 @@ Function HasBadChars
   done:
 FunctionEnd
 
+; Sets $R1 to the value of option $R8 (e.g. "/SERVER=") in the command line $R0, or sets the
+; error flag if it is absent. FileFunc's GetOptions ends a value at the next "/" anywhere, which
+; cut /SERVER=https://... down to "https:" and broke base64 keys containing "/": here a value
+; ends only where the next option starts (" /"). Surrounding double quotes are removed.
+Function GetOpt
+  Push $2
+  Push $3
+  Push $4
+  ClearErrors
+  StrLen $3 $R8
+  StrCpy $2 0
+  find:
+    StrCpy $4 $R0 $3 $2
+    StrCmp $4 "" notfound
+    StrCmp $4 $R8 0 next ; case-insensitive
+    IntCmp $2 0 found
+    IntOp $4 $2 - 1
+    StrCpy $4 $R0 1 $4
+    StrCmp $4 " " found
+  next:
+    IntOp $2 $2 + 1
+    Goto find
+  found:
+    IntOp $2 $2 + $3
+    StrCpy $R1 $R0 "" $2
+    StrCpy $2 0
+  scan:
+    StrCpy $4 $R1 2 $2
+    StrCmp $4 "" cut
+    StrCmp $4 " /" cut
+    IntOp $2 $2 + 1
+    Goto scan
+  cut:
+    StrCpy $R1 $R1 $2
+  trim:
+    StrCpy $4 $R1 1 -1
+    StrCmp $4 " " 0 unquote
+    StrCpy $R1 $R1 -1
+    Goto trim
+  unquote:
+    StrCpy $4 $R1 1
+    StrCmp $4 '"' 0 done
+    StrCpy $4 $R1 1 -1
+    StrCmp $4 '"' 0 done
+    StrCpy $R1 $R1 -1 1
+    Goto done
+  notfound:
+    StrCpy $R1 ""
+    SetErrors
+  done:
+  Pop $4
+  Pop $3
+  Pop $2
+FunctionEnd
+
 Function .onInit
   StrCpy $Server "${SERVER_URL}"
   StrCpy $Key "${SERVER_KEY}"
   StrCpy $Token ""
   ${GetParameters} $R0
-  ClearErrors
-  ${GetOptions} $R0 "/SERVER=" $R1
+  StrCpy $R8 "/SERVER="
+  Call GetOpt
   ${IfNot} ${Errors}
     StrCpy $Server $R1
   ${EndIf}
-  ClearErrors
-  ${GetOptions} $R0 "/KEY=" $R1
+  StrCpy $R8 "/KEY="
+  Call GetOpt
   ${IfNot} ${Errors}
     StrCpy $Key $R1
   ${EndIf}
-  ClearErrors
-  ${GetOptions} $R0 "/TOKEN=" $R1
+  StrCpy $R8 "/TOKEN="
+  Call GetOpt
   ${IfNot} ${Errors}
     StrCpy $Token $R1
   ${EndIf}

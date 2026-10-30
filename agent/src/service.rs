@@ -16,7 +16,12 @@ fn home() -> Result<PathBuf> {
 }
 
 fn run(cmd: &str, args: &[&str]) -> Result<String> {
-    let out = Command::new(cmd).args(args).output().with_context(|| format!("run {cmd}"))?;
+    let mut c = Command::new(cmd);
+    c.args(args);
+    // The desktop app has no console: without this every `reg` call flashes a console window.
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(&mut c, 0x0800_0000); // CREATE_NO_WINDOW
+    let out = c.output().with_context(|| format!("run {cmd}"))?;
     if !out.status.success() {
         bail!("{cmd} {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
     }
