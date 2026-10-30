@@ -23,6 +23,16 @@ SERVER_URL=https://aegiron.kgarden.co.th SERVER_KEY='<server key>' deploy/window
 
 ได้ไฟล์ `dist/Aegiron-Agent-Setup-<version>[-<โดเมน>].exe` พร้อมไฟล์ `.sha256`
 
+## ทดสอบบน Windows จริง (CI)
+
+GitHub Actions (`.github/workflows/ci.yml`) build ตัวติดตั้งด้วยสคริปต์นี้บน Ubuntu แล้วนำไปรัน `deploy/windows/smoke-test.ps1` บน Windows: ติดตั้งแบบเงียบ (`/S /SERVER= /KEY=`), ตรวจไฟล์ ข้อมูลเวอร์ชันใน exe ตัวตนเครื่อง registry (`aegiron://`, `redesk://`, Run, Add/Remove Programs), `aegiron-agent info`, การเปิดซ้ำและลิงก์ `aegiron://` ที่เปิดผ่าน shell ต้องส่งต่อไปที่โปรแกรมเดิมผ่าน named pipe แล้วถอนการติดตั้งแบบเงียบ จะรันเองบนเครื่องทดสอบหรือ VM ก็ได้ (สคริปต์แก้การติดตั้งของผู้ใช้ปัจจุบัน อย่ารันบนเครื่องที่ใช้งานจริง):
+
+```bat
+powershell -ExecutionPolicy Bypass -File deploy\windows\smoke-test.ps1 dist\Aegiron-Agent-Setup-<version>.exe
+```
+
+`cargo test` ของ agent ก็รันบน Windows ด้วย: Media Foundation ผ่าน H.264 encoder แบบ software ของ Microsoft (runner ไม่มี GPU จึงยังไม่ได้ทดสอบ hardware encoder และ AV1), เสียงผ่าน WASAPI loopback และ cpal บนการ์ดเสียงเสมือน (Scream) และ named pipe
+
 ## ติดตั้ง
 
 **แบบที่ง่ายที่สุด (เหมือน RustDesk):** ใช้ตัวติดตั้งแบบทั่วไป เว้นหน้าเซิร์ฟเวอร์ว่างไว้ แล้วให้ผู้ใช้**เข้าสู่ระบบในโปรแกรม**ด้วยอีเมลและรหัสผ่าน (รวม 2FA) ของคอนโซล Aegiron เครื่องจะลงทะเบียนเป็นของผู้ใช้คนนั้นและเข้าสมุดที่อยู่ให้เอง ไม่ต้องคัดลอกกุญแจหรือ token
@@ -36,6 +46,7 @@ Aegiron-Agent-Setup-<version>.exe /S /SERVER=https://aegiron.kgarden.co.th /KEY=
 "%LOCALAPPDATA%\Programs\Aegiron\uninstall.exe" /S          :: ถอนการติดตั้งแบบเงียบ (เก็บ ID เครื่องไว้)
 ```
 
+- ตัวติดตั้งรุ่นก่อนหน้า (ที่ build ก่อนการแก้ไขนี้) ตัดค่า `/SERVER=` และ `/KEY=` ที่ตัวอักษร `/` ตัวแรก ทำให้ติดตั้งแบบเงียบแล้วไม่ได้ตั้งค่าเซิร์ฟเวอร์ ถ้าต้องใช้รุ่นเก่า ให้ใส่ค่าในเครื่องหมายคำพูด เช่น `/SERVER="https://…"` `/KEY="…"`
 - **ติดตั้งทับเวอร์ชันเดิม (อัปเกรด):** ID การตั้งค่า และรหัสผ่านถาวรจะยังอยู่ ตัวติดตั้งปิดโปรแกรมเก่าให้เอง
 - ตอนถอนการติดตั้ง จะถามว่าจะลบ ID ของเครื่องด้วยหรือไม่ ถ้ารันแบบเงียบจะเก็บไว้เสมอ
 

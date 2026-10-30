@@ -1,0 +1,132 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "ci/**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # Agent on real Windows: Media Foundation (software H.264 MFT; hardware MFTs only where a GPU
+  # has one), WASAPI loopback + cpal playback on a virtual audio device, the named pipe.
+  agent-windows:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: agent
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: agent
+      # Hosted runners have no audio endpoint and the Windows Audio service is off; this installs
+      # the Scream virtual sound card and starts the service.
+      - name: Virtual audio device
+        uses: LABSN/sound-ci-helpers@v1
+      - run: cargo build --all-targets
+      - name: cargo test (including the ignored audio device tests)
+        run: cargo test -- --include-ignored --nocapture
+        env:
+          AEGIRON_REQUIRE_AUDIO: "1"
+
+  agent-macos:
+    runs-on: macos-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: agent
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: agent
+      - run: cargo test
+
+  # The release installer, built the way releases are (cross-compiled with mingw + makensis).
+  installer-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: agent
+          key: windows-gnu
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends mingw-w64 nsis
+      - run: deploy/windows/build-installer.sh
+      - uses: actions/upload-artifact@v5
+        with:
+          name: windows-installer
+          path: dist/
+          retention-days: 7
+
+  installer-windows:
+    needs: installer-build
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v6
+        with:
+          name: windows-installer
+          path: dist
+      - name: Silent install, checks, single instance, silent uninstall
+        shell: pwsh
+        run: deploy/windows/smoke-test.ps1 (Get-Item dist/Aegiron-Agent-Setup-*.exe).FullName
+
+  server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: aegiron
+          POSTGRES_PASSWORD: aegiron
+          POSTGRES_DB: aegiron
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U aegiron"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 20
+    defaults:
+      run:
+        working-directory: server
+    env:
+      AEGIRON_TEST_DATABASE_URL: postgres://aegiron:aegiron@localhost:5432/aegiron?sslmode=disable
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+      - run: go vet ./...
+      - run: go test ./...
+
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun run check
+      - run: bun run build

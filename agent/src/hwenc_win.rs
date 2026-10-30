@@ -2,14 +2,15 @@
 //! Sync, NVIDIA NVENC, AMD AMF expose their encoders as hardware MFTs; AV1 needs NVIDIA RTX 40,
 //! Intel Arc / Core Ultra or AMD RDNA 3 and newer).
 //!
-//! UNTESTED on real Windows hardware: this compiles for x86_64-pc-windows-gnu but has only been
-//! exercised on macOS through the shared fallback logic. Any failure here (no hardware MFT,
-//! a type the MFT rejects, a timeout) makes the caller fall back to OpenH264 (AV1: to H.264).
+//! Not yet run against GPU encoders. CI (GitHub's Windows runners, no GPU) drives the same
+//! code with Microsoft's software H.264 MFT, which is synchronous (see `new_software`). Any
+//! failure here (no hardware MFT, a type the MFT rejects, a timeout) makes the caller fall back
+//! to OpenH264 (AV1: to H.264).
 //!
 //! Configured as H.264 Baseline profile (MF_MT_MPEG2_PROFILE = 66) or AV1 Main 4:2:0 8-bit,
 //! low-latency mode, no B-frames, BT.601 limited range NV12 input. Hardware MFTs are
 //! asynchronous: they ask for input and announce output through events, which this pumps
-//! synchronously per frame.
+//! synchronously per frame. Synchronous MFTs take input and give output by direct calls.
 
 use std::time::{Duration, Instant};
 
@@ -25,7 +26,8 @@ const TIMEOUT: Duration = Duration::from_millis(500);
 
 pub struct MfEncoder {
     transform: IMFTransform,
-    events: IMFMediaEventGenerator,
+    /// None for a synchronous MFT.
+    events: Option<IMFMediaEventGenerator>,
     codec_api: Option<ICodecAPI>,
     provides_samples: bool,
     out_size: u32,
@@ -41,11 +43,18 @@ pub struct MfEncoder {
 }
 
 pub fn new(w: usize, h: usize, fps: u32, quality: u8) -> Result<MfEncoder> {
-    unsafe { MfEncoder::new(Codec::H264, w, h, fps, quality) }
+    unsafe { MfEncoder::new(Codec::H264, w, h, fps, quality, MFT_ENUM_FLAG_HARDWARE) }
 }
 
 pub fn new_av1(w: usize, h: usize, fps: u32, quality: u8) -> Result<MfEncoder> {
-    unsafe { MfEncoder::new(Codec::Av1, w, h, fps, quality) }
+    unsafe { MfEncoder::new(Codec::Av1, w, h, fps, quality, MFT_ENUM_FLAG_HARDWARE) }
+}
+
+/// Microsoft's software H.264 MFT (synchronous), through the same setup and output handling as
+/// the hardware ones. Tests only: sessions use OpenH264 when there is no hardware encoder.
+#[cfg(test)]
+pub fn new_software(w: usize, h: usize, fps: u32, quality: u8) -> Result<MfEncoder> {
+    unsafe { MfEncoder::new(Codec::H264, w, h, fps, quality, MFT_ENUM_FLAG_SYNCMFT) }
 }
 
 fn pack(hi: u32, lo: u32) -> u64 {
@@ -53,7 +62,7 @@ fn pack(hi: u32, lo: u32) -> u64 {
 }
 
 impl MfEncoder {
-    unsafe fn new(codec: Codec, w: usize, h: usize, fps: u32, quality: u8) -> Result<Self> {
+    unsafe fn new(codec: Codec, w: usize, h: usize, fps: u32, quality: u8, kind: MFT_ENUM_FLAG) -> Result<Self> {
         unsafe {
             // S_FALSE / RPC_E_CHANGED_MODE are fine: COM is usable on this thread either way.
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -72,20 +81,21 @@ impl MfEncoder {
             let mut count = 0u32;
             MFTEnumEx(
                 MFT_CATEGORY_VIDEO_ENCODER,
-                MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+                kind | MFT_ENUM_FLAG_SORTANDFILTER,
                 Some(&input),
                 Some(&output),
                 &mut list,
                 &mut count,
             )
             .context("MFTEnumEx")?;
+            let label = if kind == MFT_ENUM_FLAG_HARDWARE { format!("hardware {label}") } else { format!("software {label}") };
             if list.is_null() || count == 0 {
-                bail!("no hardware {label} encoder (Media Foundation)");
+                bail!("no {label} encoder (Media Foundation)");
             }
             let activates: Vec<Option<IMFActivate>> = (0..count as usize).map(|i| (*list.add(i)).take()).collect();
             windows::Win32::System::Com::CoTaskMemFree(Some(list as *const _));
 
-            let mut last = anyhow!("no usable hardware {label} encoder");
+            let mut last = anyhow!("no usable {label} encoder");
             for a in activates.into_iter().flatten() {
                 match Self::open(&a, codec, w, h, fps, quality) {
                     Ok(e) => return Ok(e),
@@ -102,12 +112,26 @@ impl MfEncoder {
     unsafe fn open(a: &IMFActivate, codec: Codec, w: usize, h: usize, fps: u32, quality: u8) -> Result<Self> {
         unsafe {
             let transform: IMFTransform = a.ActivateObject().context("activate MFT")?;
-            let attrs = transform.GetAttributes().context("MFT attributes")?;
-            if attrs.GetUINT32(&MF_TRANSFORM_ASYNC).unwrap_or(0) != 0 {
-                attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1).context("unlock async MFT")?;
-            }
-            let events: IMFMediaEventGenerator = transform.cast().context("MFT has no event generator (not async)")?;
+            // Synchronous MFTs (the software ones) may have no attribute store at all.
+            let attrs = transform.GetAttributes().ok();
+            let is_async = attrs.as_ref().is_some_and(|a| a.GetUINT32(&MF_TRANSFORM_ASYNC).unwrap_or(0) != 0);
+            let events = if is_async {
+                attrs.as_ref().unwrap().SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1).context("unlock async MFT")?;
+                Some(transform.cast::<IMFMediaEventGenerator>().context("async MFT has no event generator")?)
+            } else {
+                None
+            };
             let fps = fps.clamp(1, 60);
+
+            // Encoder properties before the media types: some encoders (Microsoft's H.264 MFT
+            // for the rate control mode) only accept them then.
+            let codec_api: Option<ICodecAPI> = transform.cast().ok();
+            if let Some(api) = &codec_api {
+                let _ = api.SetValue(&CODECAPI_AVLowLatencyMode, &VARIANT::from(true));
+                let _ = api.SetValue(&CODECAPI_AVEncCommonRateControlMode, &VARIANT::from(eAVEncCommonRateControlMode_CBR.0 as u32));
+                let _ = api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &VARIANT::from(bitrate(w, h, fps, quality)));
+                let _ = api.SetValue(&CODECAPI_AVEncMPVGOPSize, &VARIANT::from(fps * 10));
+            }
 
             // Output first (encoders need it before the input type).
             let out = MFCreateMediaType()?;
@@ -136,14 +160,6 @@ impl MfEncoder {
             inp.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32)?;
             transform.SetInputType(0, &inp, 0).context("NV12 input type")?;
 
-            let codec_api: Option<ICodecAPI> = transform.cast().ok();
-            if let Some(api) = &codec_api {
-                let _ = api.SetValue(&CODECAPI_AVLowLatencyMode, &VARIANT::from(true));
-                let _ = api.SetValue(&CODECAPI_AVEncCommonRateControlMode, &VARIANT::from(eAVEncCommonRateControlMode_CBR.0 as u32));
-                let _ = api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &VARIANT::from(bitrate(w, h, fps, quality)));
-                let _ = api.SetValue(&CODECAPI_AVEncMPVGOPSize, &VARIANT::from(fps * 10));
-            }
-
             let info = transform.GetOutputStreamInfo(0)?;
             transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
             transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
@@ -169,8 +185,16 @@ impl MfEncoder {
     /// Handles queued events until `done` says stop or the deadline passes.
     unsafe fn pump(&mut self, deadline: Instant, out: &mut Vec<(Vec<u8>, bool)>, done: impl Fn(&Self, usize) -> bool) -> Result<()> {
         unsafe {
+            let Some(events) = self.events.clone() else {
+                // Synchronous: input is always accepted; collect whatever output is ready.
+                self.need_input = 1;
+                while let Some(o) = self.output()? {
+                    out.push(o);
+                }
+                return Ok(());
+            };
             while !done(self, out.len()) {
-                match self.events.GetEvent(MF_EVENT_FLAG_NO_WAIT) {
+                match events.GetEvent(MF_EVENT_FLAG_NO_WAIT) {
                     Ok(ev) => {
                         let t = ev.GetType()?;
                         if t == METransformNeedInput.0 as u32 {

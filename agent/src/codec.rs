@@ -587,6 +587,27 @@ mod tests {
         round_trip(&mut *hardware_encoder(320, 240, 15, 70).unwrap());
     }
 
+    /// The Media Foundation encoder's media types, NV12 input, output handling and keyframe
+    /// detection, with Microsoft's software H.264 MFT (present on every Windows, including CI
+    /// runners without a GPU). Only the asynchronous event pump is left to hardware_round_trip.
+    #[cfg(windows)]
+    #[test]
+    fn mediafoundation_software_round_trip() {
+        let mut enc = match hw::new_software(320, 240, 15, 70) {
+            Ok(e) => e,
+            // Windows N/KN editions and Server Core ship without Media Foundation's codecs.
+            Err(e) if std::env::var_os("CI").is_none() => {
+                eprintln!("no software Media Foundation H.264 encoder here: {e:#}");
+                return;
+            }
+            Err(e) => panic!("Media Foundation H.264 encoder: {e:#}"),
+        };
+        let (key, _) = enc.encode(&vec![128u8; 320 * 240 * 3], true).unwrap().expect("keyframe");
+        let sps = key.windows(5).position(|w| w[..4] == [0, 0, 0, 1] && w[4] & 0x1f == 7).expect("SPS in keyframe");
+        assert_eq!(key[sps + 5], 66, "profile_idc must be Baseline");
+        round_trip(&mut hw::new_software(320, 240, 15, 70).unwrap());
+    }
+
     /// AV1 from a hardware encoder must decode with the desktop viewer's decoder (rav1d), and
     /// keyframes must carry the sequence header (WebCodecs is configured without a
     /// description). Skipped where there is no AV1 encoder (everywhere but recent Windows GPUs).

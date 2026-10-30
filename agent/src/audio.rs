@@ -405,7 +405,7 @@ mod imp;
 #[cfg(windows)]
 mod imp {
     //! WASAPI loopback through cpal: an input stream on the default *output* device records
-    //! what the machine plays. Untested on real Windows hardware (cross-compiled only).
+    //! what the machine plays. CI runs it on Windows against a virtual sound card (Scream).
     use super::*;
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
@@ -536,27 +536,68 @@ mod tests {
         assert!(levels.iter().all(|l| (l - 0.354).abs() < 0.02), "{levels:?}");
     }
 
-    /// Manual check on a machine with Screen Recording permission (macOS) or speakers
-    /// (Windows): `cargo test --lib audio -- --ignored`. Plays a system sound and expects the
-    /// capture to hear it.
+    /// Whether the machine has an audio output to test with. Windows runners (and servers)
+    /// usually have none, so the device tests skip there unless AEGIRON_REQUIRE_AUDIO=1 (set
+    /// by CI after installing a virtual audio device) makes a missing device a failure.
+    /// The returned guard keeps the device tests from running at the same time: each would hear
+    /// the other's tone.
+    #[cfg(any(windows, target_os = "macos"))]
+    fn have_output() -> Option<std::sync::MutexGuard<'static, ()>> {
+        use cpal::traits::HostTrait;
+        static DEVICE: Mutex<()> = Mutex::new(());
+        let guard = DEVICE.lock().unwrap_or_else(|e| e.into_inner());
+        if cpal::default_host().default_output_device().is_some() {
+            return Some(guard);
+        }
+        assert!(std::env::var("AEGIRON_REQUIRE_AUDIO").as_deref() != Ok("1"), "AEGIRON_REQUIRE_AUDIO=1 but there is no audio output device");
+        eprintln!("skipped: no audio output device");
+        None
+    }
+
+    /// Records the loudest block captured from system audio.
+    #[cfg(any(windows, target_os = "macos"))]
+    fn capture_peak(peak: Arc<Mutex<(f32, usize)>>) -> imp::Capture {
+        let sink: PcmSink = Box::new(move |d, _, _| {
+            let mut p = peak.lock().unwrap();
+            p.0 = p.0.max(rms(d));
+            p.1 += d.len();
+        });
+        // macOS: include this process's own audio, which the agent normally leaves out.
+        #[cfg(target_os = "macos")]
+        return imp::start_with(sink, false).unwrap();
+        #[cfg(windows)]
+        return imp::start(sink).unwrap();
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    fn play_tone(secs: usize) {
+        let player = Player::new().unwrap();
+        for chunk in tone(SAMPLE_RATE as usize * secs, SAMPLE_RATE, 660.0).chunks(FRAME * CHANNELS) {
+            player.push(chunk);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
+    /// Manual check on a machine with Screen Recording permission (macOS) or an audio output
+    /// (Windows; CI installs a virtual one): `cargo test --lib audio -- --ignored`. Plays a
+    /// sound and expects the capture to hear it.
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     #[ignore]
     fn capture_hears_system_audio() {
+        let Some(_device) = have_output() else { return };
         assert!(capture_supported(), "no capture backend");
         let peak = Arc::new(Mutex::new((0f32, 0usize)));
-        let p = peak.clone();
-        let cap = imp::start(Box::new(move |d, _, _| {
-            let mut p = p.lock().unwrap();
-            p.0 = p.0.max(rms(d));
-            p.1 += d.len();
-        }))
-        .unwrap();
+        let cap = capture_peak(peak.clone());
         if cfg!(target_os = "macos") {
             for _ in 0..3 {
                 std::process::Command::new("afplay").arg("/System/Library/Sounds/Ping.aiff").status().unwrap();
             }
         } else {
-            std::thread::sleep(Duration::from_secs(3));
+            // WASAPI loopback delivers nothing while nothing plays, and Windows has no
+            // command-line player: play a tone through cpal's output path instead.
+            play_tone(2);
         }
         drop(cap);
         let (level, samples) = *peak.lock().unwrap();
@@ -564,30 +605,20 @@ mod tests {
         assert!(level > 0.01, "captured audio is silent");
     }
 
-    /// Manual check (macOS): what the viewer's Player plays is heard by the system-audio
-    /// capture, i.e. playback through cpal really reaches the output device.
-    #[cfg(target_os = "macos")]
+    /// Manual check: what the viewer's Player plays is heard by the system-audio capture,
+    /// i.e. playback through cpal really reaches the output device.
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     #[ignore]
     fn player_output_is_heard() {
-        let peak = Arc::new(Mutex::new(0f32));
-        let p = peak.clone();
-        let cap = imp::start_with(Box::new(move |d, _, _| {
-            let mut p = p.lock().unwrap();
-            *p = p.max(rms(d));
-        }), false)
-        .unwrap();
+        let Some(_device) = have_output() else { return };
+        let peak = Arc::new(Mutex::new((0f32, 0usize)));
+        let cap = capture_peak(peak.clone());
         std::thread::sleep(Duration::from_millis(300));
-        let quiet = *peak.lock().unwrap();
-        let player = Player::new().unwrap();
-        for chunk in tone(SAMPLE_RATE as usize * 2, SAMPLE_RATE, 660.0).chunks(FRAME * CHANNELS) {
-            player.push(chunk);
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        std::thread::sleep(Duration::from_millis(300));
-        drop(player);
+        let quiet = peak.lock().unwrap().0;
+        play_tone(2);
         drop(cap);
-        let level = *peak.lock().unwrap();
+        let level = peak.lock().unwrap().0;
         eprintln!("before playback rms {quiet:.4}, during playback {level:.4}");
         assert!(level > 0.05, "player output not heard");
     }

@@ -248,30 +248,46 @@ mod tests {
         assert_ne!(a, b);
     }
 
-    #[cfg(unix)]
     #[test]
     fn second_launch_hands_over() {
-        use std::os::unix::fs::PermissionsExt;
         use std::sync::mpsc;
         let dir = std::env::temp_dir().join(format!("aegiron-instance-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let cfg = dir.join("agent.toml");
         let (tx, rx) = mpsc::channel();
         assert!(claim(&cfg, &Request::Show, move |r| tx.send(r).unwrap()));
-        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(&dir), 0o700);
-        assert_eq!(mode(&socket_path(&cfg)), 0o600);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&dir), 0o700);
+            assert_eq!(mode(&socket_path(&cfg)), 0o600);
+        }
         // The lock is taken, so these are "second launches".
         assert!(!claim(&cfg, &Request::Open("123456789".into()), |_| unreachable!()));
         assert!(!claim(&cfg, &Request::Show, |_| unreachable!()));
         assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), Request::Open("123456789".into()));
         assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), Request::Show);
         // Junk is dropped without reaching the app.
+        #[cfg(unix)]
         let mut s = std::os::unix::net::UnixStream::connect(socket_path(&cfg)).unwrap();
+        #[cfg(windows)]
+        let mut s = (0..20)
+            .find_map(|_| {
+                let r = std::fs::OpenOptions::new().write(true).open(pipe_name(&cfg));
+                if r.is_err() {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                r.ok()
+            })
+            .expect("instance pipe");
         s.write_all(b"aegiron-open 1; rm -rf /").unwrap();
         drop(s);
         assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
+        // Still listening after the junk.
+        assert!(!claim(&cfg, &Request::Open("987654321".into()), |_| unreachable!()));
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), Request::Open("987654321".into()));
+        let _ = std::fs::remove_dir_all(&dir); // Windows: the held lock file stays until exit
     }
 
     #[cfg(target_os = "macos")]
