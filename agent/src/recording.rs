@@ -268,6 +268,15 @@ fn upload_one(server: &str, device_id: &str, key: &SigningKey, sid: &str, token:
     }
 }
 
+/// Uploads one recording file now (blocking), e.g. a test recording made by
+/// `examples/make_recording.rs`. Sessions upload through `upload_pending`.
+pub fn upload(server: &str, device_id: &str, key: &SigningKey, sid: &str, token: &str, path: &Path) -> Result<()> {
+    match upload_one(server.trim_end_matches('/'), device_id, key, sid, token, path) {
+        Outcome::Stored => Ok(()),
+        Outcome::Rejected(why) | Outcome::Retry(why) => bail!("upload of {sid} failed: {why}"),
+    }
+}
+
 static UPLOADING: AtomicBool = AtomicBool::new(false);
 
 /// Uploads every finished recording (blocking; run it off the async threads). Only over

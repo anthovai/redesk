@@ -143,6 +143,8 @@ export class RecordedAudio {
 	private decoder: AudioDecoder | null = null;
 	private sources = new Set<AudioBufferSourceNode>();
 	private next = 0;
+	/** Recording time of the last packet given to the decoder. */
+	private lastT = -1;
 	private playhead = 0;
 	private generation = 0;
 	/** The player's position in ms, and its speed (0 = silent); both set by `reset`. */
@@ -227,12 +229,20 @@ export class RecordedAudio {
 		const until = now + RECORDED_AHEAD_MS * this.rate;
 		while (this.next < this.packets.length && this.packets[this.next].t <= until) {
 			const p = this.packets[this.next++];
+			// Chrome's AudioDecoder ignores the timestamps of later chunks and counts on from the
+			// first one, so after a gap (muted or dropped audio) its output would be stamped too
+			// early and dropped as already past. Each contiguous run gets its own decoder.
+			if (this.decoder && p.t !== this.lastT + 20) this.retireDecoder();
+			this.lastT = p.t;
 			if (!this.decoder || this.decoder.state === 'closed') {
 				const gen = this.generation;
-				this.decoder = opusDecoder(
+				const dec: AudioDecoder = opusDecoder(
 					(data) => this.schedule(data, gen),
-					() => (this.decoder = null)
+					() => {
+						if (this.decoder === dec) this.decoder = null;
+					}
 				);
+				this.decoder = dec;
 			}
 			try {
 				this.decoder.decode(new EncodedAudioChunk({ type: 'key', timestamp: p.t * 1000, data: p.data }));
@@ -240,6 +250,16 @@ export class RecordedAudio {
 				console.warn('recording: opus decode failed', e);
 			}
 		}
+	}
+
+	/** Lets the current decoder finish what it was given, then closes it. */
+	private retireDecoder() {
+		const dec = this.decoder;
+		this.decoder = null;
+		if (!dec || dec.state === 'closed') return;
+		dec.flush()
+			.catch(() => {})
+			.finally(() => dec.state !== 'closed' && dec.close());
 	}
 
 	private schedule(data: AudioData, gen: number) {

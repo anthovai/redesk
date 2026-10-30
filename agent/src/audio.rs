@@ -176,7 +176,58 @@ pub type PcmSink = Box<dyn FnMut(&[f32], usize, u32) + Send>;
 /// Whether this machine can capture its output audio (checked once).
 pub fn capture_supported() -> bool {
     static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OK.get_or_init(imp::capture_supported)
+    *OK.get_or_init(|| test_tone() || imp::capture_supported())
+}
+
+/// `AEGIRON_TEST_AUDIO=tone` replaces system-audio capture with a generated beep (440 Hz,
+/// 0.5 s on / 0.5 s off) so end-to-end tests exercise encoding, streaming, recording and
+/// playback on machines where capture is unavailable (e.g. no Screen Recording permission).
+/// Tests only: never set by the app or the installers.
+fn test_tone() -> bool {
+    std::env::var("AEGIRON_TEST_AUDIO").is_ok_and(|v| v == "tone")
+}
+
+/// A running capture: the platform backend or the test tone. Dropping it stops capture.
+enum Source {
+    #[allow(dead_code)]
+    System(imp::Capture),
+    Tone(Arc<AtomicBool>),
+}
+
+impl Drop for Source {
+    fn drop(&mut self) {
+        if let Source::Tone(stop) = self {
+            stop.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Feeds the test tone to `sink` in real time, 10 ms per block (48 kHz stereo).
+fn start_tone(mut sink: PcmSink) -> Result<Source> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop2 = stop.clone();
+    std::thread::Builder::new()
+        .name("aegiron-test-tone".into())
+        .spawn(move || {
+            let block = SAMPLE_RATE as usize / 100;
+            let start = std::time::Instant::now();
+            let mut n = 0u64;
+            let mut buf = vec![0f32; block * CHANNELS];
+            while !stop2.load(Ordering::Relaxed) {
+                for (i, f) in buf.chunks_exact_mut(CHANNELS).enumerate() {
+                    let k = n + i as u64;
+                    let on = (k / (SAMPLE_RATE as u64 / 2)) % 2 == 0;
+                    let s = if on { (k as f32 * 440.0 * std::f32::consts::TAU / SAMPLE_RATE as f32).sin() * 0.3 } else { 0.0 };
+                    f.fill(s);
+                }
+                sink(&buf, CHANNELS, SAMPLE_RATE);
+                n += block as u64;
+                let due = start + Duration::from_micros(n * 1_000_000 / SAMPLE_RATE as u64);
+                std::thread::sleep(due.saturating_duration_since(std::time::Instant::now()));
+            }
+        })
+        .map_err(|e| anyhow!("test tone thread: {e}"))?;
+    Ok(Source::Tone(stop))
 }
 
 /// Captures system audio and sends Opus `0x05` packets to `out` while `on` is set, until
@@ -187,7 +238,14 @@ pub fn stream(out: mpsc::Sender<Vec<u8>>, on: Arc<AtomicBool>, stop: Arc<AtomicB
     let sink: PcmSink = Box::new(move |data, ch, rate| {
         let _ = pcm_tx.try_send((data.to_vec(), ch, rate));
     });
-    let capture = match imp::start(sink) {
+    let started = match test_tone() {
+        true => {
+            tracing::warn!("audio: AEGIRON_TEST_AUDIO=tone, sending a generated test tone instead of system audio");
+            start_tone(sink)
+        }
+        false => imp::start(sink).map(Source::System),
+    };
+    let capture = match started {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!("audio capture unavailable: {e:#}");
@@ -492,6 +550,20 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_tone_is_realtime_stereo_and_audible() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let src = start_tone(Box::new(move |d: &[f32], ch, rate| {
+            let _ = tx.send((d.to_vec(), ch, rate));
+        }))
+        .unwrap();
+        let (d, ch, rate) = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        drop(src);
+        // 10 ms of 48 kHz stereo, starting in the "on" half of the beep.
+        assert_eq!((ch, rate, d.len()), (CHANNELS, SAMPLE_RATE, 960));
+        assert!(rms(&d) > 0.1);
+    }
 
     fn tone(n: usize, rate: u32, hz: f32) -> Vec<f32> {
         (0..n).flat_map(|i| {

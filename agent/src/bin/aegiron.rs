@@ -28,11 +28,14 @@ const MAIN_MIN: [f32; 2] = [820.0, 540.0];
 fn main() -> eframe::Result {
     let mut args = std::env::args().skip(1);
     let (mut config_path, mut background, mut link) = (Config::default_path(), false, None);
-    let mut bad_link = None;
+    let (mut bad_link, mut own_config) = (None, false);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--background" => background = true,
-            "--config" => config_path = args.next().map(PathBuf::from).unwrap_or(config_path),
+            "--config" => {
+                own_config = true;
+                config_path = args.next().map(PathBuf::from).unwrap_or(config_path);
+            }
             url if ["aegiron:", "redesk:"].iter().any(|s| url.get(..s.len()).is_some_and(|p| p.eq_ignore_ascii_case(s))) => match local::parse_link(url) {
                 Some(id) => link = Some(id),
                 None => bad_link = Some(url.chars().take(80).collect::<String>()),
@@ -42,7 +45,9 @@ fn main() -> eframe::Result {
     }
     let screenshot = std::env::var_os("AEGIRON_UI_SCREENSHOT").map(PathBuf::from);
     let demo = std::env::var("AEGIRON_UI_DEMO").ok();
-    init_logging();
+    // With --config (a second profile, tests) the log goes next to that config, not into the
+    // default app's log.
+    init_logging(own_config.then(|| config_path.parent().map(PathBuf::from)).flatten());
     if let Some(u) = bad_link {
         tracing::warn!("ignoring invalid link {u:?}");
     }
@@ -191,8 +196,8 @@ fn install_url_handler(show: &ShowSignal, open: &OpenRequests, ctx: &Arc<OnceLoc
     });
 }
 
-fn init_logging() {
-    let dir = dirs::data_local_dir().unwrap_or_else(std::env::temp_dir).join("Aegiron");
+fn init_logging(dir: Option<PathBuf>) {
+    let dir = dir.filter(|d| !d.as_os_str().is_empty()).unwrap_or_else(|| dirs::data_local_dir().unwrap_or_else(std::env::temp_dir).join("Aegiron"));
     let _ = std::fs::create_dir_all(&dir);
     let file = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("aegiron.log"));
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
