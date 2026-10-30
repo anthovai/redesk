@@ -486,8 +486,10 @@ impl ViewerWindow {
             menu_header(ui, "Codec วิดีโอ");
             let want = self.viewer.state.lock().unwrap().want_codec;
             let av1 = f.info.is_some_and(|i| i.codecs.iter().any(|c| c == "av1"));
+            // While AV1 is unavailable the remembered AV1 choice shows as H.264, the codec in use.
+            let shown = if av1 { want } else { Codec::H264 };
             for (c, label, hint, enabled) in [(Codec::H264, "H.264", "", true), (Codec::Av1, "AV1", if av1 { "" } else { "ปลายทางไม่รองรับ" }, av1)] {
-                if menu_row(ui, Lead::Check(want == c), label, hint, enabled).clicked() && want != c {
+                if menu_row(ui, Lead::Check(shown == c), label, hint, enabled).clicked() && want != c {
                     self.viewer.set_codec(c);
                 }
             }

@@ -113,6 +113,8 @@
 	const av1Hint = $derived(
 		!viewer.decodable.includes('av1') ? 'เบราว์เซอร์ไม่รองรับ' : !viewer.info?.codecs?.includes('av1') ? 'ปลายทางไม่รองรับ' : ''
 	);
+	// The remembered choice, or H.264 while AV1 is unavailable here (so the menu never marks a disabled codec).
+	const menuCodec = $derived(av1Hint ? 'h264' : viewer.wantCodec);
 	const encoderNames: Record<string, string> = {
 		videotoolbox: 'VideoToolbox (ฮาร์ดแวร์)',
 		mediafoundation: 'Media Foundation (ฮาร์ดแวร์)',
@@ -529,13 +531,13 @@
 										<button
 											class="{mi} disabled:pointer-events-none disabled:opacity-50"
 											role="menuitemradio"
-											aria-checked={viewer.wantCodec === c}
+											aria-checked={menuCodec === c}
 											disabled={!!hint}
 											title={c === 'av1' ? 'ใช้แบนด์วิดท์น้อยกว่า เมื่อเครื่องปลายทางมีตัวเข้ารหัส AV1 ฮาร์ดแวร์' : 'ค่าเริ่มต้น ใช้ได้กับทุกเครื่อง'}
 											onclick={() => act(() => viewer.setCodec(c))}
 										>
 											<span class="grid size-[15px] place-items-center">
-												<span class="size-2 rounded-full {viewer.wantCodec === c ? 'bg-accent ring-2 ring-surface' : ''}"></span>
+												<span class="size-2 rounded-full {menuCodec === c ? 'bg-accent ring-2 ring-surface' : ''}"></span>
 											</span>
 											<span class="flex-1">{label}</span>
 											{#if hint}<span class="text-[11px] text-muted">{hint}</span>{/if}
