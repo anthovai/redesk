@@ -95,6 +95,7 @@
 		const d = e.device;
 		return [
 			{ label: 'เชื่อมต่อ', icon: 'link', href: `/connect/${e.device_id}`, disabled: !d?.online },
+			{ label: 'เทอร์มินัล', icon: 'terminal', href: `/terminal/${e.device_id}`, disabled: !d?.online },
 			...(d?.can_wake ? [{ label: 'ปลุกเครื่อง', icon: 'power', onclick: () => wake(e.device_id), disabled: waking === d.id } satisfies PeerAction] : []),
 			{ label: e.favorite ? 'นำออกจากรายการโปรด' : 'เพิ่มในรายการโปรด', icon: 'star', onclick: () => toggleFavorite(e), divider: true },
 			{ label: 'แก้ไข', icon: 'edit', onclick: () => editEntry(e) },
@@ -105,6 +106,7 @@
 	function sharedActions(d: Device): PeerAction[] {
 		return [
 			{ label: 'เชื่อมต่อ', icon: 'link', href: `/connect/${d.id}`, disabled: !d.online },
+			{ label: 'เทอร์มินัล', icon: 'terminal', href: `/terminal/${d.id}`, disabled: !d.online },
 			...(d.can_wake ? [{ label: 'ปลุกเครื่อง', icon: 'power', onclick: () => wake(d.id), disabled: waking === d.id } satisfies PeerAction] : []),
 			...(!entries.some((e) => e.device_id === d.id) ? [{ label: 'เพิ่มในสมุดที่อยู่', icon: 'book', onclick: () => addShared(d) } satisfies PeerAction] : [])
 		];

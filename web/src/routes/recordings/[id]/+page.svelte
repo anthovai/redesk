@@ -5,6 +5,7 @@
 	import { bytes, dateTime, formatId } from '#lib/format.js';
 	import Icon from '#lib/Icon.svelte';
 	import { clock, parseRecording, RecordingPlayer } from '#lib/recording.svelte.js';
+	import TerminalPlayback from '#lib/TerminalPlayback.svelte';
 
 	const id = page.params.id ?? '';
 	let rec = $state<Recording | null>(null);
@@ -12,6 +13,8 @@
 	let canvas = $state<HTMLCanvasElement>();
 	let error = $state('');
 	let loaded = $state(0);
+	/** A terminal session's recording: played as text in xterm.js instead of video. */
+	let termBuf = $state<ArrayBuffer | null>(null);
 	const speeds = [1, 2, 4, 8];
 
 	onMount(() => {
@@ -33,6 +36,10 @@
 				const buf = new Uint8Array(loaded);
 				let o = 0;
 				for (const part of parts) (buf.set(part, o), (o += part.length));
+				if (rec.codec === 'terminal') {
+					termBuf = buf.buffer;
+					return;
+				}
 				p = new RecordingPlayer(parseRecording(buf.buffer), canvas!);
 				player = p;
 				p.play();
@@ -80,6 +87,9 @@
 {#if error}<p class="mb-4 rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">{error}</p>{/if}
 {#if player?.error}<p class="mb-4 rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">{player.error}</p>{/if}
 
+{#if termBuf}
+	<TerminalPlayback buf={termBuf} />
+{:else}
 <div class="card overflow-hidden">
 	<div class="relative grid min-h-[320px] place-items-center bg-stage">
 		<canvas bind:this={canvas} class="block h-auto max-h-[70vh] w-auto max-w-full {player?.frame.w ? '' : 'opacity-0'}"></canvas>
@@ -133,3 +143,4 @@
 		</p>
 	{/if}
 </div>
+{/if}

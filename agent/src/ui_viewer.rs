@@ -59,14 +59,27 @@ struct WinUi {
     /// Toolbar rectangle from the previous frame (hover tracking).
     bar_rect: Option<Rect>,
     show_quality: bool,
-    /// Original size (1:1 pixels) instead of fit-to-window.
-    original: bool,
-    /// Where the 1:1 view is panned to (0..1 on each axis, follows the pointer).
+    /// How the remote screen is sized in the window.
+    scale: Scale,
+    /// Where a view larger than the window is panned to (0..1 on each axis).
     pan: egui::Vec2,
+    /// Pan so the remote pointer stays visible (instead of following ours).
+    follow_cursor: bool,
     /// Send ⌘/Ctrl as-is instead of mapping them for the remote OS.
     raw_keys: bool,
-    /// Mouse buttons pressed on the remote screen (bit per button), so releases pair up.
-    held: u8,
+    /// Keyboard "map" mode: physical keys, down and up (feature "keymode").
+    key_map: bool,
+    /// Relative mouse: the cursor is captured and motion is sent as `mr` (feature "relmouse").
+    relative: bool,
+    /// Remote display whose modes were asked for while the monitor menu is open.
+    modes_asked: Option<usize>,
+    /// Top of the area this window draws in (below the tab strip when hosted in tabs).
+    top: f32,
+    /// Input state of the main screen.
+    input: InputState,
+    /// Textures and input state of extra display windows, by display.
+    extra_tex: HashMap<usize, Option<egui::TextureHandle>>,
+    extra_input: HashMap<usize, InputState>,
     demo_menu: Option<String>,
     demo_done: bool,
     pen: Pen,
@@ -79,10 +92,49 @@ struct WinUi {
     renaming: Option<(String, String)>,
     /// Remote path waiting for delete confirmation.
     confirm_delete: Option<String>,
-    /// A paste was seen on key-down, so the matching key-up is not a second paste.
-    paste_seen: bool,
     /// Asking whether to restart the remote machine.
     confirm_restart: bool,
+}
+
+/// What input forwarding remembers between frames for one remote screen.
+#[derive(Default)]
+struct InputState {
+    /// Mouse buttons pressed on the remote screen (bit per button), so releases pair up.
+    held: u8,
+    /// A paste was seen on key-down, so the matching key-up is not a second paste.
+    paste_seen: bool,
+    /// Modifiers held on the remote side in map mode.
+    mods_down: Vec<(&'static str, &'static str)>,
+    /// Relative motion not yet sent (fractions of a unit).
+    rel_rest: egui::Vec2,
+}
+
+/// The window holding remote sessions as tabs.
+pub fn tabs_viewport() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("aegiron-remote-tabs")
+}
+
+/// How the remote screen is sized (RustDesk's view styles).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Scale {
+    /// Fills the window, keeping the aspect ratio (enlarges small screens too).
+    #[default]
+    Stretch,
+    /// Like stretch, but never larger than 1:1.
+    Shrink,
+    /// 1:1 pixels; a larger screen pans.
+    Original,
+}
+
+/// Where the window is shown.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Host {
+    /// Its own native window (tabs off).
+    Window,
+    /// A tab of the tabbed viewer window.
+    Tab,
+    /// Popped out of the tabs into its own window.
+    PoppedOut,
 }
 
 pub struct ViewerWindow {
@@ -92,6 +144,13 @@ pub struct ViewerWindow {
     ui: Mutex<WinUi>,
     pub closed: AtomicBool,
     pub reconnect: AtomicBool,
+    /// Shown in its own window although tabs are on.
+    pub popped: AtomicBool,
+    /// Asked to move from its own window back into the tabs (or out of them).
+    pub toggle_tab: AtomicBool,
+    /// Windows to repaint when the connection has news: where it is shown and its extra
+    /// display windows (kept up to date by the app).
+    pub repaint_to: Arc<Mutex<Vec<egui::ViewportId>>>,
 }
 
 /// What the toolbar and quality monitor need from the connection state for one frame.
@@ -108,12 +167,15 @@ struct Frame1<'a> {
     audio_level: Option<f32>,
     fb: (usize, usize),
     path: Option<crate::direct::Path>,
+    display_all: bool,
+    modes: Option<&'a crate::viewer::Modes>,
+    host: Host,
     view_only: bool,
     controls: Controls,
 }
 
 impl ViewerWindow {
-    pub fn new(viewer: Arc<Viewer>, device_id: String, viewport: egui::ViewportId) -> Arc<Self> {
+    pub fn new(viewer: Arc<Viewer>, device_id: String, viewport: egui::ViewportId, repaint_to: Arc<Mutex<Vec<egui::ViewportId>>>) -> Arc<Self> {
         Arc::new(Self {
             viewer,
             viewport,
@@ -121,53 +183,59 @@ impl ViewerWindow {
             ui: Mutex::new(WinUi { quality: 1, pan: vec2(0.5, 0.5), ..Default::default() }),
             closed: AtomicBool::new(false),
             reconnect: AtomicBool::new(false),
+            popped: AtomicBool::new(false),
+            toggle_tab: AtomicBool::new(false),
+            repaint_to,
         })
+    }
+
+    /// Viewport of extra display window `d`.
+    pub fn display_viewport(&self, d: usize) -> egui::ViewportId {
+        egui::ViewportId::from_hash_of((self.viewport, "display", d))
+    }
+
+    /// Displays shown in their own windows.
+    pub fn extra_displays(&self) -> Vec<usize> {
+        let mut v: Vec<usize> = self.viewer.state.lock().unwrap().extra.keys().copied().collect();
+        v.sort();
+        v
+    }
+
+    /// Short name for a tab or window title.
+    pub fn title(&self) -> String {
+        self.viewer.state.lock().unwrap().device_name.clone()
     }
 
     fn flash(w: &mut WinUi, msg: impl Into<String>) {
         w.toast = Some((msg.into(), Instant::now()));
     }
 
-    fn close_window(&self) {
+    pub fn close_window(&self) {
         self.viewer.close();
         self.closed.store(true, Ordering::Relaxed);
     }
 
-    pub fn show(&self, ui: &mut Ui) {
+    /// Draws the window. `host` says where: its own window, or a tab (whose host window handles
+    /// closing).
+    pub fn show(&self, ui: &mut Ui, host: Host) {
         let ctx = ui.ctx().clone();
-        if ui.input(|i| i.viewport().close_requested()) {
+        if host != Host::Tab && ui.input(|i| i.viewport().close_requested()) {
             self.close_window();
             return;
         }
         let mut guard = self.ui.lock().unwrap();
         let w = &mut *guard;
         self.demo_state(&ctx, w);
+        w.top = ui.available_rect_before_wrap().top();
+        if w.relative && ui.input(|i| i.viewport().focused == Some(false)) {
+            // Lost focus: give the pointer back.
+            self.set_relative(&ctx, w, false);
+        }
 
         // Pull new screen regions into the GPU texture and pick up state for this frame.
-        let (phase, error, name, fp, info, fps, kbps, clip, transfers, fb_size, cursor, codec, path, browser, clip_offer, notice, encoder, muted, audio_level, view_only, controls, reconnect) = {
+        let (phase, error, name, fp, info, fps, kbps, clip, transfers, fb_size, cursor, codec, path, browser, clip_offer, notice, encoder, muted, audio_level, display_all, modes, view_only, controls, reconnect) = {
             let mut st = self.viewer.state.lock().unwrap();
-            if st.fb.w > 0 {
-                let opts = egui::TextureOptions::LINEAR;
-                if w.texture.is_none() || st.fb.resized {
-                    let img = egui::ColorImage::from_rgba_unmultiplied([st.fb.w, st.fb.h], &st.fb.rgba);
-                    w.texture = Some(ctx.load_texture(format!("remote-{}", self.device_id), img, opts));
-                    st.fb.resized = false;
-                    st.fb.dirty.clear();
-                } else if let Some(tex) = w.texture.as_mut() {
-                    let fbw = st.fb.w;
-                    for [x, y, dw, dh] in std::mem::take(&mut st.fb.dirty) {
-                        if dw == 0 || dh == 0 {
-                            continue;
-                        }
-                        let mut sub = Vec::with_capacity(dw * dh * 4);
-                        for row in y..y + dh {
-                            let i = (row * fbw + x) * 4;
-                            sub.extend_from_slice(&st.fb.rgba[i..i + dw * 4]);
-                        }
-                        tex.set_partial([x, y], egui::ColorImage::from_rgba_unmultiplied([dw, dh], &sub), opts);
-                    }
-                }
-            }
+            sync_texture(&ctx, &mut w.texture, &mut st.fb, &format!("remote-{}", self.device_id));
             (
                 st.phase.clone(),
                 st.error.clone(),
@@ -188,6 +256,8 @@ impl ViewerWindow {
                 st.encoder.clone(),
                 st.muted,
                 st.audio_level,
+                st.display_all,
+                st.modes.clone(),
                 st.view_only,
                 st.controls,
                 st.reconnect,
@@ -233,47 +303,50 @@ impl ViewerWindow {
             self.files_panel(ui, w, &browser, fs2);
         }
 
+        // Ctrl+Alt+M toggles relative mouse mode (never sent to the remote machine).
+        let relmouse = connected && info.as_ref().is_some_and(|i| i.input && i.has("relmouse"));
+        if relmouse && take_relative_hotkey(ui) {
+            let on = !w.relative;
+            self.set_relative(&ctx, w, on);
+        }
+
         // Remote screen: the whole window.
         egui::CentralPanel::default().frame(Frame::new().fill(SCREEN_BG)).show(ui, |ui| {
             let area = ui.max_rect();
             if let (Some(tex), (fw, fh)) = (&w.texture, fb_size) {
-                let rect = if w.original {
-                    // 1:1 pixels; when larger than the window the view pans with the pointer.
-                    let size = vec2(fw as f32, fh as f32) / ctx.pixels_per_point();
-                    if let Some(p) = ui.input(|i| i.pointer.hover_pos()).filter(|p| area.contains(*p)) {
-                        w.pan = vec2((p.x - area.left()) / area.width(), (p.y - area.top()) / area.height());
+                // A view larger than the window pans with our pointer, or with the remote one.
+                let size = view_size(w.scale, area.size(), vec2(fw as f32, fh as f32), ctx.pixels_per_point());
+                match cursor.filter(|_| w.follow_cursor || w.relative) {
+                    Some((cx, cy)) => {
+                        w.pan.x = follow(w.pan.x, size.x, area.width(), cx * size.x);
+                        w.pan.y = follow(w.pan.y, size.y, area.height(), cy * size.y);
                     }
-                    let mut min = area.center() - size / 2.0;
-                    if size.x > area.width() {
-                        min.x = area.left() - w.pan.x * (size.x - area.width());
+                    None => {
+                        if let Some(p) = ui.input(|i| i.pointer.hover_pos()).filter(|p| area.contains(*p)) {
+                            w.pan = vec2((p.x - area.left()) / area.width(), (p.y - area.top()) / area.height());
+                        }
                     }
-                    if size.y > area.height() {
-                        min.y = area.top() - w.pan.y * (size.y - area.height());
-                    }
-                    Rect::from_min_size(min.round(), size)
-                } else {
-                    let scale = (area.width() / fw as f32).min(area.height() / fh as f32);
-                    Rect::from_center_size(area.center(), vec2(fw as f32 * scale, fh as f32 * scale))
-                };
+                }
+                let rect = place(area, size, w.pan);
                 ui.painter().image(tex.id(), rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
                 let resp = ui.allocate_rect(rect.intersect(area), Sense::click_and_drag());
                 let typing = w.new_folder.is_some() || w.renaming.is_some();
-                let drawing = connected && w.pen.on && info.as_ref().is_some_and(|i| i.whiteboard);
+                let drawing = connected && w.pen.on && !display_all && info.as_ref().is_some_and(|i| i.whiteboard);
                 if drawing {
                     self.draw(&mut w.pen, &resp, rect);
-                    w.held = 0;
+                    w.input.held = 0;
                 } else if connected && !view_only && info.as_ref().is_some_and(|i| i.input) && ui.input(|i| i.viewport().focused != Some(false)) && !typing {
-                    let keys = KeyMap { remote_mac, raw: w.raw_keys };
-                    forward_input(&self.viewer, ui, rect, area, keys, &mut w.held, &mut w.paste_seen);
+                    let keys = KeyMap { remote_mac, raw: w.raw_keys, map: w.key_map, relative: w.relative };
+                    forward_input(&self.viewer, ui, rect, area, keys, &mut w.input, None);
                     if resp.hovered() {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
+                        ui.ctx().set_cursor_icon(if w.relative { egui::CursorIcon::None } else { egui::CursorIcon::Default });
                     }
                 } else {
-                    w.held = 0;
+                    w.input.held = 0;
                 }
                 paint_strokes(ui.painter(), &w.pen.strokes, rect);
                 // The remote pointer (captures do not include it), unless ours is on top of it.
-                if let Some((cx, cy)) = cursor.filter(|_| !resp.hovered()) {
+                if let Some((cx, cy)) = cursor.filter(|_| !resp.hovered() || w.relative) {
                     paint_pointer(ui.painter(), pos2(rect.left() + cx * rect.width(), rect.top() + cy * rect.height()));
                 }
             } else if connected {
@@ -286,12 +359,12 @@ impl ViewerWindow {
         });
 
         if connected {
-            let f = Frame1 { name: &name, id: &self.device_id, fp: &fp, info: info.as_ref(), fps, kbps, codec: &codec, encoder: &encoder, muted, audio_level, fb: fb_size, path, view_only, controls };
+            let f = Frame1 { name: &name, id: &self.device_id, fp: &fp, info: info.as_ref(), fps, kbps, codec: &codec, encoder: &encoder, muted, audio_level, fb: fb_size, path, display_all, modes: modes.as_ref(), host, view_only, controls };
             if w.show_quality {
-                self.quality_monitor(&ctx, &f);
+                self.quality_monitor(&ctx, &f, w.top);
             }
             if f.info.is_some_and(|i| i.recording) {
-                self.recording_badge(&ctx);
+                self.recording_badge(&ctx, w.top);
             }
             self.control_badges(&ctx, &f);
             self.toolbar(&ctx, w, &f);
@@ -329,6 +402,86 @@ impl ViewerWindow {
         }
     }
 
+    /// Strip of remote sessions on top of the tabbed viewer window (RustDesk style). Right-click
+    /// a tab to open it in its own window.
+    pub fn tab_strip(ui: &mut Ui, list: &[Arc<ViewerWindow>], active: &mut Option<egui::ViewportId>) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            for w in list {
+                let live = w.viewer.state.lock().unwrap().phase == Phase::Connected;
+                let (tab, close) = tab_chip(ui, &w.title(), TabIcon::Remote(live), *active == Some(w.viewport), true);
+                if close {
+                    w.close_window();
+                } else if tab.clicked() {
+                    *active = Some(w.viewport);
+                }
+                tab.context_menu(|ui| {
+                    if ui.button("แยกเป็นหน้าต่างใหม่").clicked() {
+                        w.toggle_tab.store(true, Ordering::Relaxed);
+                    }
+                    if ui.button("ตัดการเชื่อมต่อและปิดแท็บ").clicked() {
+                        w.close_window();
+                    }
+                });
+            }
+            if let Some(w) = list.iter().find(|w| *active == Some(w.viewport)) {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if bar_button(ui, Glyph::PopOut, "แยกแท็บนี้เป็นหน้าต่างใหม่", Tone::Neutral, false).clicked() {
+                        w.toggle_tab.store(true, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+    }
+
+    /// Window of the extra display stream `d` (feature "multidisp"): the remote display and
+    /// its pointer, with the main window's scaling and keyboard settings. Closing it stops
+    /// the stream.
+    pub fn show_display(&self, ui: &mut Ui, d: usize) {
+        let ctx = ui.ctx().clone();
+        if ui.input(|i| i.viewport().close_requested()) {
+            self.viewer.set_stream(d, false);
+            return;
+        }
+        let mut guard = self.ui.lock().unwrap();
+        let w = &mut *guard;
+        let (live, info, size, cursor) = {
+            let mut st = self.viewer.state.lock().unwrap();
+            // View-only applies to every window of the session.
+            let live = st.phase == Phase::Connected && !st.view_only;
+            let info = st.info.clone();
+            let Some(e) = st.extra.get_mut(&d) else { return };
+            sync_texture(&ctx, w.extra_tex.entry(d).or_default(), &mut e.fb, &format!("remote-{}-{d}", self.device_id));
+            (live, info, vec2(e.fb.w as f32, e.fb.h as f32), e.cursor)
+        };
+        let remote_mac = info.as_ref().is_some_and(|i| i.os == "macos");
+        egui::CentralPanel::default().frame(Frame::new().fill(SCREEN_BG)).show(ui, |ui| {
+            let area = ui.max_rect();
+            let Some(Some(tex)) = w.extra_tex.get(&d) else {
+                ui.centered_and_justified(|ui| ui.label(RichText::new("กำลังรอภาพหน้าจอ…").color(Color32::from_gray(170))));
+                return;
+            };
+            let view = view_size(w.scale, area.size(), size, ctx.pixels_per_point());
+            let pan = match cursor {
+                Some((cx, cy)) => vec2(follow(0.5, view.x, area.width(), cx * view.x), follow(0.5, view.y, area.height(), cy * view.y)),
+                None => vec2(0.5, 0.5),
+            };
+            let rect = place(area, view, pan);
+            ui.painter().image(tex.id(), rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+            let resp = ui.allocate_rect(rect.intersect(area), Sense::click_and_drag());
+            let st = w.extra_input.entry(d).or_default();
+            if live && info.as_ref().is_some_and(|i| i.input) && ui.input(|i| i.viewport().focused != Some(false)) {
+                let keys = KeyMap { remote_mac, raw: w.raw_keys, map: w.key_map, relative: false };
+                forward_input(&self.viewer, ui, rect, area, keys, st, Some(d));
+            } else {
+                st.held = 0;
+            }
+            if let Some((cx, cy)) = cursor.filter(|_| !resp.hovered()) {
+                paint_pointer(ui.painter(), pos2(rect.left() + cx * rect.width(), rect.top() + cy * rect.height()));
+            }
+        });
+    }
+
     // -----------------------------------------------------------------------------------------
     // Floating toolbar
 
@@ -351,7 +504,7 @@ impl ViewerWindow {
         if t < 1.0 {
             let resp = egui::Area::new(egui::Id::unique(("bar-handle", self.viewport)))
                 .order(Order::Foreground)
-                .anchor(Align2::CENTER_TOP, [0.0, 0.0])
+                .anchor(Align2::CENTER_TOP, [0.0, w.top])
                 .show(ctx, |ui| {
                     let pal = Palette::of(ui);
                     let (rect, resp) = ui.allocate_exact_size(vec2(54.0, 18.0), Sense::click());
@@ -378,7 +531,7 @@ impl ViewerWindow {
         let y = 6.0 - (1.0 - t) * (height + 8.0);
         let resp = egui::Area::new(egui::Id::unique(("bar", self.viewport)))
             .order(Order::Foreground)
-            .anchor(Align2::CENTER_TOP, [0.0, y])
+            .anchor(Align2::CENTER_TOP, [0.0, y + w.top])
             .constrain(false)
             .show(ctx, |ui| {
                 let pal = Palette::of(ui);
@@ -397,6 +550,90 @@ impl ViewerWindow {
         w.bar_rect = Some(resp.response.rect);
     }
 
+    /// Display choice: one display, all of them in one picture, or extra windows.
+    fn monitor_menu(&self, ui: &mut Ui, w: &mut WinUi, info: &Info, f: &Frame1) {
+        menu_header(ui, "หน้าจอของเครื่องปลายทาง");
+        for (k, d) in info.displays.iter().enumerate() {
+            let label = if d.primary { format!("{} (หลัก)", d.name) } else { d.name.clone() };
+            if menu_row(ui, Lead::Check(!f.display_all && d.index == info.display), &label, &format!("{}", k + 1), true).clicked() {
+                self.viewer.set_display(d.index);
+            }
+        }
+        if info.has("alldisp") {
+            let r = menu_row(ui, Lead::Check(f.display_all), "ทุกหน้าจอ", "รวมเป็นภาพเดียว", true);
+            if r.clicked() && !f.display_all {
+                // Annotations belong to one display.
+                w.pen.on = false;
+                self.viewer.set_display_all();
+            }
+        }
+        if info.has("multidisp") {
+            menu_separator(ui);
+            menu_header(ui, "เปิดในหน้าต่างแยก");
+            let open: Vec<usize> = self.extra_displays();
+            for (k, d) in info.displays.iter().enumerate() {
+                let on = open.contains(&d.index);
+                if menu_row(ui, Lead::Tick(on), &format!("หน้าต่างของ {}", d.name), &format!("{}", k + 1), true).clicked() {
+                    self.viewer.set_stream(d.index, !on);
+                }
+            }
+            let others: Vec<usize> = info.displays.iter().map(|d| d.index).filter(|d| *d != info.display && !open.contains(d)).collect();
+            if menu_row(ui, Lead::Glyph(Glyph::PopOut), "เปิดหน้าจออื่นทุกจอแยกหน้าต่าง", "", !others.is_empty()).clicked() {
+                for d in others {
+                    self.viewer.set_stream(d, true);
+                }
+            }
+        }
+    }
+
+    /// Modes of the shown display (the agent answers `res_list` when the menu opens).
+    fn resolution_menu(&self, ui: &mut Ui, display: usize, modes: Option<&crate::viewer::Modes>) {
+        menu_header(ui, "ความละเอียดของหน้าจอ");
+        let Some(m) = modes else {
+            menu_footer(ui, "กำลังโหลด…");
+            return;
+        };
+        egui::ScrollArea::vertical().max_height(230.0).id_salt(("modes", self.viewport)).show(ui, |ui| {
+            for mode in &m.modes {
+                let label = format!("{} × {}", mode.w, mode.h);
+                let mut hint = if mode.hz > 0 { format!("{} Hz", mode.hz) } else { String::new() };
+                if *mode == m.original && m.original != m.current {
+                    hint = format!("เดิม · {hint}");
+                }
+                if menu_row(ui, Lead::Check(*mode == m.current), &label, hint.trim_end_matches(" · "), true).clicked() && *mode != m.current {
+                    self.viewer.set_resolution(display, *mode);
+                }
+            }
+        });
+        if m.original != m.current && m.original.w > 0 {
+            menu_separator(ui);
+            if menu_row(ui, Lead::Glyph(Glyph::Refresh), "คืนค่าความละเอียดเดิม", &format!("{} × {}", m.original.w, m.original.h), true).clicked() {
+                self.viewer.restore_resolution(display);
+            }
+        }
+        menu_footer(ui, "คืนค่าเดิมให้เองเมื่อจบการเชื่อมต่อ");
+    }
+
+    /// Captures (or releases) the pointer for relative mouse mode.
+    fn set_relative(&self, ctx: &egui::Context, w: &mut WinUi, on: bool) {
+        if w.relative == on {
+            return;
+        }
+        w.relative = on;
+        w.input.rel_rest = egui::Vec2::ZERO;
+        // macOS can lock the cursor in place; elsewhere winit only confines it to the window.
+        let grab = if !on {
+            egui::CursorGrab::None
+        } else if cfg!(target_os = "macos") {
+            egui::CursorGrab::Locked
+        } else {
+            egui::CursorGrab::Confined
+        };
+        ctx.send_viewport_cmd(ViewportCommand::CursorGrab(grab));
+        ctx.send_viewport_cmd(ViewportCommand::CursorVisible(!on));
+        Self::flash(w, if on { "เมาส์แบบสัมพัทธ์: เปิด (Ctrl+Alt+M เพื่อปิด)" } else { "เมาส์แบบสัมพัทธ์: ปิด" });
+    }
+
     fn toolbar_buttons(&self, ui: &mut Ui, w: &mut WinUi, f: &Frame1) {
         let pal = Palette::of(ui);
         let ctx = ui.ctx().clone();
@@ -410,26 +647,34 @@ impl ViewerWindow {
         bar_divider(ui);
 
         // Monitor: the current display's number; a menu when there are several.
+        // Monitor: the current display's number; a menu with the displays, the combined view,
+        // separate windows and the resolution.
         if let Some(info) = f.info {
             let n = info.displays.iter().position(|d| d.index == info.display).map(|p| p + 1).unwrap_or(1);
             let many = info.displays.len() > 1;
+            let resize = info.can_resize() && !f.display_all;
             let tip = if many { "เลือกหน้าจอ" } else { "หน้าจอของเครื่องปลายทาง" };
             let id = egui::Id::unique(("menu-monitor", self.viewport));
             let open = Popup::is_id_open(&ctx, id);
-            let resp = bar_button(ui, Glyph::Display(n), tip, Tone::Accent, open);
-            if many {
+            let resp = bar_button(ui, Glyph::Display(if f.display_all { 0 } else { n }), tip, Tone::Accent, open);
+            if !open {
+                w.modes_asked = None;
+            } else if resize && w.modes_asked != Some(info.display) {
+                w.modes_asked = Some(info.display);
+                self.viewer.list_modes(info.display);
+            }
+            if many || resize {
                 self.demo_open(&ctx, w, "monitor", id);
                 menu(&resp, id, pal).show(|ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
-                    menu_header(ui, "หน้าจอของเครื่องปลายทาง");
-                    for (k, d) in info.displays.iter().enumerate() {
-                        let label = if d.primary { format!("{} (หลัก)", d.name) } else { d.name.clone() };
-                        if menu_row(ui, Lead::Check(d.index == info.display), &label, &format!("{}", k + 1), true).clicked() {
-                            self.viewer.send(serde_json::json!({"t": "cfg", "display": d.index}));
-                            if let Some(info) = self.viewer.state.lock().unwrap().info.as_mut() {
-                                info.display = d.index;
-                            }
+                    if many {
+                        self.monitor_menu(ui, w, info, f);
+                    }
+                    if resize {
+                        if many {
+                            menu_separator(ui);
                         }
+                        self.resolution_menu(ui, info.display, f.modes.filter(|m| m.display == info.display));
                     }
                 });
             }
@@ -489,6 +734,25 @@ impl ViewerWindow {
             if menu_row(ui, Lead::Glyph(Glyph::Refresh), "รีเฟรชภาพ", "", true).clicked() {
                 self.viewer.send(serde_json::json!({"t": "refresh"}));
             }
+            if menu_row(ui, Lead::Glyph(Glyph::Camera), "บันทึกภาพหน้าจอ", "", f.fb.0 > 0).clicked() {
+                match self.viewer.screenshot(&crate::files::default_upload_dir(), None) {
+                    Ok(p) => Self::flash(w, format!("บันทึกภาพไว้ที่ {}", p.display())),
+                    Err(e) => Self::flash(w, format!("บันทึกภาพไม่สำเร็จ: {e:#}")),
+                }
+            }
+            match f.host {
+                Host::Tab => {
+                    if menu_row(ui, Lead::Glyph(Glyph::PopOut), "แยกเป็นหน้าต่างใหม่", "", true).clicked() {
+                        self.toggle_tab.store(true, Ordering::Relaxed);
+                    }
+                }
+                Host::PoppedOut => {
+                    if menu_row(ui, Lead::Glyph(Glyph::PopOut), "ย้ายกลับเข้าแท็บ", "", true).clicked() {
+                        self.toggle_tab.store(true, Ordering::Relaxed);
+                    }
+                }
+                Host::Window => {}
+            }
             menu_separator(ui);
             let files = f.info.is_some_and(|i| i.files);
             if menu_row(ui, Lead::Tick(w.show_files), "ไฟล์บนเครื่องปลายทาง", "", files)
@@ -539,11 +803,16 @@ impl ViewerWindow {
             }
             menu_separator(ui);
             menu_header(ui, "ขนาดภาพ");
-            if menu_row(ui, Lead::Check(!w.original), "พอดีหน้าต่าง", "", true).clicked() {
-                w.original = false;
+            for (s, label, hint) in [(Scale::Stretch, "ยืดให้เต็มหน้าต่าง", ""), (Scale::Shrink, "ย่อให้พอดี", "ไม่ขยายเกิน 1:1"), (Scale::Original, "ขนาดจริง", "1:1")] {
+                if menu_row(ui, Lead::Check(w.scale == s), label, hint, true).clicked() {
+                    w.scale = s;
+                }
             }
-            if menu_row(ui, Lead::Check(w.original), "ขนาดจริง", "1:1", true).clicked() {
-                w.original = true;
+            if menu_row(ui, Lead::Tick(w.follow_cursor), "เลื่อนภาพตามเคอร์เซอร์ปลายทาง", "", true)
+                .on_hover_text("เมื่อภาพใหญ่กว่าหน้าต่าง ให้เลื่อนตามตัวชี้ของเครื่องปลายทางแทนตัวชี้ของเรา")
+                .clicked()
+            {
+                w.follow_cursor = !w.follow_cursor;
             }
             menu_separator(ui);
             if menu_row(ui, Lead::Tick(w.show_quality), "แสดงข้อมูลคุณภาพการเชื่อมต่อ", "", true).clicked() {
@@ -561,7 +830,24 @@ impl ViewerWindow {
             menu(&resp, id, pal).show(|ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
                 let remote_mac = f.info.is_some_and(|i| i.os == "macos");
-                menu_header(ui, "โหมดแป้นพิมพ์");
+                if f.info.is_some_and(|i| i.has("keymode")) {
+                    menu_header(ui, "โหมดแป้นพิมพ์");
+                    let modes = [(false, "พิมพ์ตามตัวอักษร", "Translate"), (true, "ตามตำแหน่งปุ่ม", "Map")];
+                    for (map, label, hint) in modes {
+                        let r = menu_row(ui, Lead::Check(w.key_map == map), label, hint, true).on_hover_text(if map {
+                            "กดปุ่มตามตำแหน่งจริงบนแป้นพิมพ์ ใช้ภาษาที่ตั้งไว้บนเครื่องปลายทาง (เหมาะกับเกม)"
+                        } else {
+                            "ส่งตัวอักษรที่พิมพ์ ใช้ได้ทุกภาษาโดยไม่ต้องตั้งภาษาบนเครื่องปลายทาง"
+                        });
+                        if r.clicked() && w.key_map != map {
+                            w.key_map = map;
+                            w.input.mods_down.clear();
+                            self.viewer.set_key_map(map);
+                        }
+                    }
+                    menu_separator(ui);
+                }
+                menu_header(ui, "ปุ่ม ⌘ และ Ctrl");
                 let hint = if remote_mac { "" } else { "⌘ → Ctrl" };
                 if menu_row(ui, Lead::Check(!w.raw_keys), "แมปตามระบบปลายทาง", hint, true).clicked() {
                     w.raw_keys = false;
@@ -570,6 +856,13 @@ impl ViewerWindow {
                     w.raw_keys = true;
                 }
                 menu_separator(ui);
+                if f.info.is_some_and(|i| i.has("relmouse")) {
+                    if menu_row(ui, Lead::Tick(w.relative), "เมาส์แบบสัมพัทธ์ (เกม/3D)", "Ctrl+Alt+M", true).clicked() {
+                        let on = !w.relative;
+                        self.set_relative(&ctx, w, on);
+                    }
+                    menu_separator(ui);
+                }
                 if menu_row(ui, Lead::Glyph(Glyph::Keyboard), "ส่ง Ctrl + Alt + Del", "", true).clicked() {
                     send_combo(&self.viewer, &[("ControlLeft", "Control"), ("AltLeft", "Alt")], ("Delete", "Delete"));
                 }
@@ -666,11 +959,11 @@ impl ViewerWindow {
     }
 
     /// "Recording" badge in the top-right corner while the remote machine records the session.
-    fn recording_badge(&self, ctx: &egui::Context) {
+    fn recording_badge(&self, ctx: &egui::Context, top: f32) {
         egui::Area::new(egui::Id::unique(("recording", self.viewport)))
             .order(Order::Middle)
             .interactable(true)
-            .anchor(Align2::RIGHT_TOP, [-12.0, 10.0])
+            .anchor(Align2::RIGHT_TOP, [-12.0, 10.0 + top])
             .show(ctx, |ui| {
                 Frame::new().fill(Color32::from_black_alpha(175)).corner_radius(12).inner_margin(Margin::symmetric(10, 4)).show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -697,11 +990,11 @@ impl ViewerWindow {
     // -----------------------------------------------------------------------------------------
     // Quality monitor, transfers
 
-    fn quality_monitor(&self, ctx: &egui::Context, f: &Frame1) {
+    fn quality_monitor(&self, ctx: &egui::Context, f: &Frame1, top: f32) {
         egui::Area::new(egui::Id::unique(("quality", self.viewport)))
             .order(Order::Middle)
             .interactable(false)
-            .anchor(Align2::LEFT_TOP, [10.0, 10.0])
+            .anchor(Align2::LEFT_TOP, [10.0, 10.0 + top])
             .show(ctx, |ui| {
                 Frame::new().fill(Color32::from_black_alpha(175)).corner_radius(8).inner_margin(Margin::symmetric(12, 9)).show(ui, |ui| {
                     ui.spacing_mut().item_spacing = vec2(14.0, 3.0);
@@ -1045,7 +1338,7 @@ impl ViewerWindow {
 
     /// Screenshots: AEGIRON_UI_VIEWER_STATE="menu=display,quality,dark,..." sets up the demo
     /// viewer once (flags: menu=monitor|actions|display|keyboard|pen, pinned, collapsed, quality, pen,
-    /// original, cursor, dark, password, connecting, closed).
+    /// original, shrink, map, cursor, dark, password, connecting, closed).
     fn demo_state(&self, ctx: &egui::Context, w: &mut WinUi) {
         if w.demo_done {
             return;
@@ -1062,7 +1355,9 @@ impl ViewerWindow {
                 "pinned" => w.pinned = true,
                 "collapsed" => w.bar_seen = Some(-100.0),
                 "quality" => w.show_quality = true,
-                "original" => w.original = true,
+                "original" => w.scale = Scale::Original,
+                "shrink" => w.scale = Scale::Shrink,
+                "map" => w.key_map = true,
                 "cursor" => st.cursor = Some((0.62, 0.55)),
                 "pen" => {
                     w.pen.on = true;
@@ -1351,6 +1646,9 @@ enum Glyph {
     Speaker,
     SpeakerOff,
     Power,
+    Camera,
+    /// A window with an arrow out of it (open in a new window).
+    PopOut,
 }
 
 fn glyph(ui: &Ui, rect: Rect, g: Glyph, color: Color32) {
@@ -1369,7 +1667,7 @@ fn glyph(ui: &Ui, rect: Rect, g: Glyph, color: Color32) {
             p.rect_stroke(Rect::from_min_max(at(1.0, 1.8), at(15.0, 11.8)), 1.5 * s, st, egui::StrokeKind::Middle);
             line(&[(5.0, 14.5), (11.0, 14.5)]);
             line(&[(8.0, 11.8), (8.0, 14.5)]);
-            p.text(at(8.0, 6.9), Align2::CENTER_CENTER, n.to_string(), semi(8.5 * s), color);
+            p.text(at(8.0, 6.9), Align2::CENTER_CENTER, if n == 0 { "*".to_string() } else { n.to_string() }, semi(8.5 * s), color);
         }
         Glyph::Bolt => {
             let poly = |pts: &[(f32, f32)]| p.add(Shape::convex_polygon(pts.iter().map(|&(x, y)| at(x, y)).collect(), color, Stroke::NONE));
@@ -1474,6 +1772,16 @@ fn glyph(ui: &Ui, rect: Rect, g: Glyph, color: Color32) {
             line(&[(3.0, 1.5), (9.5, 1.5), (13.0, 5.0), (13.0, 14.5), (3.0, 14.5), (3.0, 1.5)]);
             line(&[(9.5, 1.5), (9.5, 5.0), (13.0, 5.0)]);
         }
+        Glyph::Camera => {
+            p.rect_stroke(Rect::from_min_max(at(1.0, 4.0), at(15.0, 13.5)), 2.0 * s, st, egui::StrokeKind::Middle);
+            line(&[(5.0, 4.0), (6.3, 2.0), (9.7, 2.0), (11.0, 4.0)]);
+            p.circle_stroke(at(8.0, 8.8), 2.7 * s, st);
+        }
+        Glyph::PopOut => {
+            line(&[(7.0, 2.0), (2.0, 2.0), (2.0, 14.0), (14.0, 14.0), (14.0, 9.0)]);
+            line(&[(8.0, 8.0), (14.5, 1.5)]);
+            line(&[(10.0, 1.5), (14.5, 1.5), (14.5, 6.0)]);
+        }
         Glyph::Speaker | Glyph::SpeakerOff => {
             p.add(Shape::convex_polygon(
                 [(1.5, 5.8), (4.5, 5.8), (8.5, 2.2), (8.5, 13.8), (4.5, 10.2), (1.5, 10.2)].iter().map(|&(x, y)| at(x, y)).collect(),
@@ -1504,12 +1812,99 @@ fn glyph(ui: &Ui, rect: Rect, g: Glyph, color: Color32) {
 // ---------------------------------------------------------------------------------------------
 // Input forwarding
 
-/// How modifier keys are translated for the remote OS.
+/// How keys and the pointer reach the remote machine.
 #[derive(Clone, Copy)]
 struct KeyMap {
     remote_mac: bool,
     /// Send Ctrl as Ctrl and ⌘ as Meta, whatever the remote OS.
     raw: bool,
+    /// "map" mode: physical keys, each press and release (otherwise characters are typed).
+    map: bool,
+    /// Relative mouse: raw motion as `mr`, buttons without a position.
+    relative: bool,
+}
+
+/// Size of the remote screen (`frame`, in pixels) in a window area of `avail` points.
+fn view_size(scale: Scale, avail: egui::Vec2, frame: egui::Vec2, ppp: f32) -> egui::Vec2 {
+    let fit = (avail.x / frame.x).min(avail.y / frame.y);
+    let one = 1.0 / ppp;
+    frame
+        * match scale {
+            Scale::Stretch => fit,
+            Scale::Shrink => fit.min(one),
+            Scale::Original => one,
+        }
+}
+
+/// Where a view of `size` goes in `area`: centered on an axis where it fits, else panned
+/// (`pan` 0 = start, 1 = end).
+fn place(area: Rect, size: egui::Vec2, pan: egui::Vec2) -> Rect {
+    let mut min = area.center() - size / 2.0;
+    if size.x > area.width() {
+        min.x = area.left() - pan.x.clamp(0.0, 1.0) * (size.x - area.width());
+    }
+    if size.y > area.height() {
+        min.y = area.top() - pan.y.clamp(0.0, 1.0) * (size.y - area.height());
+    }
+    Rect::from_min_size(min.round(), size)
+}
+
+/// Pan (0..1) along one axis so a point at `at` (in view units from its start) stays at least
+/// a margin inside a window `view` long; moves only as far as needed.
+fn follow(pan: f32, size: f32, view: f32, at: f32) -> f32 {
+    let room = size - view;
+    if room <= 0.0 {
+        return pan;
+    }
+    let margin = (view * 0.15).min(80.0);
+    let mut offset = pan.clamp(0.0, 1.0) * room;
+    if at - offset < margin {
+        offset = at - margin;
+    } else if at - offset > view - margin {
+        offset = at - (view - margin);
+    }
+    (offset / room).clamp(0.0, 1.0)
+}
+
+/// Uploads changed parts of `fb` into `tex` (the whole picture after a resize, or when many
+/// changes piled up while the window or tab was not drawn).
+fn sync_texture(ctx: &egui::Context, tex: &mut Option<egui::TextureHandle>, fb: &mut crate::viewer::Framebuffer, name: &str) {
+    if fb.w == 0 {
+        return;
+    }
+    let opts = egui::TextureOptions::LINEAR;
+    if tex.is_none() || fb.resized || fb.dirty.len() > 64 {
+        let img = egui::ColorImage::from_rgba_unmultiplied([fb.w, fb.h], &fb.rgba);
+        *tex = Some(ctx.load_texture(name, img, opts));
+        fb.resized = false;
+        fb.dirty.clear();
+    } else if let Some(t) = tex.as_mut() {
+        for [x, y, dw, dh] in std::mem::take(&mut fb.dirty) {
+            if dw == 0 || dh == 0 {
+                continue;
+            }
+            let mut sub = Vec::with_capacity(dw * dh * 4);
+            for row in y..y + dh {
+                let i = (row * fb.w + x) * 4;
+                sub.extend_from_slice(&fb.rgba[i..i + dw * 4]);
+            }
+            t.set_partial([x, y], egui::ColorImage::from_rgba_unmultiplied([dw, dh], &sub), opts);
+        }
+    }
+}
+
+/// Ctrl+Alt+M was pressed (relative mouse on/off); the key is taken out of this frame's input.
+fn take_relative_hotkey(ui: &Ui) -> bool {
+    ui.input_mut(|i| {
+        let hit = |e: &egui::Event| matches!(e, egui::Event::Key { key: egui::Key::M, modifiers, .. } if modifiers.ctrl && modifiers.alt);
+        let pressed = i.events.iter().any(|e| hit(e) && matches!(e, egui::Event::Key { pressed: true, repeat: false, .. }));
+        i.events.retain(|e| !hit(e));
+        // Ctrl+Alt+M may also type a character (e.g. µ on a Mac): drop it.
+        if pressed {
+            i.events.retain(|e| !matches!(e, egui::Event::Text(_)));
+        }
+        pressed
+    })
 }
 
 /// Presses modifiers, taps `key`, releases in reverse order.
@@ -1594,11 +1989,51 @@ fn shortcut_key(k: egui::Key) -> Option<(String, String)> {
     None
 }
 
+/// Every key that types something, by its position (map mode): (KeyboardEvent.code, key).
+fn physical_code(k: egui::Key) -> Option<(String, String)> {
+    use egui::Key::*;
+    if let Some((code, name)) = named_key(k) {
+        return Some((code.into(), name.into()));
+    }
+    if let Some(c) = shortcut_key(k) {
+        return Some(c);
+    }
+    let (code, ch) = match k {
+        Space => ("Space", " "),
+        Minus => ("Minus", "-"),
+        Equals => ("Equal", "="),
+        OpenBracket => ("BracketLeft", "["),
+        CloseBracket => ("BracketRight", "]"),
+        Backslash => ("Backslash", "\\"),
+        Semicolon => ("Semicolon", ";"),
+        Quote => ("Quote", "'"),
+        Backtick => ("Backquote", "`"),
+        Comma => ("Comma", ","),
+        Period => ("Period", "."),
+        Slash => ("Slash", "/"),
+        _ => return None,
+    };
+    Some((code.into(), ch.into()))
+}
+
+/// Presses and releases remote modifiers so exactly `want` is held (map mode).
+fn sync_mods(v: &Viewer, st: &mut InputState, want: Vec<(&'static str, &'static str)>) {
+    let k = |(code, name): (&str, &str), down: bool| serde_json::json!({"t": "key", "code": code, "key": name, "down": down});
+    for m in st.mods_down.iter().filter(|m| !want.contains(m)) {
+        v.send(k(*m, false));
+    }
+    for m in want.iter().filter(|m| !st.mods_down.contains(m)) {
+        v.send(k(*m, true));
+    }
+    st.mods_down = want;
+}
+
 /// Sends pointer and keyboard input on the remote screen. `rect` is where the remote screen is
-/// drawn, `visible` the part of the window showing it. Pointer events over the toolbar, its
-/// menus or other overlays stay local (hit-tested against egui's layers from the last frame),
-/// and nothing is forwarded while a menu is open.
-fn forward_input(v: &Viewer, ui: &Ui, rect: Rect, visible: Rect, keys: KeyMap, held: &mut u8, paste_seen: &mut bool) {
+/// drawn, `visible` the part of the window showing it, `display` the extra display stream it
+/// shows (None = the main one). Pointer events over the toolbar, its menus or other overlays
+/// stay local (hit-tested against egui's layers from the last frame), and nothing is
+/// forwarded while a menu is open.
+fn forward_input(v: &Viewer, ui: &Ui, rect: Rect, visible: Rect, keys: KeyMap, st: &mut InputState, display: Option<usize>) {
     let ctx = ui.ctx();
     let menu_open = Popup::is_any_open(ctx);
     let ours = ui.layer_id();
@@ -1609,11 +2044,24 @@ fn forward_input(v: &Viewer, ui: &Ui, rect: Rect, visible: Rect, keys: KeyMap, h
         let q = rect.clamp(p);
         (((q.x - rect.left()) / rect.width()) as f64, ((q.y - rect.top()) / rect.height()) as f64)
     };
+    // Pointer messages of an extra display window say which display they are for.
+    let with_d = |mut m: serde_json::Value| {
+        if let Some(d) = display {
+            m["d"] = serde_json::json!(d);
+        }
+        m
+    };
     let (events, hover) = ui.input(|i| (i.events.clone(), i.pointer.hover_pos()));
+    if !keys.map && !st.mods_down.is_empty() {
+        sync_mods(v, st, Vec::new());
+    }
     let mut moved = None;
+    let mut rel = egui::Vec2::ZERO;
     for e in events {
         match e {
-            egui::Event::PointerMoved(p) if on_screen(p) || *held != 0 => moved = Some(norm(p)),
+            // Relative mode: raw motion, wherever the (hidden, captured) cursor is.
+            egui::Event::MouseMoved(d) if keys.relative && !menu_open => rel += d,
+            egui::Event::PointerMoved(p) if !keys.relative && (on_screen(p) || st.held != 0) => moved = Some(norm(p)),
             egui::Event::PointerButton { pos, button, pressed, .. } => {
                 let b: u8 = match button {
                     egui::PointerButton::Primary => 0,
@@ -1622,19 +2070,24 @@ fn forward_input(v: &Viewer, ui: &Ui, rect: Rect, visible: Rect, keys: KeyMap, h
                     _ => continue,
                 };
                 // Presses must land on the screen; a release goes out only if its press did.
-                if pressed && !on_screen(pos) || !pressed && *held & (1 << b) == 0 {
+                let lands = if keys.relative { !menu_open } else { on_screen(pos) };
+                if pressed && !lands || !pressed && st.held & (1 << b) == 0 {
                     continue;
                 }
                 if pressed {
-                    *held |= 1 << b;
+                    st.held |= 1 << b;
                 } else {
-                    *held &= !(1 << b);
+                    st.held &= !(1 << b);
                 }
-                let (x, y) = norm(pos);
                 moved = None;
-                v.send(serde_json::json!({"t": "mb", "b": b, "down": pressed, "x": x, "y": y}));
+                if keys.relative {
+                    v.send(serde_json::json!({"t": "mb", "b": b, "down": pressed}));
+                } else {
+                    let (x, y) = norm(pos);
+                    v.send(with_d(serde_json::json!({"t": "mb", "b": b, "down": pressed, "x": x, "y": y})));
+                }
             }
-            egui::Event::MouseWheel { unit, delta, .. } if hover.is_some_and(on_screen) => {
+            egui::Event::MouseWheel { unit, delta, .. } if keys.relative || hover.is_some_and(on_screen) => {
                 let lines = |d: f32| match unit {
                     egui::MouseWheelUnit::Line => d,
                     egui::MouseWheelUnit::Point => d / 40.0,
@@ -1648,6 +2101,19 @@ fn forward_input(v: &Viewer, ui: &Ui, rect: Rect, visible: Rect, keys: KeyMap, h
             }
             // Keyboard input belongs to an open menu (Esc closes it).
             _ if menu_open => {}
+            // Map mode: every key by position, down and up; characters are not typed.
+            egui::Event::Text(_) if keys.map => {}
+            egui::Event::Key { key, physical_key, pressed, modifiers, .. } if keys.map => {
+                sync_mods(v, st, remote_mods(modifiers, keys));
+                if let Some((code, name)) = physical_code(physical_key.unwrap_or(key)) {
+                    v.send(serde_json::json!({"t": "key", "code": code, "key": name, "down": pressed}));
+                }
+            }
+            egui::Event::Copy | egui::Event::Cut if keys.map => {
+                sync_mods(v, st, remote_mods(ui.input(|i| i.modifiers), keys));
+                let k = if matches!(e, egui::Event::Copy) { ("KeyC", "c") } else { ("KeyX", "x") };
+                send_combo(v, &[], k);
+            }
             egui::Event::Text(t) => {
                 let t: String = t.chars().filter(|c| !c.is_control()).collect();
                 if !t.is_empty() {
@@ -1659,8 +2125,15 @@ fn forward_input(v: &Viewer, ui: &Ui, rect: Rect, visible: Rect, keys: KeyMap, h
             egui::Event::Paste(text) => {
                 // Paste what is on this machine's clipboard: files are uploaded and put on the
                 // remote clipboard first; text is handed over; then paste is pressed remotely.
-                *paste_seen = true;
-                let combo = combo_events(&remote_mods(ui.input(|i| i.modifiers), keys), ("KeyV", "v"));
+                // In map mode the modifiers are already held remotely.
+                st.paste_seen = true;
+                let mods = if keys.map {
+                    sync_mods(v, st, remote_mods(ui.input(|i| i.modifiers), keys));
+                    Vec::new()
+                } else {
+                    remote_mods(ui.input(|i| i.modifiers), keys)
+                };
+                let combo = combo_events(&mods, ("KeyV", "v"));
                 match v.paste_files(combo.clone()) {
                     Paste::Text => {
                         v.send(serde_json::json!({"t": "clip", "s": text}));
@@ -1673,7 +2146,7 @@ fn forward_input(v: &Viewer, ui: &Ui, rect: Rect, visible: Rect, keys: KeyMap, h
             // Cmd/Ctrl+V with no text on the clipboard (e.g. files copied in Explorer) produces
             // no Paste event, only this key-up.
             egui::Event::Key { key: egui::Key::V, pressed: false, modifiers, .. } if modifiers.command_only() => {
-                if std::mem::take(paste_seen) {
+                if std::mem::take(&mut st.paste_seen) {
                     continue;
                 }
                 let combo = combo_events(&remote_mods(modifiers, keys), ("KeyV", "v"));
@@ -1694,8 +2167,19 @@ fn forward_input(v: &Viewer, ui: &Ui, rect: Rect, visible: Rect, keys: KeyMap, h
             _ => {}
         }
     }
-    if let Some((x, y)) = moved {
-        v.send(serde_json::json!({"t": "mm", "x": x, "y": y}));
+    if keys.map && !menu_open {
+        // Modifier keys alone (Shift for running in a game) produce no key event.
+        sync_mods(v, st, remote_mods(ui.input(|i| i.modifiers), keys));
+    }
+    if keys.relative {
+        st.rel_rest += rel;
+        let (dx, dy) = (st.rel_rest.x.trunc(), st.rel_rest.y.trunc());
+        if dx != 0.0 || dy != 0.0 {
+            st.rel_rest -= vec2(dx, dy);
+            v.send(serde_json::json!({"t": "mr", "dx": dx as i32, "dy": dy as i32}));
+        }
+    } else if let Some((x, y)) = moved {
+        v.send(with_d(serde_json::json!({"t": "mm", "x": x, "y": y})));
     }
 }
 
@@ -1968,4 +2452,49 @@ fn human_size(n: u64) -> String {
         u += 1;
     }
     if u == 0 { format!("{n} B") } else { format!("{v:.1} {}", UNITS[u]) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scale_modes() {
+        let frame = vec2(1920.0, 1080.0);
+        // A big window: stretch enlarges, shrink and original stay at 1:1 (2x display: 960 pt).
+        let big = vec2(2400.0, 1600.0);
+        assert_eq!(view_size(Scale::Stretch, big, frame, 1.0), vec2(2400.0, 1350.0));
+        assert_eq!(view_size(Scale::Shrink, big, frame, 1.0), frame);
+        assert_eq!(view_size(Scale::Original, big, frame, 2.0), vec2(960.0, 540.0));
+        // A small window: stretch and shrink fit, original overflows.
+        let small = vec2(960.0, 800.0);
+        assert_eq!(view_size(Scale::Stretch, small, frame, 1.0), vec2(960.0, 540.0));
+        assert_eq!(view_size(Scale::Shrink, small, frame, 1.0), vec2(960.0, 540.0));
+        assert_eq!(view_size(Scale::Original, small, frame, 1.0), frame);
+    }
+
+    #[test]
+    fn placing_and_following() {
+        let area = Rect::from_min_size(pos2(0.0, 40.0), vec2(800.0, 600.0));
+        // Fits: centered.
+        assert_eq!(place(area, vec2(400.0, 300.0), vec2(0.0, 1.0)).min, pos2(200.0, 190.0));
+        // Larger: panned.
+        assert_eq!(place(area, vec2(1600.0, 600.0), vec2(1.0, 0.5)).min, pos2(-800.0, 40.0));
+        // The remote pointer near the right edge of a 1600-wide view pulls the pan along.
+        let pan = follow(0.0, 1600.0, 800.0, 1500.0);
+        let offset = pan * 800.0;
+        assert!(1500.0 - offset <= 800.0 - 80.0 + 0.01 && pan > 0.0);
+        // Already visible: no movement; and nothing to pan when it fits.
+        assert_eq!(follow(0.5, 1600.0, 800.0, 800.0), 0.5);
+        assert_eq!(follow(0.3, 600.0, 800.0, 590.0), 0.3);
+    }
+
+    #[test]
+    fn map_mode_codes() {
+        assert_eq!(physical_code(egui::Key::A), Some(("KeyA".into(), "a".into())));
+        assert_eq!(physical_code(egui::Key::Num7), Some(("Digit7".into(), "7".into())));
+        assert_eq!(physical_code(egui::Key::Semicolon), Some(("Semicolon".into(), ";".into())));
+        assert_eq!(physical_code(egui::Key::Enter), Some(("Enter".into(), "Enter".into())));
+        assert_eq!(physical_code(egui::Key::Copy), None);
+    }
 }

@@ -21,7 +21,10 @@
 	];
 
 	const bare = $derived(
-		page.url.pathname === '/login' || page.url.pathname.startsWith('/connect/') || page.url.pathname.startsWith('/gateway/')
+		page.url.pathname === '/login' ||
+			page.url.pathname.startsWith('/connect/') ||
+			page.url.pathname.startsWith('/terminal/') ||
+			page.url.pathname.startsWith('/gateway/')
 	);
 	const isActive = (href: string) => (href === '/' ? page.url.pathname === '/' : page.url.pathname.startsWith(href));
 

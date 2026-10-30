@@ -50,6 +50,14 @@ func TestScan(t *testing.T) {
 		t.Fatalf("av1 recording: %+v %v", info, err)
 	}
 
+	// A terminal session: output and size records only.
+	size := append([]byte{msgJSON}, []byte(`{"t":"term_size","cols":80,"rows":24}`)...)
+	out := append([]byte{msgTerm}, []byte("$ echo hi\r\nhi\r\n")...)
+	info, err = Scan(bytes.NewReader(build(h, size, out, out)))
+	if err != nil || info.Frames != 0 || info.Codec != "terminal" || info.DurationMS != 200 {
+		t.Fatalf("terminal recording: %+v %v", info, err)
+	}
+
 	info, err = Scan(bytes.NewReader(build(h)))
 	if err != nil || info.Frames != 0 || info.Codec != "" {
 		t.Fatalf("empty recording: %+v %v", info, err)

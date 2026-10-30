@@ -9,6 +9,11 @@
 //!         temporal unit of low-overhead OBUs)
 //!   0x05  audio packet: codec (u8, 1 = Opus 48 kHz stereo), sequence (u32 BE, one per 20 ms
 //!         frame) followed by one Opus packet. Only sent to viewers that asked for audio.
+//!   0x06  extra display stream: display (u8) followed by a complete 0x01/0x02/0x04 message for
+//!         that display (feature "multidisp", only after `cfg {streams}`).
+//!   0x10  TCP tunnel data (tunnel sessions): stream id (u32 BE) followed by up to 32 KiB
+//!   0x11  terminal data (terminal sessions): raw bytes, PTY output to the viewer and keyboard
+//!         input to the agent
 
 use serde::Deserialize;
 
@@ -17,6 +22,23 @@ pub const MSG_FRAME: u8 = 0x02;
 pub const MSG_FILE: u8 = 0x03;
 pub const MSG_VIDEO: u8 = 0x04;
 pub const MSG_AUDIO: u8 = 0x05;
+pub const MSG_STREAM: u8 = 0x06;
+
+/// Display and input capabilities every agent session offers (added to `info.features`).
+pub const DISPLAY_FEATURES: [&str; 5] = ["alldisp", "multidisp", "resolution", "keymode", "relmouse"];
+
+/// Most extra display streams one session may ask for.
+pub const MAX_STREAMS: usize = 8;
+
+/// Wraps a message of an extra display stream.
+pub fn stream(display: u8, msg: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + msg.len());
+    out.extend_from_slice(&[MSG_STREAM, display]);
+    out.extend_from_slice(msg);
+    out
+}
+pub const MSG_TUNNEL: u8 = 0x10;
+pub const MSG_TERM: u8 = 0x11;
 
 pub const AUDIO_OPUS: u8 = 1;
 
@@ -26,6 +48,21 @@ pub fn file_chunk(id: u32, data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(5 + data.len());
     out.push(MSG_FILE);
     out.extend_from_slice(&id.to_be_bytes());
+    out.extend_from_slice(data);
+    out
+}
+
+pub fn tunnel_data(id: u32, data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(5 + data.len());
+    out.push(MSG_TUNNEL);
+    out.extend_from_slice(&id.to_be_bytes());
+    out.extend_from_slice(data);
+    out
+}
+
+pub fn term_data(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + data.len());
+    out.push(MSG_TERM);
     out.extend_from_slice(data);
     out
 }
@@ -86,6 +123,13 @@ pub enum ViewerMsg {
         /// Audio codecs the viewer can play, e.g. ["opus"]; absent = no audio is sent.
         #[serde(default)]
         audio: Vec<String>,
+        /// Session type the viewer asked the server for ("tunnel", "terminal"); absent = screen.
+        /// Must match the type in the server's session request.
+        #[serde(default)]
+        session: Option<String>,
+        /// Tunnel target (`host:port`); must match the server's session request.
+        #[serde(default)]
+        target: Option<String>,
         /// One-time token from `ctl {op:"restart"}`: reconnecting after the restart it asked
         /// for, without the password or a click (feature "restart").
         #[serde(default)]
@@ -94,12 +138,17 @@ pub enum ViewerMsg {
     /// Viewer muted (`on: false`) or unmuted its speaker; the agent stops/resumes 0x05 packets.
     #[serde(rename = "audio")]
     Audio { on: bool },
-    /// Pointer move; x, y are normalised to [0, 1] across the displayed frame.
+    /// Pointer move; x, y are normalised to [0, 1] across the displayed frame, or across the
+    /// extra display stream `d` (feature "multidisp").
     #[serde(rename = "mm")]
-    MouseMove { x: f64, y: f64 },
-    /// Mouse button (0 left, 1 middle, 2 right) press/release.
+    MouseMove { x: f64, y: f64, d: Option<usize> },
+    /// Mouse button (0 left, 1 middle, 2 right) press/release. Without x/y (feature
+    /// "relmouse") it is pressed wherever the pointer is.
     #[serde(rename = "mb")]
-    MouseButton { b: u8, down: bool, x: f64, y: f64 },
+    MouseButton { b: u8, down: bool, x: Option<f64>, y: Option<f64>, d: Option<usize> },
+    /// Relative pointer motion in input units (feature "relmouse").
+    #[serde(rename = "mr")]
+    MouseRel { dx: f64, dy: f64 },
     #[serde(rename = "wh")]
     Wheel { dx: i32, dy: i32 },
     /// Key press/release using browser KeyboardEvent.code / .key.
@@ -110,8 +159,29 @@ pub enum ViewerMsg {
     #[serde(rename = "clip")]
     Clipboard { s: String },
     /// Stream settings; `codec` ("av1", "h264", "jpeg") switches to one of `info.codecs`.
+    /// `display_all` (feature "alldisp") streams every display as one picture; `streams`
+    /// (feature "multidisp") lists extra displays to stream; `keyboard` (feature "keymode") is
+    /// "map" or "translate".
     #[serde(rename = "cfg")]
-    Config { fps: Option<u32>, quality: Option<u8>, max_width: Option<u32>, display: Option<usize>, codec: Option<String> },
+    Config {
+        fps: Option<u32>,
+        quality: Option<u8>,
+        max_width: Option<u32>,
+        display: Option<usize>,
+        codec: Option<String>,
+        display_all: Option<bool>,
+        streams: Option<Vec<usize>>,
+        keyboard: Option<String>,
+    },
+    /// Display modes of `display` (feature "resolution").
+    #[serde(rename = "res_list")]
+    ResList { display: usize },
+    /// Switch `display` to one of its modes (feature "resolution").
+    #[serde(rename = "res_set")]
+    ResSet { display: usize, w: u32, h: u32, hz: Option<u32> },
+    /// Put the display's original mode back (feature "resolution").
+    #[serde(rename = "res_restore")]
+    ResRestore { display: usize },
     /// List a directory ("" = home).
     #[serde(rename = "ls")]
     List { path: String },

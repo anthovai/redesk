@@ -48,6 +48,8 @@ mod cm_ui;
 mod viewer_ui;
 #[path = "ui_overlay.rs"]
 mod overlay_ui;
+#[path = "ui_remote.rs"]
+mod remote_ui;
 
 pub use viewer_ui::ViewerWindow;
 
@@ -151,7 +153,9 @@ fn install_fonts(ctx: &egui::Context) {
     let regular = load(REGULAR);
     let semibold = load(SEMIBOLD);
     if let Some(r) = regular.clone() {
-        ctx.add_font(FontInsert::new("ui-regular", r, vec![fam(FontFamily::Proportional)]));
+        // Also the fallback for Thai in monospace text (terminal windows).
+        let mono_fallback = InsertFontFamily { family: FontFamily::Monospace, priority: FontPriority::Lowest };
+        ctx.add_font(FontInsert::new("ui-regular", r, vec![fam(FontFamily::Proportional), mono_fallback]));
     }
     if let Some(s) = semibold.or(regular) {
         ctx.add_font(FontInsert::new("ui-semibold", s, vec![fam(FontFamily::Name("semi".into()))]));
@@ -505,6 +509,39 @@ fn verify_pin(hash: &str, pin: &str) -> bool {
 enum TabIcon {
     Logo,
     Gear,
+    /// A remote session: a dot, green while connected.
+    Remote(bool),
+}
+
+/// A remote-control window (own window, tabs or extra display).
+fn viewer_builder(title: String, size: [f32; 2]) -> egui::ViewportBuilder {
+    let builder = egui::ViewportBuilder::default()
+        .with_title(title)
+        .with_inner_size(size)
+        .with_min_inner_size([640.0, 420.0])
+        .with_transparent(false)
+        .with_icon(Arc::new(egui::IconData { rgba: icon_rgba(64), width: 64, height: 64 }));
+    // AEGIRON_UI_VIEWER_POS="x,y" places the window (automated screenshots).
+    match std::env::var("AEGIRON_UI_VIEWER_POS").ok().and_then(|p| {
+        let (x, y) = p.split_once(',')?;
+        Some([x.parse::<f32>().ok()?, y.parse::<f32>().ok()?])
+    }) {
+        Some(pos) => builder.with_position(pos),
+        None => builder,
+    }
+}
+
+/// Remembers the size of the focused remote window for the next one.
+fn remember_viewer_size(ui: &Ui, seen: &Mutex<Option<[f32; 2]>>) {
+    let size = ui.input(|i| {
+        let v = i.viewport();
+        // The focused window only: several open viewers must not fight over one value.
+        let normal = v.focused == Some(true) && v.minimized != Some(true) && v.maximized != Some(true) && v.fullscreen != Some(true);
+        v.inner_rect.filter(|_| normal).map(|r| [r.width(), r.height()])
+    });
+    if size.is_some() {
+        *seen.lock().unwrap() = size;
+    }
 }
 
 /// One tab of the strip under the title bar. Returns the tab response and whether its close
@@ -533,6 +570,9 @@ fn tab_chip(ui: &mut Ui, text: &str, icon: TabIcon, selected: bool, closable: bo
             ui.painter().image(tex.id(), ic, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
         }
         TabIcon::Gear => paint_icon(ui, ic, Icon::Gear, if selected { pal.accent } else { pal.muted }),
+        TabIcon::Remote(live) => {
+            ui.painter().circle_filled(ic.center(), 4.0, if live { pal.ok } else { pal.muted });
+        }
     }
     ui.painter().galley(pos2(ic.right() + 8.0, rect.center().y - galley.size().y / 2.0), galley, pal.fg);
     let mut closed = false;
@@ -694,6 +734,8 @@ fn view_toggle(ui: &mut Ui, icon: Icon, on: bool, tip: &str) -> Response {
 /// What the user picked on a device card or row.
 enum PeerAction {
     Connect(String, String),
+    Terminal(String, String),
+    Tunnel(String, String),
     Star(String),
     CopyId(String),
     Forget(String),
@@ -841,6 +883,11 @@ pub struct App {
     lan_busy: bool,
     update: UpdateState,
     viewers: Vec<Arc<ViewerWindow>>,
+    /// Terminal windows (one per remote shell).
+    terminals: Vec<Arc<remote_ui::TerminalWindow>>,
+    /// TCP tunnels opened from this app, with a key for the list.
+    tunnels: Arc<Mutex<Vec<(u64, Arc<crate::tunnel::Tunnel>)>>>,
+    tunnel_form: Option<remote_ui::TunnelForm>,
     new_pw: String,
     new_pw2: String,
     autostart: bool,
@@ -866,6 +913,8 @@ pub struct App {
     /// Initial size of each open viewer window (a changing builder would resize it).
     viewer_init: HashMap<egui::ViewportId, [f32; 2]>,
     viewer_size_seen: Arc<Mutex<Option<[f32; 2]>>>,
+    /// Remote session shown in the tabbed viewer window (by its own viewport id).
+    tab_active: Arc<Mutex<Option<egui::ViewportId>>>,
     /// Demo screenshots of the lower part of a view.
     demo_scroll: Option<f32>,
     /// The settings tab stays in the tab strip until closed.
@@ -902,6 +951,9 @@ impl App {
             lan_busy: false,
             update: UpdateState::default(),
             viewers: Vec::new(),
+            terminals: Vec::new(),
+            tunnels: Arc::default(),
+            tunnel_form: None,
             new_pw: String::new(),
             new_pw2: String::new(),
             autostart: service::is_installed(),
@@ -923,6 +975,7 @@ impl App {
             pin: PinState::default(),
             viewer_init: HashMap::new(),
             viewer_size_seen: Arc::default(),
+            tab_active: Arc::default(),
             demo_scroll: None,
             settings_tab: false,
         };
@@ -993,6 +1046,7 @@ impl App {
                 kill: Default::default(),
                 recording: view == "home" && std::env::var_os("AEGIRON_UI_DEMO_RECORDING").is_some(),
                 controls: Default::default(),
+                purpose: String::new(),
             });
             if std::env::var_os("AEGIRON_UI_DEMO_WHITEBOARD").is_some() {
                 // A circled spot and an arrow pointing at it, as a viewer would draw them.
@@ -1045,7 +1099,7 @@ impl App {
             if let Ok(img) = image::open("docs/images/remote-sample.png").or_else(|_| image::open("../docs/images/agent-home.png")) {
                 let viewport = egui::ViewportId::from_hash_of("demo-viewer");
                 let v = Viewer::demo("บัญชี-PC01", "512340987", "9371:520b:f9c5:c8fc", &img.to_rgba8());
-                self.viewers.push(ViewerWindow::new(v, "512340987".into(), viewport));
+                self.viewers.push(ViewerWindow::new(v, "512340987".into(), viewport, Arc::default()));
             }
         }
         if view == "signin" {
@@ -1055,7 +1109,7 @@ impl App {
         if view == "approval" {
             let (reply, _) = tokio::sync::oneshot::channel();
             self.pending.push_back((
-                ApprovalRequest { sid: String::new(), who: "สุดา รักงาน <suda@kgarden.co.th>".into(), ip: "10.1.20.45".into(), recording: std::env::var_os("AEGIRON_UI_DEMO_RECORDING").is_some(), reply },
+                ApprovalRequest { sid: String::new(), who: "สุดา รักงาน <suda@kgarden.co.th>".into(), ip: "10.1.20.45".into(), recording: std::env::var_os("AEGIRON_UI_DEMO_RECORDING").is_some(), purpose: String::new(), reply },
                 Instant::now() - Duration::from_secs(8),
             ));
         }
@@ -1187,7 +1241,11 @@ impl App {
             return;
         }
         if let Some(w) = self.viewers.iter().find(|w| w.device_id == id && !w.closed.load(Ordering::Relaxed)) {
-            ctx.send_viewport_cmd_to(w.viewport, ViewportCommand::Focus);
+            let tabbed = self.local.viewer_tabs && !w.popped.load(Ordering::Relaxed);
+            if tabbed {
+                *self.tab_active.lock().unwrap() = Some(w.viewport);
+            }
+            ctx.send_viewport_cmd_to(if tabbed { viewer_ui::tabs_viewport() } else { w.viewport }, ViewportCommand::Focus);
             return;
         }
         let Some((server, acc)) = self.account() else {
@@ -1201,11 +1259,25 @@ impl App {
         let direct = agent.config.lock().unwrap().direct_enabled;
         let codec = agent.config.lock().unwrap().viewer_codec.codec();
         let target = crate::viewer::Target { server, token: acc.token, insecure, device_id: id.to_string(), name: name.to_string(), direct, only: None, codec };
-        // Frames arrive on the network thread: wake that connection's own window.
+        // Frames arrive on the network thread: wake the windows showing that connection (its
+        // own window or the tabs, and its extra display windows; kept up to date in
+        // show_viewers).
         let viewport = egui::ViewportId::from_hash_of(("remote", id, Instant::now()));
         let rctx = ctx.clone();
-        let viewer = Viewer::connect(target, Arc::new(move || rctx.request_repaint_of(viewport)));
-        self.viewers.push(ViewerWindow::new(viewer, id.to_string(), viewport));
+        let repaint_to: Arc<Mutex<Vec<egui::ViewportId>>> = Arc::new(Mutex::new(vec![viewport]));
+        let targets = repaint_to.clone();
+        let viewer = Viewer::connect(
+            target,
+            Arc::new(move || {
+                for v in targets.lock().unwrap().iter() {
+                    rctx.request_repaint_of(*v);
+                }
+            }),
+        );
+        self.viewers.push(ViewerWindow::new(viewer, id.to_string(), viewport, repaint_to));
+        if self.local.viewer_tabs {
+            *self.tab_active.lock().unwrap() = Some(viewport);
+        }
         // A bare formatted ID is not a name worth remembering.
         let name = if name == format_id(id) { "" } else { name };
         self.local.record(id, name, local::unix_now());
@@ -1426,6 +1498,8 @@ impl App {
         Ok(())
     }
 
+    /// Remote windows: one per connection, or tabs of one window (`viewer_tabs`), plus a
+    /// window per remote display opened separately.
     fn show_viewers(&mut self, ctx: &egui::Context) {
         // "Connect again" replaces a finished window's connection in place.
         for i in 0..self.viewers.len() {
@@ -1436,43 +1510,82 @@ impl App {
                 break;
             }
         }
-        self.viewers.retain(|w| !w.closed.load(Ordering::Relaxed));
-        let live: Vec<_> = self.viewers.iter().map(|w| w.viewport).collect();
-        self.viewer_init.retain(|v, _| live.contains(v));
+        // A tab popped out into its own window, or a popped-out window moved back into the tabs.
         for w in &self.viewers {
-            let title = format!("{} — Aegiron", w.viewer.state.lock().unwrap().device_name);
-            let size = *self.viewer_init.entry(w.viewport).or_insert(self.local.viewer_size.unwrap_or(VIEWER_SIZE));
-            let builder = egui::ViewportBuilder::default()
-                .with_title(title)
-                .with_inner_size(size)
-                .with_min_inner_size([640.0, 420.0])
-                .with_transparent(false)
-                .with_icon(Arc::new(egui::IconData { rgba: icon_rgba(64), width: 64, height: 64 }));
-            // AEGIRON_UI_VIEWER_POS="x,y" places the window (automated screenshots).
-            let builder = match std::env::var("AEGIRON_UI_VIEWER_POS").ok().and_then(|p| {
-                let (x, y) = p.split_once(',')?;
-                Some([x.parse::<f32>().ok()?, y.parse::<f32>().ok()?])
-            }) {
-                Some(pos) => builder.with_position(pos),
-                None => builder,
-            };
-            let (win, seen) = (w.clone(), self.viewer_size_seen.clone());
-            ctx.show_viewport_deferred(w.viewport, builder, move |ui, _| {
-                let size = ui.input(|i| {
-                    let v = i.viewport();
-                    // The focused window only: several open viewers must not fight over one value.
-                    let normal = v.focused == Some(true)
-                        && v.minimized != Some(true)
-                        && v.maximized != Some(true)
-                        && v.fullscreen != Some(true);
-                    v.inner_rect.filter(|_| normal).map(|r| [r.width(), r.height()])
-                });
-                if size.is_some() {
-                    *seen.lock().unwrap() = size;
+            if w.toggle_tab.swap(false, Ordering::Relaxed) {
+                let popped = !w.popped.load(Ordering::Relaxed);
+                w.popped.store(popped, Ordering::Relaxed);
+                if !popped {
+                    *self.tab_active.lock().unwrap() = Some(w.viewport);
+                    ctx.send_viewport_cmd_to(viewer_ui::tabs_viewport(), ViewportCommand::Focus);
                 }
-                win.show(ui)
+            }
+        }
+        self.viewers.retain(|w| !w.closed.load(Ordering::Relaxed));
+        let tabs = self.local.viewer_tabs;
+        let tabbed: Vec<Arc<ViewerWindow>> = self.viewers.iter().filter(|w| tabs && !w.popped.load(Ordering::Relaxed)).cloned().collect();
+        let mut live: Vec<_> = self.viewers.iter().map(|w| w.viewport).collect();
+        live.push(viewer_ui::tabs_viewport());
+        self.viewer_init.retain(|v, _| live.contains(v));
+        let default_size = self.local.viewer_size.unwrap_or(VIEWER_SIZE);
+        for w in &self.viewers {
+            let in_tabs = tabbed.iter().any(|t| Arc::ptr_eq(t, w));
+            let host = if in_tabs { viewer_ui::tabs_viewport() } else { w.viewport };
+            // Each remote display opened in its own window (feature "multidisp").
+            let connected = w.viewer.state.lock().unwrap().phase == crate::viewer::Phase::Connected;
+            let extras = if connected { w.extra_displays() } else { Vec::new() };
+            *w.repaint_to.lock().unwrap() = std::iter::once(host).chain(extras.iter().map(|d| w.display_viewport(*d))).collect();
+            for d in extras {
+                let vp = w.display_viewport(d);
+                let size = *self.viewer_init.entry(vp).or_insert(default_size);
+                let builder = viewer_builder(format!("{} — หน้าจอ {} — Aegiron", w.title(), d + 1), size);
+                let win = w.clone();
+                ctx.show_viewport_deferred(vp, builder, move |ui, _| win.show_display(ui, d));
+            }
+            if in_tabs {
+                continue;
+            }
+            let size = *self.viewer_init.entry(w.viewport).or_insert(default_size);
+            let builder = viewer_builder(format!("{} — Aegiron", w.title()), size);
+            let (win, seen) = (w.clone(), self.viewer_size_seen.clone());
+            let kind = if tabs { viewer_ui::Host::PoppedOut } else { viewer_ui::Host::Window };
+            ctx.show_viewport_deferred(w.viewport, builder, move |ui, _| {
+                remember_viewer_size(ui, &seen);
+                win.show(ui, kind)
             });
         }
+        if tabbed.is_empty() {
+            return;
+        }
+        // All other sessions: tabs of one window (RustDesk style).
+        let size = *self.viewer_init.entry(viewer_ui::tabs_viewport()).or_insert(default_size);
+        let title = match tabbed.len() {
+            1 => format!("{} — Aegiron", tabbed[0].title()),
+            n => format!("{n} การเชื่อมต่อ — Aegiron"),
+        };
+        let (active, seen) = (self.tab_active.clone(), self.viewer_size_seen.clone());
+        ctx.show_viewport_deferred(viewer_ui::tabs_viewport(), viewer_builder(title, size), move |ui, _| {
+            if ui.input(|i| i.viewport().close_requested()) {
+                tabbed.iter().for_each(|w| w.close_window());
+                return;
+            }
+            remember_viewer_size(ui, &seen);
+            let current = {
+                let mut a = active.lock().unwrap();
+                let i = tabbed.iter().position(|w| Some(w.viewport) == *a).unwrap_or(tabbed.len() - 1);
+                *a = Some(tabbed[i].viewport);
+                let pal = Palette::of(ui);
+                egui::Panel::top("remote-tabs")
+                    .exact_size(TABBAR_HEIGHT)
+                    .resizable(false)
+                    .show_separator_line(false)
+                    .frame(Frame::new().fill(pal.side).inner_margin(Margin { left: 8, right: 10, top: 0, bottom: 0 }))
+                    .show(ui, |ui| ViewerWindow::tab_strip(ui, &tabbed, &mut a));
+                let i = tabbed.iter().position(|w| Some(w.viewport) == *a).unwrap_or(i);
+                tabbed[i].clone()
+            };
+            current.show(ui, viewer_ui::Host::Tab);
+        });
     }
 
     fn flash(&mut self, msg: impl Into<String>) {
@@ -1630,6 +1743,11 @@ impl eframe::App for App {
             }
         }
         self.show_viewers(ui.ctx());
+        self.show_terminals(ui.ctx());
+        if self.agent.is_some() {
+            self.tunnel_dialog(ui);
+            self.tunnels_panel(ui);
+        }
         self.connection_manager(ui);
         self.whiteboard_overlay(ui.ctx());
         self.toast_view(ui);
@@ -2037,6 +2155,17 @@ impl App {
                 let ctx = ui.ctx().clone();
                 self.open_remote(&ctx, &id, &name);
             }
+            Some(PeerAction::Terminal(id, name)) => {
+                let ctx = ui.ctx().clone();
+                self.open_terminal(&ctx, &id, &name);
+            }
+            Some(PeerAction::Tunnel(id, name)) => {
+                if self.account().is_some() {
+                    self.tunnel_form = Some(remote_ui::TunnelForm::new(&id, &name));
+                } else {
+                    self.flash("เข้าสู่ระบบก่อน เพื่อเปิด TCP tunnel");
+                }
+            }
             Some(PeerAction::Star(id)) => {
                 self.local.toggle_favorite(&id);
                 self.mark_local();
@@ -2068,6 +2197,13 @@ impl App {
         if ui.add_enabled(!offline, Button::new("เชื่อมต่อ")).clicked() {
             *action = Some(PeerAction::Connect(r.id.clone(), r.title.clone()));
         }
+        if ui.add_enabled(!offline, Button::new("เปิดเทอร์มินัล")).clicked() {
+            *action = Some(PeerAction::Terminal(r.id.clone(), r.title.clone()));
+        }
+        if ui.add_enabled(!offline, Button::new("TCP tunnel…")).clicked() {
+            *action = Some(PeerAction::Tunnel(r.id.clone(), r.title.clone()));
+        }
+        ui.separator();
         let fav = if self.local.is_favorite(&r.id) { "เอาออกจากรายการโปรด" } else { "เพิ่มในรายการโปรด" };
         if ui.button(fav).clicked() {
             *action = Some(PeerAction::Star(r.id.clone()));

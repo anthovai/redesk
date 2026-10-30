@@ -44,6 +44,8 @@ struct Entry {
     kind: Kind,
     /// The session is (or will be, if accepted) recorded.
     recording: bool,
+    /// A tunnel or terminal session: what it does instead of remote control.
+    purpose: String,
 }
 
 enum CmAction {
@@ -260,13 +262,22 @@ impl App {
                 email: s.email.clone(),
                 ip: s.ip.clone(),
                 recording: s.recording,
+                purpose: s.purpose.clone(),
                 kind: Kind::Session(s),
             })
             .collect();
         for (i, (req, at)) in self.pending.iter().enumerate() {
             let (name, email) = split_who(&req.who);
             let left = APPROVAL_TIMEOUT.saturating_sub(at.elapsed());
-            entries.push(Entry { key: pending_key(*at), name, email, ip: req.ip.clone(), kind: Kind::Pending(i, left), recording: req.recording });
+            entries.push(Entry {
+                key: pending_key(*at),
+                name,
+                email,
+                ip: req.ip.clone(),
+                kind: Kind::Pending(i, left),
+                recording: req.recording,
+                purpose: req.purpose.clone(),
+            });
         }
 
         let mut st: CmState = ctx.data(|d| d.get_temp(state_id())).unwrap_or_default();
@@ -386,6 +397,9 @@ impl App {
                         let who = if s.name.is_empty() { s.email.clone() } else { s.name.clone() };
                         ui.label(RichText::new(who).font(semi(14.5)).color(pal.fg));
                         ui.label(RichText::new(format!("{} · {}", s.email, s.ip)).size(12.5).color(pal.muted));
+                        if !s.purpose.is_empty() {
+                            ui.label(RichText::new(&s.purpose).size(12.5).color(pal.muted));
+                        }
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if secondary(ui, "ตัดการเชื่อมต่อ", Some(pal.danger)).clicked() {
@@ -409,7 +423,8 @@ impl App {
         let (name, email) = split_who(&req.who);
         let ip = req.ip.clone();
         let recording = req.recording;
-        let perms = self.agent.as_ref().map(|a| {
+        let purpose = req.purpose.clone();
+        let perms = self.agent.as_ref().filter(|_| purpose.is_empty()).map(|a| {
             let c = a.config.lock().unwrap();
             let mut p = vec![if c.allow_input { "ควบคุมเมาส์และคีย์บอร์ด" } else { "ดูหน้าจอ" }];
             if c.allow_clipboard {
@@ -430,7 +445,8 @@ impl App {
                 ui.add_space(6.0);
                 avatar(ui, &initials(&name, &email), 56.0);
                 ui.add_space(4.0);
-                ui.label(RichText::new("มีผู้ขอควบคุมเครื่องนี้").size(13.0).color(pal.muted));
+                let asks = if purpose.is_empty() { "มีผู้ขอควบคุมเครื่องนี้".to_string() } else { format!("มีผู้ขอ{purpose}") };
+                ui.label(RichText::new(asks).size(13.0).color(pal.muted));
                 ui.label(RichText::new(&name).font(semi(18.0)).color(pal.fg));
                 if !email.is_empty() {
                     ui.label(RichText::new(&email).size(13.0).color(pal.muted));
@@ -599,6 +615,7 @@ fn details(ui: &mut Ui, e: &Entry, perms: Perms) {
         ui.label(RichText::new(format!("IP {}", e.ip)).font(mono(12.5)).color(pal.muted));
         ui.add_space(8.0);
         let (dot, text) = match &e.kind {
+            Kind::Pending(..) if !e.purpose.is_empty() => (pal.warn, format!("ขอ{}", e.purpose)),
             Kind::Pending(..) => (pal.warn, "ขอควบคุมเครื่องนี้".to_string()),
             Kind::Session(s) => (pal.ok, format!("เชื่อมต่อแล้ว  {}", elapsed(s.started))),
         };
@@ -636,6 +653,17 @@ fn details(ui: &mut Ui, e: &Entry, perms: Perms) {
         }
     });
     ui.add_space(14.0);
+    if !e.purpose.is_empty() {
+        // Tunnels and terminals do not see or control the screen: say what they do instead.
+        let title = if matches!(e.kind, Kind::Pending(..)) { "ถ้าอนุญาต ผู้เชื่อมต่อจะทำได้" } else { "การเชื่อมต่อนี้" };
+        ui.label(RichText::new(title).font(semi(13.0)).color(pal.muted));
+        ui.add_space(2.0);
+        ui.label(RichText::new(&e.purpose).size(14.0).color(pal.fg));
+        if e.purpose.contains("เทอร์มินัล") {
+            ui.label(RichText::new("คำสั่งจะทำงานด้วยสิทธิ์ของผู้ใช้ที่เปิด Aegiron บนเครื่องนี้").size(12.5).color(pal.muted));
+        }
+        return;
+    }
     let title = if matches!(e.kind, Kind::Pending(..)) { "ถ้าอนุญาต ผู้ควบคุมจะทำได้" } else { "สิทธิ์ของผู้ควบคุม" };
     ui.label(RichText::new(title).font(semi(13.0)).color(pal.muted));
     ui.add_space(2.0);

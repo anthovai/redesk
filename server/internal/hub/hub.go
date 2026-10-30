@@ -76,6 +76,8 @@ type agentConn struct {
 	conn   *websocket.Conn
 	out    chan []byte
 	direct bool // advertised FeatureDirect
+	// Every advertised feature, e.g. FeatureTunnel.
+	features map[string]bool
 }
 
 func (a *agentConn) send(v any) bool {
@@ -156,7 +158,8 @@ var agentEvents = map[string]bool{
 	"auth_failed": true, "auth_ok": true, "denied": true, "locked": true,
 	"file_upload": true, "file_download": true, "wol_sent": true,
 	"recording_started": true, "recording_failed": true,
-	"file_delete": true, "file_rename": true,
+	"file_delete": true, "file_rename": true, "resolution_change": true,
+	"tunnel_open": true, "tunnel_closed": true, "terminal_open": true, "terminal_closed": true,
 	// Session controls the viewer used on the device (docs/PROTOCOL.md §4, Session controls).
 	"view_only": true, "block_input": true, "privacy_mode": true,
 	"lock_screen": true, "lock_after_session": true, "restart": true, "restart_failed": true,
@@ -335,10 +338,14 @@ func (h *Hub) registerAgent(ctx context.Context, c *websocket.Conn, ip string) (
 		return nil, err
 	}
 	direct := false
+	features := map[string]bool{}
 	for _, f := range m.Features {
 		direct = direct || f == FeatureDirect
+		if len(features) < 32 {
+			features[trunc(f, 32)] = true
+		}
 	}
-	return &agentConn{id: m.ID, ip: ip, conn: c, out: make(chan []byte, 16), direct: direct}, nil
+	return &agentConn{id: m.ID, ip: ip, conn: c, out: make(chan []byte, 16), direct: direct, features: features}, nil
 }
 
 // agentEvent records an agent-reported session event, attributed to the session's viewer.
@@ -365,6 +372,9 @@ func (h *Hub) agentEvent(ctx context.Context, a *agentConn, m agentMsg) {
 	if rl != nil && rl.deviceID == a.id {
 		uid := rl.userID
 		actor, ip = &uid, rl.viewerIP
+		if _, ok := detail["target"]; !ok {
+			rl.tagged(detail)
+		}
 	}
 	h.mu.Unlock()
 	_ = h.store.AddAudit(ctx, actor, ip, "agent."+m.Kind, a.id, detail)

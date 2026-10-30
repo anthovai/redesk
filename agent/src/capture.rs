@@ -16,6 +16,8 @@ use crate::proto;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Params {
     pub display: usize,
+    /// Every display as one picture (feature "alldisp"); `display` is ignored.
+    pub all: bool,
     pub fps: u32,
     pub quality: u8,
     pub max_width: u32,
@@ -26,6 +28,9 @@ pub struct Params {
 pub struct DisplayInfo {
     pub index: usize,
     pub name: String,
+    /// Position in the same units as width/height (for drawing the layout).
+    pub x: i32,
+    pub y: i32,
     pub width: u32,
     pub height: u32,
     pub primary: bool,
@@ -48,6 +53,8 @@ pub fn displays() -> Vec<DisplayInfo> {
         .map(|(i, m)| DisplayInfo {
             index: i,
             name: m.friendly_name().or_else(|_| m.name()).unwrap_or_else(|_| format!("Display {}", i + 1)),
+            x: m.x().unwrap_or(0),
+            y: m.y().unwrap_or(0),
             width: m.width().unwrap_or(0),
             height: m.height().unwrap_or(0),
             primary: m.is_primary().unwrap_or(false),
@@ -57,8 +64,73 @@ pub fn displays() -> Vec<DisplayInfo> {
 
 pub fn geometry(display: usize) -> Option<Geometry> {
     let monitors = Monitor::all().ok()?;
-    let m = monitors.get(display).or(monitors.first())?;
+    monitor_geometry(monitors.get(display).or(monitors.first())?)
+}
+
+fn monitor_geometry(m: &Monitor) -> Option<Geometry> {
     Some(Geometry { x: m.x().ok()?, y: m.y().ok()?, width: m.width().ok()?, height: m.height().ok()? })
+}
+
+/// Bounding box of all displays: the input geometry of the combined view.
+pub fn all_geometry() -> Option<Geometry> {
+    bounding(Monitor::all().ok()?.iter().filter_map(monitor_geometry))
+}
+
+/// Input geometry of what `p` streams.
+pub fn geometry_of(p: &Params) -> Option<Geometry> {
+    if p.all { all_geometry() } else { geometry(p.display) }
+}
+
+fn bounding(it: impl Iterator<Item = Geometry>) -> Option<Geometry> {
+    let mut b: Option<(i32, i32, i32, i32)> = None;
+    for g in it {
+        let (x1, y1) = (g.x + g.width as i32, g.y + g.height as i32);
+        b = Some(match b {
+            None => (g.x, g.y, x1, y1),
+            Some((a, c, d, e)) => (a.min(g.x), c.min(g.y), d.max(x1), e.max(y1)),
+        });
+    }
+    b.map(|(x0, y0, x1, y1)| Geometry { x: x0, y: y0, width: (x1 - x0) as u32, height: (y1 - y0) as u32 })
+}
+
+/// All displays in desktop coordinates as windows are placed (bounding box of `logical_area`).
+pub fn logical_area_all() -> Option<[f32; 4]> {
+    let n = Monitor::all().ok()?.len();
+    let areas: Vec<[f32; 4]> = (0..n).filter_map(logical_area).collect();
+    let x0 = areas.iter().map(|a| a[0]).reduce(f32::min)?;
+    let y0 = areas.iter().map(|a| a[1]).reduce(f32::min)?;
+    let x1 = areas.iter().map(|a| a[0] + a[2]).reduce(f32::max)?;
+    let y1 = areas.iter().map(|a| a[1] + a[3]).reduce(f32::max)?;
+    Some([x0, y0, x1 - x0, y1 - y0])
+}
+
+/// Largest combined picture; denser displays are scaled down to fit.
+const MAX_COMPOSITE: u32 = 8192;
+
+/// Places each display's capture at its position in one picture covering the bounding box.
+/// The scale (pixels per geometry unit) is the densest display's, capped at MAX_COMPOSITE wide;
+/// captures at another density are resized.
+fn composite(parts: &[(Geometry, image::RgbaImage)]) -> Option<image::RgbaImage> {
+    let b = bounding(parts.iter().map(|(g, _)| *g))?;
+    let densest = parts.iter().filter(|(g, _)| g.width > 0).map(|(g, i)| i.width() as f32 / g.width as f32).fold(1.0f32, f32::max);
+    let scale = densest.min(MAX_COMPOSITE as f32 / b.width.max(1) as f32);
+    let (w, h) = ((b.width as f32 * scale).round() as u32, (b.height as f32 * scale).round() as u32);
+    let mut out = image::RgbaImage::new(w.max(1), h.max(1));
+    for (g, img) in parts {
+        let (pw, ph) = ((g.width as f32 * scale).round() as u32, (g.height as f32 * scale).round() as u32);
+        if pw == 0 || ph == 0 {
+            continue;
+        }
+        let x = ((g.x - b.x) as f32 * scale).round() as i64;
+        let y = ((g.y - b.y) as f32 * scale).round() as i64;
+        if img.width() == pw && img.height() == ph {
+            image::imageops::replace(&mut out, img, x, y);
+        } else {
+            let resized = image::imageops::resize(img, pw, ph, image::imageops::FilterType::Triangle);
+            image::imageops::replace(&mut out, &resized, x, y);
+        }
+    }
+    Some(out)
 }
 
 /// The display in desktop coordinates as windows are placed (logical points): x, y, w, h.
@@ -321,18 +393,25 @@ pub fn run(params: watch::Receiver<Params>, out: mpsc::Sender<Vec<u8>>, stop: Ar
             std::thread::sleep(Duration::from_secs(1));
             continue;
         };
-        let geometry = Geometry {
-            x: m.x().unwrap_or(0),
-            y: m.y().unwrap_or(0),
-            width: m.width().unwrap_or(0),
-            height: m.height().unwrap_or(0),
+        let geometry = match p.all {
+            true => bounding(monitors.iter().filter_map(monitor_geometry)).unwrap_or_default(),
+            false => monitor_geometry(m).unwrap_or_default(),
         };
         if let Some(msg) = pointer.poll(geometry) {
             if out.blocking_send(msg).is_err() {
                 return;
             }
         }
-        let img = match capture_monitor(m) {
+        // Privacy mode's black windows are left out on macOS (capture_monitor).
+        let captured = match p.all {
+            // A display that fails to capture is left black rather than ending the picture.
+            true => {
+                let parts: Vec<_> = monitors.iter().filter_map(|m| Some((monitor_geometry(m)?, capture_monitor(m).ok()?))).collect();
+                composite(&parts).ok_or_else(|| anyhow::anyhow!("no display could be captured"))
+            }
+            false => capture_monitor(m),
+        };
+        let img = match captured {
             Ok(i) => i,
             Err(e) => {
                 if !warned {
@@ -470,5 +549,22 @@ mod tests {
         b.rgb[(1 * 4 + 2) * 3] = 9; // pixel (2,1)
         b.rgb[(2 * 4 + 1) * 3 + 2] = 9; // pixel (1,2)
         assert_eq!(dirty_rect(&a, &b), Some((1, 1, 2, 2)));
+    }
+
+    #[test]
+    fn composite_places_displays() {
+        let solid = |w, h, v: u8| image::RgbaImage::from_pixel(w, h, image::Rgba([v, v, v, 255]));
+        // A 2x "Retina" display at (0,0) 4x3 points and a 1x display to its right, lower down.
+        let parts = vec![
+            (Geometry { x: 0, y: 0, width: 4, height: 3 }, solid(8, 6, 200)),
+            (Geometry { x: 4, y: 1, width: 2, height: 2 }, solid(2, 2, 50)),
+        ];
+        let out = composite(&parts).unwrap();
+        assert_eq!((out.width(), out.height()), (12, 6));
+        assert_eq!(out.get_pixel(0, 0)[0], 200);
+        assert_eq!(out.get_pixel(9, 3)[0], 50); // scaled up to 4x4 at (8,2)
+        assert_eq!(out.get_pixel(9, 0)[3], 0); // outside every display
+        let b = bounding(parts.iter().map(|(g, _)| *g)).unwrap();
+        assert_eq!((b.x, b.y, b.width, b.height), (0, 0, 6, 3));
     }
 }

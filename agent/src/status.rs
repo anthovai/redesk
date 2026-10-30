@@ -24,6 +24,9 @@ pub struct SessionInfo {
     pub kill: Arc<Notify>,
     /// The session is being recorded (policy from the server); shown as "กำลังบันทึก".
     pub recording: bool,
+    /// What a tunnel or terminal session does (Thai, e.g. "เปิดเทอร์มินัล…"); empty for
+    /// remote control.
+    pub purpose: String,
     /// View-only, input blocked, privacy mode, lock after the session (connection manager).
     pub controls: Arc<crate::controls::Flags>,
 }
@@ -35,6 +38,8 @@ pub struct ApprovalRequest {
     pub ip: String,
     /// The session will be recorded if accepted (shown to the person deciding).
     pub recording: bool,
+    /// What is asked for besides remote control (see [`SessionInfo::purpose`]).
+    pub purpose: String,
     pub reply: oneshot::Sender<bool>,
 }
 
