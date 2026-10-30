@@ -6,6 +6,8 @@ dev-db:        ## local Postgres via Homebrew
 	psql -d postgres -tc "select 1 from pg_database where datname='aegiron'" | grep -q 1 || psql -d postgres -c "create database aegiron owner aegiron"
 
 dev-guacd:     ## guacd for the RDP/VNC/SSH gateway (Docker)
+	mkdir -p server/data/recordings
+	-docker run --rm --user root --entrypoint chown -v $(CURDIR)/server/data/recordings:/recordings guacamole/guacd:1.5.5 guacd:guacd /recordings
 	docker run -d --name aegiron-guacd -p 127.0.0.1:4822:4822 -v $(CURDIR)/server/data/recordings:/recordings guacamole/guacd:1.5.5
 
 server:        ## run the server (serves web/build); gateway on if guacd is running

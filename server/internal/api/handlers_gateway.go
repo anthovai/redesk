@@ -48,6 +48,10 @@ func (a *API) gatewayParams(e *store.Endpoint, secret, sid string) map[string]st
 	case "ssh":
 		p["font-size"] = "12"
 		p["color-scheme"] = "white-black"
+		if sshKeyAuth(e) {
+			p["private-key"] = secret
+			delete(p, "password")
+		}
 	}
 	if a.cfg.GatewayRecordingPath != "" {
 		// guacd writes a session recording (playable with guacamole-common-js) per session.
@@ -55,8 +59,10 @@ func (a *API) gatewayParams(e *store.Endpoint, secret, sid string) map[string]st
 		p["recording-name"] = sid
 		p["create-recording-path"] = "true"
 		if e.Provider == "ssh" {
+			// The typescript must not share the recording's name: guacd would then write it to
+			// "<sid>.1" (it never overwrites), losing the link between the two files.
 			p["typescript-path"] = a.cfg.GatewayRecordingPath
-			p["typescript-name"] = sid
+			p["typescript-name"] = sid + ".typescript"
 			p["create-typescript-path"] = "true"
 		}
 	}
@@ -136,6 +142,8 @@ func (a *API) handleGateway(w http.ResponseWriter, r *http.Request) {
 	})
 	started := time.Now()
 	var toBrowser, toTarget atomic.Int64
+	var guacErr atomic.Value // last "error" instruction from guacd, kept for the audit log
+	var targetEnded atomic.Bool // guacd ended the session (the browser then closes the tunnel)
 
 	// The first message tells the JS tunnel its UUID and marks it open.
 	if err := c.Write(ctx, websocket.MessageText, []byte(gateway.Encode("", sid))); err != nil {
@@ -150,14 +158,28 @@ func (a *API) handleGateway(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		var buf []byte
 		for {
-			_, raw, err := gc.Reader.Read()
+			elems, raw, err := gc.Reader.Read()
 			if err != nil {
+				// Deliver what was held back for batching: it often is guacd's final "error".
+				if len(buf) > 0 && c.Write(ctx, websocket.MessageText, buf) == nil {
+					toBrowser.Add(int64(len(buf)))
+				}
 				if err == io.EOF {
 					reason <- "target_closed"
 				} else {
+					if ctx.Err() == nil { // not our own shutdown after the browser left
+						a.log.Warn("gateway: guacd stream error", "sid", sid, "err", err)
+					}
 					reason <- "guacd_error"
 				}
 				return
+			}
+			switch {
+			case elems[0] == "error" && len(elems) >= 3:
+				guacErr.Store(elems[1] + " (status " + elems[2] + ")")
+				targetEnded.Store(true)
+			case elems[0] == "disconnect":
+				targetEnded.Store(true)
 			}
 			buf = append(buf, raw...)
 			if gc.Reader.Buffered() > 0 && len(buf) < 256<<10 {
@@ -202,6 +224,9 @@ func (a *API) handleGateway(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	why := <-reason
+	if why == "browser_closed" && targetEnded.Load() {
+		why = "target_closed"
+	}
 	stop()
 	gc.Close()
 	c.Close(websocket.StatusNormalClosure, "0")
@@ -209,8 +234,12 @@ func (a *API) handleGateway(w http.ResponseWriter, r *http.Request) {
 	ectx, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel2()
 	_ = a.store.MarkSessionEnded(ectx, sid, toBrowser.Load(), toTarget.Load(), why)
-	_ = a.store.AddAudit(ectx, &u.ID, ip, "gateway.end", strconv.FormatInt(e.ID, 10), map[string]any{
+	detail := map[string]any{
 		"sid": sid, "name": e.Name, "reason": why, "seconds": int(time.Since(started).Seconds()),
 		"bytes_to_viewer": toBrowser.Load(), "bytes_to_target": toTarget.Load(),
-	})
+	}
+	if msg, ok := guacErr.Load().(string); ok {
+		detail["error"] = msg // e.g. wrong password or security mode: guacd connects first, fails later
+	}
+	_ = a.store.AddAudit(ectx, &u.ID, ip, "gateway.end", strconv.FormatInt(e.ID, 10), detail)
 }

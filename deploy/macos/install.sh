@@ -351,6 +351,9 @@ if [ "$GATEWAY" = 1 ]; then
 	# Keep session recordings made before the rename.
 	RECORDINGS=aegiron-recordings
 	brew_user "${DOCKER[@]}" volume inspect redesk-recordings >/dev/null 2>&1 && RECORDINGS=redesk-recordings
+	# guacd runs as uid 1000 but a new volume is owned by root: without this, recording fails.
+	as_user "${DOCKER[@]}" run --rm --user root --entrypoint chown -v "$RECORDINGS:/recordings" \
+		guacamole/guacd:1.5.5 guacd:guacd /recordings
 	as_user "${DOCKER[@]}" run -d --name aegiron-guacd --restart unless-stopped \
 		-p 127.0.0.1:4822:4822 -v "$RECORDINGS:/recordings" guacamole/guacd:1.5.5
 	wait_for 60 "guacd on 127.0.0.1:4822" nc -z 127.0.0.1 4822 || warn "guacd is not reachable on 127.0.0.1:4822 yet"

@@ -20,6 +20,7 @@
 		"@types/bun": "^1.4.4",
 		"@types/guacamole-common-js": "^1.5.5",
 		"@types/qrcode": "^1.5.6",
+		"playwright-core": "^1.64.1",
 		"puppeteer-core": "^25.16.0",
 		"svelte": "^5.57.1",
 		"svelte-check": "^4.6.0",

@@ -1,8 +1,10 @@
 package api
 
 import (
+	"encoding/binary"
 	"encoding/csv"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -48,6 +50,73 @@ type rdpOptions struct {
 	Security   string `json:"security,omitempty"` // any | nla | tls | rdp
 	IgnoreCert bool   `json:"ignore_cert,omitempty"`
 	Domain     string `json:"domain,omitempty"`
+}
+
+type sshOptions struct {
+	// Auth "key": the vault secret is an unencrypted private key (OpenSSH or PEM) instead of a password.
+	Auth string `json:"auth,omitempty"` // password (default) | key
+}
+
+func sshKeyAuth(e *store.Endpoint) bool {
+	if e.Provider != "ssh" {
+		return false
+	}
+	var o sshOptions
+	_ = json.Unmarshal(e.Options, &o)
+	return o.Auth == "key"
+}
+
+// normalizePrivateKey checks that s is an SSH private key guacd can use without a passphrase
+// and returns it with Unix line endings (keys pasted from Windows editors carry CRLF).
+func normalizePrivateKey(s string) (string, error) {
+	s = strings.TrimSpace(strings.ReplaceAll(s, "\r\n", "\n")) + "\n"
+	if len(s) > 16<<10 {
+		return "", errors.New("private key is too large")
+	}
+	block, _ := pem.Decode([]byte(s))
+	if block == nil || !strings.HasSuffix(block.Type, "PRIVATE KEY") {
+		return "", errors.New("SSH key must be a private key in OpenSSH or PEM format (-----BEGIN ... PRIVATE KEY-----)")
+	}
+	encrypted := block.Headers["Proc-Type"] == "4,ENCRYPTED" || block.Type == "ENCRYPTED PRIVATE KEY"
+	if block.Type == "OPENSSH PRIVATE KEY" {
+		// openssh-key-v1\0, then string ciphername ("none" when not protected by a passphrase).
+		const magic = "openssh-key-v1\x00"
+		b := block.Bytes
+		if len(b) < len(magic)+4 || string(b[:len(magic)]) != magic {
+			return "", errors.New("invalid OpenSSH private key")
+		}
+		b = b[len(magic):]
+		n := int(binary.BigEndian.Uint32(b))
+		encrypted = n > len(b)-4 || string(b[4:4+n]) != "none"
+	}
+	if encrypted {
+		return "", errors.New("passphrase-protected SSH keys are not supported; store an unencrypted key (ssh-keygen -p -N '')")
+	}
+	return s, nil
+}
+
+// sealSecret encrypts a password, or for SSH key authentication a validated private key.
+func (a *API) sealSecret(e *store.Endpoint, secret string) ([]byte, error) {
+	if secret != "" && sshKeyAuth(e) {
+		k, err := normalizePrivateKey(secret)
+		if err != nil {
+			return nil, userError{err}
+		}
+		secret = k
+	}
+	return a.vault.Seal(secret)
+}
+
+// userError is a validation failure whose message is safe to show.
+type userError struct{ error }
+
+func (a *API) secretErr(w http.ResponseWriter, err error) {
+	var ue userError
+	if errors.As(err, &ue) {
+		writeErr(w, http.StatusBadRequest, ue.Error())
+		return
+	}
+	a.internal(w, err)
 }
 
 // normalize validates a request into an endpoint, returning a user-facing error.
@@ -111,6 +180,22 @@ func normalizeEndpoint(req *endpointReq) (*store.Endpoint, error) {
 			}
 			if !safeText.MatchString(o.Domain) || len(o.Domain) > 64 {
 				return nil, errors.New("invalid RDP domain")
+			}
+			e.Options, _ = json.Marshal(o)
+		}
+		if e.Provider == "ssh" && len(req.Options) > 0 && string(req.Options) != "null" {
+			var o sshOptions
+			dec := json.NewDecoder(strings.NewReader(string(req.Options)))
+			dec.DisallowUnknownFields()
+			if err := dec.Decode(&o); err != nil {
+				return nil, errors.New("invalid SSH options")
+			}
+			switch o.Auth {
+			case "", "password":
+				o.Auth = ""
+			case "key":
+			default:
+				return nil, errors.New("SSH auth must be password or key")
 			}
 			e.Options, _ = json.Marshal(o)
 		}
@@ -180,8 +265,8 @@ func (a *API) createEndpoint(w http.ResponseWriter, r *http.Request) {
 		e.GroupID = nil // sharing with a group is an admin decision
 	}
 	if req.Password != nil {
-		if e.Secret, err = a.vault.Seal(*req.Password); err != nil {
-			a.internal(w, err)
+		if e.Secret, err = a.sealSecret(e, *req.Password); err != nil {
+			a.secretErr(w, err)
 			return
 		}
 	}
@@ -222,9 +307,14 @@ func (a *API) updateEndpoint(w http.ResponseWriter, r *http.Request) {
 		e.Provider, e.Address = cur.Provider, cur.Address
 	}
 	keep := req.Password == nil
+	if keep && sshKeyAuth(e) != sshKeyAuth(cur) && len(cur.Secret) > 0 {
+		// A stored password is not a key (and a key must never be sent as a password).
+		writeErr(w, http.StatusBadRequest, "enter the new password or private key when changing the SSH authentication method")
+		return
+	}
 	if !keep {
-		if e.Secret, err = a.vault.Seal(*req.Password); err != nil {
-			a.internal(w, err)
+		if e.Secret, err = a.sealSecret(e, *req.Password); err != nil {
+			a.secretErr(w, err)
 			return
 		}
 	}
@@ -270,6 +360,9 @@ func (a *API) launchEndpoint(w http.ResponseWriter, r *http.Request) {
 		a.internal(w, err)
 		return
 	}
+	if !mayReleaseSecret(userFrom(r), e, a.cfg.GuacdAddr != "") {
+		secret = ""
+	}
 	resp := map[string]any{"provider": e.Provider}
 	if secret != "" {
 		resp["secret"] = secret
@@ -296,6 +389,20 @@ func (a *API) launchEndpoint(w http.ResponseWriter, r *http.Request) {
 		"name": e.Name, "provider": e.Provider, "address": e.Address, "mode": "native", "password_released": secret != "",
 	})
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// mayReleaseSecret decides whether "open with the local program" hands the stored password
+// to the browser. SSH private keys never leave the server. With the gateway on, RDP/VNC/SSH
+// passwords go only to admins and the entry's creator: group members it was shared with use
+// the gateway, where the server injects the password and the browser never sees it.
+func mayReleaseSecret(u *store.User, e *store.Endpoint, gatewayOn bool) bool {
+	if sshKeyAuth(e) {
+		return false
+	}
+	if !gatewayOn || !gatewayProviders[e.Provider] || u.Role == "admin" {
+		return true
+	}
+	return e.CreatedBy != nil && *e.CreatedBy == u.ID
 }
 
 func hostPort(e *store.Endpoint) string {

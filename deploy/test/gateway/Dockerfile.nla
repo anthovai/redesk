@@ -1,0 +1,11 @@
+# FreeRDP shadow server sharing an Xvfb desktop, with NLA (CredSSP/NTLM) required:
+# the closest open-source stand-in for a Windows host's default security mode.
+FROM debian:bookworm-slim
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      freerdp2-shadow-x11 winpr-utils xvfb xterm x11-xserver-utils xclip fonts-dejavu-core \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -m -s /bin/bash aegiron && mkdir -m 1777 -p /tmp/.X11-unix
+COPY nla-entrypoint.sh /entrypoint.sh
+EXPOSE 3389
+USER aegiron
+ENTRYPOINT ["/bin/sh", "/entrypoint.sh"]
