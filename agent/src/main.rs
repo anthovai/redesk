@@ -78,6 +78,19 @@ enum Cmd {
         /// Send this machine's audio to viewers (macOS 13+, Windows).
         #[arg(long)]
         allow_audio: Option<bool>,
+        /// Let viewers block this machine's keyboard and mouse (needs input; macOS, Windows)
+        #[arg(long)]
+        allow_block_input: Option<bool>,
+        /// Let viewers black out this screen while they control it (needs input; Windows 10 2004+,
+        /// macOS with the desktop app)
+        #[arg(long)]
+        allow_privacy_mode: Option<bool>,
+        /// Let viewers lock this machine, now or when the session ends
+        #[arg(long)]
+        allow_lock: Option<bool>,
+        /// Let viewers restart this machine (macOS, Windows)
+        #[arg(long)]
+        allow_restart: Option<bool>,
         /// H.264 encoder: auto (hardware when available) or software (OpenH264)
         #[arg(long, value_enum)]
         video_encoder: Option<EncoderPref>,
@@ -238,6 +251,10 @@ async fn main() -> Result<()> {
             allow_file_transfer,
             allow_whiteboard,
             allow_audio,
+            allow_block_input,
+            allow_privacy_mode,
+            allow_lock,
+            allow_restart,
             video_encoder,
             max_fps,
             jpeg_quality,
@@ -260,6 +277,10 @@ async fn main() -> Result<()> {
             if let Some(v) = allow_file_transfer { c.allow_file_transfer = v; }
             if let Some(v) = allow_whiteboard { c.allow_whiteboard = v; }
             if let Some(v) = allow_audio { c.allow_audio = v; }
+            if let Some(v) = allow_block_input { c.allow_block_input = v; }
+            if let Some(v) = allow_privacy_mode { c.allow_privacy_mode = v; }
+            if let Some(v) = allow_lock { c.allow_lock = v; }
+            if let Some(v) = allow_restart { c.allow_restart = v; }
             if let Some(v) = video_encoder { c.video_encoder = v; }
             if let Some(v) = max_fps { c.max_fps = v.clamp(1, 60); }
             if let Some(v) = jpeg_quality { c.jpeg_quality = v.clamp(10, 95); }
@@ -296,6 +317,7 @@ async fn main() -> Result<()> {
             println!("Device key:   {}", fingerprint(identity(&c)?.verifying_key().as_bytes()));
             println!("Server key:   {}", fingerprint(&B64.decode(&c.server_key)?));
             println!("Input: {}, clipboard: {}, file transfer: {}, whiteboard: {}, audio: {}", c.allow_input, c.allow_clipboard, c.allow_file_transfer, c.allow_whiteboard, c.allow_audio);
+            println!("Controls:     block input {}, privacy mode {}, lock {}, restart {}", c.allow_block_input, c.allow_privacy_mode, c.allow_lock, c.allow_restart);
             println!("Encoder:      {:?}", c.video_encoder);
             println!("Direct/P2P:   {} (TCP port {})", if c.direct_enabled { "allowed" } else { "off (relay only)" }, c.direct_port);
             println!("Proxy:        {}", c.proxy.as_ref().map(|p| p.display()).unwrap_or_else(|| "none".into()));

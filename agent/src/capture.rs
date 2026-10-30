@@ -71,6 +71,118 @@ pub fn logical_area(display: usize) -> Option<[f32; 4]> {
     Some([x / s, y / s, w / s, h / s])
 }
 
+/// One screenshot of a display. While privacy mode shows its black windows on macOS, they are
+/// left out of the picture (see `privacy`); everywhere else the capture is xcap's.
+fn capture_monitor(m: &Monitor) -> anyhow::Result<image::RgbaImage> {
+    #[cfg(target_os = "macos")]
+    {
+        let hidden = crate::privacy::excluded_windows();
+        if !hidden.is_empty() {
+            let rect = [m.x()? as f64, m.y()? as f64, m.width()? as f64, m.height()? as f64];
+            return mac::capture_without(rect, &hidden);
+        }
+    }
+    Ok(m.capture_image()?)
+}
+
+#[cfg(target_os = "macos")]
+pub mod mac {
+    use std::ffi::c_void;
+
+    use anyhow::{Result, anyhow};
+
+    type CFRef = *const c_void;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CGRect {
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+    }
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGWindowListCreate(option: u32, relative_to: u32) -> CFRef;
+        fn CGWindowListCreateImageFromArray(bounds: CGRect, windows: CFRef, option: u32) -> CFRef;
+        fn CGImageGetWidth(image: CFRef) -> usize;
+        fn CGImageGetHeight(image: CFRef) -> usize;
+        fn CGImageGetBytesPerRow(image: CFRef) -> usize;
+        fn CGImageGetDataProvider(image: CFRef) -> CFRef;
+        fn CGDataProviderCopyData(provider: CFRef) -> CFRef;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFArrayGetCount(array: CFRef) -> isize;
+        fn CFArrayGetValueAtIndex(array: CFRef, i: isize) -> *const c_void;
+        fn CFArrayCreate(alloc: CFRef, values: *const *const c_void, n: isize, callbacks: *const c_void) -> CFRef;
+        fn CFDataGetBytePtr(data: CFRef) -> *const u8;
+        fn CFDataGetLength(data: CFRef) -> isize;
+        fn CFRelease(cf: CFRef);
+    }
+
+    const ON_SCREEN_ONLY: u32 = 1; // kCGWindowListOptionOnScreenOnly
+    const IMAGE_DEFAULT: u32 = 0;
+
+    /// On-screen windows other than `hidden`, front to back.
+    pub(super) fn keep(all: &[u32], hidden: &[u32]) -> Vec<u32> {
+        all.iter().copied().filter(|w| !hidden.contains(w)).collect()
+    }
+
+    /// Every on-screen window, front to back.
+    pub fn on_screen() -> Vec<u32> {
+        // SAFETY: the list is created, read and released here.
+        unsafe {
+            let list = CGWindowListCreate(ON_SCREEN_ONLY, 0);
+            if list.is_null() {
+                return Vec::new();
+            }
+            // The array holds CGWindowIDs stored as pointer-sized values.
+            let all = (0..CFArrayGetCount(list)).map(|i| CFArrayGetValueAtIndex(list, i) as usize as u32).collect();
+            CFRelease(list);
+            all
+        }
+    }
+
+    /// The display area `rect` (x, y, w, h in global points) composited from every on-screen
+    /// window except `hidden`, as RGBA like xcap returns it.
+    pub fn capture_without(rect: [f64; 4], hidden: &[u32]) -> Result<image::RgbaImage> {
+        let all = on_screen();
+        if all.is_empty() {
+            return Err(anyhow!("cannot list windows"));
+        }
+        // SAFETY: CoreGraphics/CoreFoundation calls; every object created here is released.
+        unsafe {
+            let ids: Vec<*const c_void> = keep(&all, hidden).into_iter().map(|w| w as usize as *const c_void).collect();
+            let array = CFArrayCreate(std::ptr::null(), ids.as_ptr(), ids.len() as isize, std::ptr::null());
+            let bounds = CGRect { x: rect[0], y: rect[1], w: rect[2], h: rect[3] };
+            let image = CGWindowListCreateImageFromArray(bounds, array, IMAGE_DEFAULT);
+            CFRelease(array);
+            if image.is_null() {
+                return Err(anyhow!("capture failed"));
+            }
+            let (w, h, stride) = (CGImageGetWidth(image), CGImageGetHeight(image), CGImageGetBytesPerRow(image));
+            let data = CGDataProviderCopyData(CGImageGetDataProvider(image));
+            CFRelease(image);
+            if data.is_null() {
+                return Err(anyhow!("capture failed"));
+            }
+            let bytes = std::slice::from_raw_parts(CFDataGetBytePtr(data), CFDataGetLength(data) as usize);
+            let mut rgba = Vec::with_capacity(w * h * 4);
+            for row in bytes.chunks_exact(stride.max(1)).take(h) {
+                rgba.extend_from_slice(&row[..(w * 4).min(row.len())]);
+            }
+            CFRelease(data);
+            for px in rgba.chunks_exact_mut(4) {
+                px.swap(0, 2); // BGRA -> RGBA
+            }
+            image::RgbaImage::from_raw(w as u32, h as u32, rgba).ok_or_else(|| anyhow!("unexpected image size"))
+        }
+    }
+}
+
 /// Downsampled RGB frame.
 struct Frame {
     w: usize,
@@ -220,7 +332,7 @@ pub fn run(params: watch::Receiver<Params>, out: mpsc::Sender<Vec<u8>>, stop: Ar
                 return;
             }
         }
-        let img = match m.capture_image() {
+        let img = match capture_monitor(m) {
             Ok(i) => i,
             Err(e) => {
                 if !warned {
@@ -319,6 +431,36 @@ fn encode_video(enc: &mut Option<Box<dyn VideoEncoder>>, f: &Frame, p: Params, c
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn privacy_windows_are_left_out() {
+        assert_eq!(super::mac::keep(&[40, 7, 12, 3], &[7, 3]), [40, 12]);
+        assert_eq!(super::mac::keep(&[1, 2], &[]), [1, 2]);
+    }
+
+    /// The capture privacy mode uses: the same picture as xcap with nothing hidden, and nothing
+    /// of a window once it is hidden. Needs Screen Recording: `cargo test -- --ignored
+    /// capture_without`.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "macos")]
+    fn capture_without_hides_windows() {
+        let m = Monitor::all().unwrap().into_iter().next().unwrap();
+        let rect = [m.x().unwrap() as f64, m.y().unwrap() as f64, m.width().unwrap() as f64, m.height().unwrap() as f64];
+        let xcap = m.capture_image().unwrap();
+        let all = super::mac::capture_without(rect, &[]).unwrap();
+        assert_eq!(all.dimensions(), xcap.dimensions());
+        let lit = all.pixels().filter(|p| p[0] as u32 + p[1] as u32 + p[2] as u32 > 30).count();
+        assert!(lit > 0, "nothing captured (Screen Recording permission?)");
+        let differ = |a: &image::RgbaImage, b: &image::RgbaImage| {
+            a.pixels().zip(b.pixels()).filter(|(p, q)| (0..3).any(|c| (p[c] as i32 - q[c] as i32).abs() > 24)).count() as f64 / a.pixels().len() as f64
+        };
+        assert!(differ(&all, &xcap) < 0.05, "not the same picture as xcap");
+        // Hiding every window leaves only the desktop picture (drawn by the window server).
+        let none = super::mac::capture_without(rect, &super::mac::on_screen()).unwrap();
+        assert!(differ(&all, &none) > 0.1, "hidden windows still visible");
+    }
 
     #[test]
     fn dirty_rect_finds_change() {

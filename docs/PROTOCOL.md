@@ -24,7 +24,7 @@ server → agent  {"t":"registered","sig":Ed25519(server_key, "redesk-server-v1\
 - Wake-on-LAN: `POST /api/devices/{id}/wake` picks an online agent on the same LAN (same public IP and/or subnet) and sends it `{"t":"wol","macs":[...],"target":"<id>"}`. The helper broadcasts the magic packet (UDP 9 and 7) and reports `wol_sent`. Errors: `online_already`, `no_mac`, `no_helper`, `helper_busy`, `rate_limited`.
 - LAN discovery (not through the server): a viewer broadcasts `redesk-discover v1` to UDP 21120; agents on the same subnet with `lan_discovery = true` answer `{id, hostname, os}`, rate-limited.
 - Session request: `{"t":"session","sid","token","relay":"/ws/relay","viewer":{"email","name","ip"}}`.
-- Agent → server audit events: `{"t":"event","sid","kind","detail"}` with `kind` in `auth_failed | auth_ok | denied | locked | file_upload | file_download | wol_sent`. They are stored as `agent.<kind>` and attributed to the viewer of that session.
+- Agent → server audit events: `{"t":"event","sid","kind","detail"}` with `kind` in `auth_failed | auth_ok | denied | locked | file_upload | file_download | wol_sent`, plus the file, recording and [session control](#session-controls) kinds below. They are stored as `agent.<kind>` and attributed to the viewer of that session; unknown kinds are dropped.
 
 ## 2. Relay (`/ws/relay?sid=&token=`)
 
@@ -58,7 +58,7 @@ Byte 0 is the type: `0x01` JSON, `0x02` video rectangle (`x, y, frame_w, frame_h
 | Direction | Message |
 |---|---|
 | agent→viewer | `auth_required {password, click}`, `auth_pending`, `auth_result {ok, reason?, attempts_left?, retry_after?}`, `info {hostname, os, displays[], input, clipboard, files, codec, codecs?[], features?, encoder?, audio?, audio_codec?}`, `encoder {encoder,codec}`, `cursor {x,y,visible}`, `clip {s}` |
-| viewer→agent | `auth {password, codecs[], features?[], audio?[]}`, `audio {on}`, `mm {x,y}`, `mb {b,down,x,y}`, `wh {dx,dy}`, `key {code,key,down}`, `text {s}`, `clip {s}`, `cfg {fps,quality,max_width,display,codec?}`, `refresh` (alias `keyframe`), `bye` |
+| viewer→agent | `auth {password, codecs[], features?[], audio?[], resume?}`, `audio {on}`, `mm {x,y}`, `mb {b,down,x,y}`, `wh {dx,dy}`, `key {code,key,down}`, `text {s}`, `clip {s}`, `cfg {fps,quality,max_width,display,codec?}`, `refresh` (alias `keyframe`), `bye` |
 | files viewer→agent | `ls {path}` (`""` = home), `put {id,dir,name,size}` followed by `0x03` chunks and then `put_end {id}`, `get {id,path}`, `cancel {id}` |
 | files agent→viewer | `ls {path,parent,sep,entries[{name,dir,size,mtime}]}`, `put_ok {id,path}`, `put_done {id,path}`, `get_start {id,name,size}` followed by `0x03` chunks and then `get_end {id}`, `fs_error {op,id?,message}` |
 
@@ -139,6 +139,35 @@ Needs both the `clipboard` and `files` permissions. The viewer opts in with `aut
 
 - **Viewer → agent (paste):** when ⌘V/Ctrl+V is pressed in the remote window and this machine's clipboard holds files, the app uploads them (folders included) to `~/Downloads/Aegiron` on the agent, puts the uploaded paths on the agent's clipboard with `clip_files`, then presses paste on the remote side, so pasting into Finder/Explorer copies them there. The files also stay in `Downloads/Aegiron` (the app says so), which is the fallback when the focused remote app does not accept files. Pressing paste again without copying anything new only presses paste remotely.
 - **Agent → viewer (copy):** small selections (files only, at most 20 and 32 MiB in total) are fetched right away into a temporary folder and put on this machine's clipboard as files, so ⌘V/Ctrl+V in Finder/Explorer pastes them; larger selections and folders wait for the user to click *รับไฟล์* in the remote window, are saved under `~/Downloads/Aegiron` and then put on the clipboard. Files never flow to a viewer that did not opt in, and the agent does not echo back file lists it set itself.
+
+### Session controls
+
+Like RustDesk's: view-only, blocking the remote user's input, privacy mode, locking now or after the session, and restarting with automatic reconnection. The agent lists each control in `info.features` only when the device allows it and the platform can do it; viewers show a control only when it is listed, so older agents and viewers are unaffected. View-only also works against older agents, since it is enforced by the viewer.
+
+| Feature | Device setting (`agent.toml` / `aegiron-agent set`) | Platforms |
+|---|---|---|
+| `view_only` | always listed | all |
+| `block_input` | `allow_input` **and** `allow_block_input` (`--allow-block-input`) | macOS, Windows |
+| `privacy` | `allow_input` **and** `allow_privacy_mode` (`--allow-privacy-mode`) | Windows 10 2004+; macOS only in the desktop app |
+| `lock` | `allow_lock` (`--allow-lock`) | macOS, Windows, Linux (`loginctl lock-session`) |
+| `restart` | `allow_restart` (`--allow-restart`) | macOS, Windows |
+
+The four settings default to on (absent in older configs = on), as in RustDesk, and are in the app under Settings → ความปลอดภัย → การควบคุมเครื่องนี้จากระยะไกล. The connection manager shows them as permission tiles, and for each live session whether the viewer is in view-only mode, blocks input, uses privacy mode or will lock the machine at the end.
+
+| Direction | Message |
+|---|---|
+| viewer→agent | `view_only {on}`, `block_input {on}`, `privacy {on}`, `lock`, `lock_after {on}`, `restart`, `ka` (keepalive) |
+| agent→viewer | `ctl {op, ok, on?, message?}` for each of them (`op` = the message type); `ctl {op:"restart", ok:true, resume}`, and later `ctl {op:"restart", ok:false, message}` if the restart itself failed |
+| viewer→agent | `auth {…, resume}`: reconnecting after the restart |
+
+- **View-only.** The viewer stops sending pointer and keyboard input; with `view_only` the agent also drops any input while it is on and shows it in the connection manager. Viewers re-send it after reconnecting.
+- **Block input.** The person at the machine cannot use its keyboard and mouse; the viewer's input still works. macOS: a CGEventTap at the HID level (Accessibility permission, which input injection needs anyway) drops events that were not posted by the agent's own process. Windows: low-level keyboard and mouse hooks drop events without the injected flag (`BlockInput` needs administrator rights and would block injected input too). Pointer movement, key and button releases, and clicks on Aegiron's own windows still pass, so the person can reach the connection manager and press ตัดการเชื่อมต่อ. **Ctrl + Alt + Shift + Esc** at the machine ends every session that blocks it (audited as `agent.denied {stage:"local_escape"}`). Hooks and taps belong to the agent process: the system removes them when it exits or crashes, and every session end (disconnect, error, kill from the connection manager) releases them.
+- **Privacy mode** turns on input blocking too, and blacks out every display for the people in front of it while the viewer keeps seeing the desktop. Windows: topmost black windows with `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`, which every capture path (GDI, Windows Graphics Capture) leaves out; on Windows before 10 2004 the call fails and the agent answers `ok:false` rather than stream a black screen. macOS: borderless black windows at the shielding window level, created on the desktop app's main thread; while they are up the agent captures with `CGWindowListCreateImageFromArray` over every on-screen window except them (`NSWindow.sharingType = none` is not relied on: it only hides a window from other processes, and macOS 15 ignores it for ScreenCaptureKit). The headless `aegiron-agent` has no AppKit main loop, so it does not offer privacy mode on macOS. The black screen shows the escape combination.
+- **Watchdog.** While input is blocked or privacy mode is on, viewers send `ka` every 10 s; an agent that hears nothing from the viewer for 30 s ends the session, so a viewer that vanished never leaves the machine blocked. Older agents ignore `ka`.
+- **Lock.** macOS: `SACLockScreenImmediate` (login.framework), else ⌃⌘Q posted as a key event. Windows: `LockWorkStation`. Linux: `loginctl lock-session`. With `lock_after {on:true}` the agent locks the machine when the session ends however it ends (after unblocking input). Viewers talking to older agents still offer the lock shortcut as key presses.
+- **Restart** (the viewers ask for confirmation first). The agent answers `ctl {op:"restart", ok:true, resume}`, waits about a second so the reply arrives, then restarts as the logged-in user: macOS `osascript -e 'tell application "System Events" to restart'` (apps are asked to quit like from the Apple menu, so one with unsaved work can cancel it; the first use asks the person at the machine to let Aegiron control System Events), falling back to `loginwindow` (`«event aevtrrst»`); Windows `shutdown /r /t 0`. No root or system service is involved. If the command fails the token is revoked and the viewer gets `ok:false`.
+- **Reconnecting.** `resume` is 32 random bytes (base64url), single use, valid for 15 minutes and bound to the viewer's account (the console user's email from the session request). The agent keeps only its SHA-256 in `resume.json` next to `agent.toml` (owner-only), so it survives the restart. When the old session closes, the viewer shows *เครื่องปลายทางกำลังรีสตาร์ท* and requests new sessions with backoff (3 s, 6 s, 12 s, 24 s, then every 30 s, for up to 12 minutes) while the device is offline, and answers `auth_required` with `auth {password:null, resume}`. A valid token replaces both the password and the click approval (audited as `agent.auth_ok {method:"resume"}`) and does not rotate the temporary password. An unknown, expired or already used token is ignored and the usual checks apply, so the viewer falls back to asking for the password. The device comes back only if the agent starts at login (`aegiron-agent install` or the app's autostart) and a user logs in (automatic login, or someone at the machine; FileVault always needs a password at boot).
+- **Audit** (`agent.<kind>`): `view_only {on}`, `block_input {on}`, `privacy_mode {on}`, `lock_screen {}` or `{after_session:true}`, `lock_after_session {on}`, `restart {}`, `restart_failed {error}`.
 
 Pointer coordinates are normalised to 0–1 over the displayed frame. Plain typing uses the actual character (Thai and other layouts work). Shortcuts with Ctrl/Cmd/Alt use the physical key.
 

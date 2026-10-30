@@ -2,9 +2,11 @@
 
 pub mod account;
 pub mod audio;
+pub mod block_input;
 pub mod capture;
 pub mod codec;
 pub mod config;
+pub mod controls;
 pub mod crypto;
 pub mod direct;
 pub mod files;
@@ -15,6 +17,7 @@ pub mod local;
 pub mod net;
 pub mod permissions;
 pub mod power;
+pub mod privacy;
 pub mod proto;
 pub mod recording;
 pub mod service;

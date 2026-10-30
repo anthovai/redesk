@@ -1,6 +1,7 @@
 // Helpers shared by the end-to-end scripts (docs/TESTING.md): API calls with a session cookie,
 // TOTP codes, and a headless Chrome driven by puppeteer-core.
 
+import { readFileSync, writeFileSync } from 'node:fs';
 import puppeteer, { type Browser } from 'puppeteer-core';
 
 export const base = process.env.AEGIRON_URL ?? 'http://127.0.0.1:21114';
@@ -43,6 +44,27 @@ export class Api {
 			.find((c) => c.startsWith('aegiron_session='));
 		if (!cookie) throw new Error('login: no session cookie');
 		return new Api(cookie);
+	}
+
+	/**
+	 * The admin, signed in once per run when AEGIRON_E2E_COOKIE names a file: scripts that only
+	 * need an admin session share it, so a run stays under the server's sign-in limit (20 per
+	 * address per 10 minutes).
+	 */
+	static async admin(): Promise<Api> {
+		const file = process.env.AEGIRON_E2E_COOKIE;
+		if (file) {
+			try {
+				const api = new Api(readFileSync(file, 'utf8').trim());
+				await api.get('/api/auth/me');
+				return api;
+			} catch {
+				// none yet, or expired
+			}
+		}
+		const api = await Api.login(adminEmail, adminPassword());
+		if (file) writeFileSync(file, api.cookie, { mode: 0o600 });
+		return api;
 	}
 
 	async req<T = any>(method: string, path: string, body?: unknown): Promise<T> {

@@ -24,6 +24,8 @@ pub struct SessionInfo {
     pub kill: Arc<Notify>,
     /// The session is being recorded (policy from the server); shown as "กำลังบันทึก".
     pub recording: bool,
+    /// View-only, input blocked, privacy mode, lock after the session (connection manager).
+    pub controls: Arc<crate::controls::Flags>,
 }
 
 /// Someone wants to take control; the UI answers through `reply`.

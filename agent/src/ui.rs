@@ -992,6 +992,7 @@ impl App {
                 started: SystemTime::now() - Duration::from_secs(754),
                 kill: Default::default(),
                 recording: view == "home" && std::env::var_os("AEGIRON_UI_DEMO_RECORDING").is_some(),
+                controls: Default::default(),
             });
             if std::env::var_os("AEGIRON_UI_DEMO_WHITEBOARD").is_some() {
                 // A circled spot and an arrow pointing at it, as a viewer would draw them.
