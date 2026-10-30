@@ -47,7 +47,9 @@
 		play: 'M6 4l14 8-14 8z',
 		pause: 'M6 4h4v16H6zM14 4h4v16h-4z',
 		volume: 'M11 5 6 9H2v6h4l5 4zM15.54 8.46a5 5 0 0 1 0 7.07M19.07 4.93a10 10 0 0 1 0 14.14',
-		volumeOff: 'M11 5 6 9H2v6h4l5 4zM23 9l-6 6M17 9l6 6'
+		volumeOff: 'M11 5 6 9H2v6h4l5 4zM23 9l-6 6M17 9l6 6',
+		camera: 'M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2zM12 17a4 4 0 1 0 0-8 4 4 0 0 0 0 8z',
+		mouse: 'M12 2a6 6 0 0 0-6 6v8a6 6 0 0 0 12 0V8a6 6 0 0 0-6-6zM12 6v4'
 	} as const;
 	export type IconName = keyof typeof paths;
 </script>
