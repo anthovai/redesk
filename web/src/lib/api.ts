@@ -181,7 +181,7 @@ export interface Endpoint {
 	port: number | null;
 	username: string;
 	has_secret: boolean;
-	options: { security?: string; ignore_cert?: boolean; domain?: string };
+	options: { security?: string; ignore_cert?: boolean; domain?: string; auth?: 'password' | 'key' };
 	group_id: number | null;
 	tags: string[];
 	note: string;

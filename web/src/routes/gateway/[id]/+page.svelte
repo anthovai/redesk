@@ -16,15 +16,17 @@
 	let screen = $state<HTMLElement>();
 	let status = $state<'connecting' | 'waiting' | 'connected' | 'closed'>('connecting');
 	let error = $state('');
+	let detail = $state(''); // guacd's own reason, e.g. "SSL/TLS connection failed (untrusted/self-signed certificate?)"
 	let toast = $state('');
 	let client: G.Client | null = null;
 
 	const errors: Record<number, string> = {
 		512: 'เกิดข้อผิดพลาดที่ gateway',
 		514: 'เชื่อมต่อเครื่องปลายทางไม่สำเร็จ (ตรวจโฮสต์ พอร์ต และ firewall)',
+		515: 'เครื่องปลายทางปฏิเสธการเชื่อมต่อ (สำหรับ RDP ลองเปลี่ยนโหมดความปลอดภัย)',
 		516: 'เครื่องปลายทางไม่ตอบสนอง',
-		519: 'ไม่พบเครื่องปลายทาง',
-		769: 'ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง หรือยังไม่ได้ล็อกอิน',
+		519: 'ไม่พบเครื่องปลายทาง หรือใบรับรองของเครื่องไม่ผ่านการตรวจสอบ',
+		769: 'ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง หรือโหมดความปลอดภัยไม่ตรงกับเครื่องปลายทาง',
 		771: 'คุณไม่มีสิทธิ์ใช้การเชื่อมต่อนี้',
 		776: 'หมดเวลาเพราะไม่มีการใช้งาน'
 	};
@@ -52,16 +54,25 @@
 		};
 		display.onresize = fit;
 
+		let connectedOnce = false;
 		c.onstatechange = (s: number) => {
 			// 1 CONNECTING, 2 WAITING, 3 CONNECTED, 4 DISCONNECTING, 5 DISCONNECTED
 			if (s === 2) status = 'waiting';
 			else if (s === 3) {
+				connectedOnce = true;
 				status = 'connected';
 				screen?.focus();
-			} else if (s >= 4) status = 'closed';
+			} else if (s >= 4) {
+				// guacd 1.5 sometimes ends a failed connection with a bare "disconnect" (its error
+				// is lost when the target fails before the user has fully joined): still a failure.
+				if (!connectedOnce && !error) error = 'เชื่อมต่อเครื่องปลายทางไม่สำเร็จ ตรวจโฮสต์ พอร์ต ชื่อผู้ใช้ รหัสผ่าน และโหมดความปลอดภัย';
+				status = 'closed';
+			}
 		};
 		const onError = (st: G.Status) => {
-			error = errors[st.code] ?? `การเชื่อมต่อล้มเหลว (${st.code}${st.message ? `: ${st.message}` : ''})`;
+			if (error) return; // keep the first, most specific reason
+			error = errors[st.code] ?? `การเชื่อมต่อล้มเหลว (${st.code})`;
+			detail = st.message && st.message !== String(st.code) && !/^Aborted\. See logs\.?$/.test(st.message) ? st.message : '';
 			status = 'closed';
 		};
 		c.onerror = onError;
@@ -125,7 +136,8 @@
 			const writer = new Guacamole.StringWriter(client.createClipboardStream('text/plain'));
 			writer.sendText(text);
 			writer.sendEnd();
-			flash('ส่งคลิปบอร์ดแล้ว — กด Ctrl+V ที่เครื่องปลายทาง');
+			// guacd's terminal pastes its clipboard on a right or middle click, not on Ctrl+V.
+			flash(endpoint?.provider === 'ssh' ? 'ส่งคลิปบอร์ดแล้ว — คลิกขวาในเทอร์มินัลเพื่อวาง' : 'ส่งคลิปบอร์ดแล้ว — กด Ctrl+V ที่เครื่องปลายทาง');
 		} catch {
 			flash('เบราว์เซอร์ไม่อนุญาตให้อ่านคลิปบอร์ด');
 		}
@@ -177,6 +189,7 @@
 					{#if status === 'closed'}
 						<h2 class="font-semibold">{error ? 'เชื่อมต่อไม่สำเร็จ' : 'ตัดการเชื่อมต่อแล้ว'}</h2>
 						{#if error}<p class="mt-2 text-sm text-muted">{error}</p>{/if}
+						{#if detail}<p class="mono mt-1 text-xs text-muted">{detail}</p>{/if}
 						<div class="mt-5 flex justify-center gap-2">
 							<a class="btn" href="/connections">กลับ</a>
 							<button class="btn btn-primary" onclick={() => location.reload()}>ลองอีกครั้ง</button>

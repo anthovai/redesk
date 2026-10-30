@@ -1,0 +1,8 @@
+# OpenSSH with one password user ("pwuser") and one key-only user ("keyuser").
+FROM debian:bookworm-slim
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openssh-server \
+    && rm -rf /var/lib/apt/lists/* && mkdir -p /run/sshd \
+    && useradd -m -s /bin/bash pwuser && useradd -m -s /bin/bash keyuser
+COPY ssh-entrypoint.sh /entrypoint.sh
+EXPOSE 22
+ENTRYPOINT ["/bin/sh", "/entrypoint.sh"]

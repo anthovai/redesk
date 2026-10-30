@@ -18,6 +18,7 @@
 		security: string;
 		ignoreCert: boolean;
 		domain: string;
+		sshAuth: 'password' | 'key';
 		group: string;
 		tags: string;
 		note: string;
@@ -76,7 +77,7 @@
 	function newForm(): Form {
 		return {
 			id: 0, name: '', provider: 'anydesk', address: '', port: '', username: '', password: '', clearPassword: false,
-			hasSecret: false, security: 'any', ignoreCert: false, domain: '', group: '', tags: '', note: '', synced: false
+			hasSecret: false, security: 'any', ignoreCert: false, domain: '', sshAuth: 'password', group: '', tags: '', note: '', synced: false
 		};
 	}
 
@@ -85,6 +86,7 @@
 			id: e.id, name: e.name, provider: e.provider, address: e.address, port: e.port ? String(e.port) : '',
 			username: e.username, password: '', clearPassword: false, hasSecret: e.has_secret,
 			security: e.options.security || 'any', ignoreCert: !!e.options.ignore_cert, domain: e.options.domain ?? '',
+			sshAuth: e.options.auth === 'key' ? 'key' : 'password',
 			group: e.group_id ? String(e.group_id) : '', tags: e.tags.join(', '), note: e.note, synced: e.source === 'teamviewer_api'
 		};
 	}
@@ -99,7 +101,12 @@
 			port: f.port ? +f.port : null,
 			username: f.username,
 			password: f.clearPassword ? '' : f.password ? f.password : f.id ? null : '',
-			options: f.provider === 'rdp' ? { security: f.security, ignore_cert: f.ignoreCert, domain: f.domain } : null,
+			options:
+				f.provider === 'rdp'
+					? { security: f.security, ignore_cert: f.ignoreCert, domain: f.domain }
+					: f.provider === 'ssh'
+						? { auth: f.sshAuth }
+						: null,
 			group_id: f.group ? +f.group : null,
 			tags: f.tags.split(',').map((t) => t.trim()).filter(Boolean),
 			note: f.note
@@ -323,24 +330,50 @@
 			{#if p.kind === 'protocol'}
 				<div><label class="label" for="ep-user">ชื่อผู้ใช้</label><input id="ep-user" class="input" autocomplete="off" bind:value={form.username} /></div>
 			{/if}
+			{#if form.provider === 'ssh'}
+				<div>
+					<label class="label" for="ep-sshauth">ยืนยันตัวตนด้วย</label>
+					<select id="ep-sshauth" class="input" bind:value={form.sshAuth}>
+						<option value="password">รหัสผ่าน</option><option value="key">กุญแจ SSH (private key)</option>
+					</select>
+				</div>
+			{/if}
 			<div>
-				<label class="label" for="ep-pw">
-					รหัสผ่าน {p.kind === 'vendor' ? '(รหัส unattended ของเครื่อง)' : ''}
-				</label>
-				<input
-					id="ep-pw"
-					class="input"
-					type="password"
-					autocomplete="new-password"
-					placeholder={form.hasSecret ? 'มีรหัสผ่านเก็บไว้แล้ว — เว้นว่างถ้าไม่เปลี่ยน' : 'ไม่บังคับ'}
-					disabled={form.clearPassword}
-					bind:value={form.password}
-				/>
+				{#if form.provider === 'ssh' && form.sshAuth === 'key'}
+					<label class="label" for="ep-pw">Private key (OpenSSH หรือ PEM ที่ไม่มี passphrase)</label>
+					<textarea
+						id="ep-pw"
+						class="input mono text-xs"
+						rows="5"
+						autocomplete="off"
+						spellcheck="false"
+						placeholder={form.hasSecret ? 'มีกุญแจเก็บไว้แล้ว — เว้นว่างถ้าไม่เปลี่ยน' : '-----BEGIN OPENSSH PRIVATE KEY-----'}
+						disabled={form.clearPassword}
+						bind:value={form.password}
+					></textarea>
+				{:else}
+					<label class="label" for="ep-pw">
+						รหัสผ่าน {p.kind === 'vendor' ? '(รหัส unattended ของเครื่อง)' : ''}
+					</label>
+					<input
+						id="ep-pw"
+						class="input"
+						type="password"
+						autocomplete="new-password"
+						placeholder={form.hasSecret ? 'มีรหัสผ่านเก็บไว้แล้ว — เว้นว่างถ้าไม่เปลี่ยน' : 'ไม่บังคับ'}
+						disabled={form.clearPassword}
+						bind:value={form.password}
+					/>
+				{/if}
 				{#if form.hasSecret}
 					<label class="mt-1 flex items-center gap-2 text-xs text-muted"><input type="checkbox" bind:checked={form.clearPassword} /> ลบรหัสผ่านที่เก็บไว้</label>
 				{/if}
 				<p class="mt-1 text-xs text-muted">
-					{p.gateway ? 'ใช้ผ่าน gateway โดยเซิร์ฟเวอร์ ไม่ถูกส่งไปที่เบราว์เซอร์' : 'เมื่อกดเปิด จะคัดลอกไปที่คลิปบอร์ดให้วางในโปรแกรม (ไม่ใส่ในลิงก์)'}
+					{form.provider === 'ssh' && form.sshAuth === 'key'
+						? 'ใช้ผ่าน gateway เท่านั้น ไม่ถูกส่งไปที่เบราว์เซอร์และไม่ถูกคัดลอกเมื่อเปิดด้วยโปรแกรมในเครื่อง'
+						: p.gateway
+							? 'ผ่าน gateway เซิร์ฟเวอร์ใส่รหัสให้เอง ไม่ถูกส่งไปที่เบราว์เซอร์ ส่วนการเปิดด้วยโปรแกรมในเครื่องจะคัดลอกรหัสให้เฉพาะผู้ดูแลและผู้สร้างรายการ'
+							: 'เมื่อกดเปิด จะคัดลอกไปที่คลิปบอร์ดให้วางในโปรแกรม (ไม่ใส่ในลิงก์)'}
 				</p>
 			</div>
 			{#if form.provider === 'rdp'}

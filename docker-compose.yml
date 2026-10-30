@@ -18,8 +18,17 @@ services:
   # the target machines; credentials are injected by aegiron-server and never reach browsers.
   guacd:
     image: guacamole/guacd:1.5.5
+    depends_on: { guacd-recordings: { condition: service_completed_successfully } }
     volumes: [recordings:/recordings]   # session recordings (AEGIRON_GATEWAY_RECORDING_PATH)
     restart: unless-stopped
+
+  # guacd runs as uid 1000 but a new named volume is owned by root, so without this guacd
+  # logs "Creation of recording failed: Permission denied" and records nothing.
+  guacd-recordings:
+    image: guacamole/guacd:1.5.5
+    user: root
+    entrypoint: ["chown", "guacd:guacd", "/recordings"]
+    volumes: [recordings:/recordings]
 
   server:
     build: { context: ., dockerfile: server/Dockerfile }

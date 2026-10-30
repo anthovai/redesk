@@ -1,0 +1,71 @@
+# Gateway end-to-end test targets: guacd plus throwaway RDP / VNC / SSH servers.
+# Used by deploy/test/gateway-e2e.sh; never point a real deployment at these.
+# Passwords and the SSH public key come from the environment the script sets.
+name: aegiron-gwtest
+
+services:
+  guacd:
+    image: guacamole/guacd:1.5.5
+    container_name: aegiron-gwtest-guacd
+    ports: ["127.0.0.1:${GWTEST_GUACD_PORT:-14822}:4822"]
+    # Same layout as the production docker-compose.yml: a named volume at /recordings,
+    # handed to the guacd user first.
+    depends_on: { guacd-recordings: { condition: service_completed_successfully } }
+    volumes: [recordings:/recordings]
+    networks: [targets]
+
+  guacd-recordings:
+    image: guacamole/guacd:1.5.5
+    container_name: aegiron-gwtest-guacd-recordings
+    user: root
+    entrypoint: ["chown", "guacd:guacd", "/recordings"]
+    volumes: [recordings:/recordings]
+    network_mode: none
+
+  rdp:
+    build: { context: ., dockerfile: Dockerfile.rdp }
+    image: aegiron-gwtest-rdp
+    container_name: aegiron-gwtest-rdp
+    hostname: rdp-target
+    environment: { RDP_PASSWORD: "${GWTEST_RDP_PASSWORD:?}", RDP_SECURITY: negotiate }
+    networks: [targets]
+
+  rdp-tls:   # TLS only (xrdp security_layer=tls, self-signed certificate)
+    build: { context: ., dockerfile: Dockerfile.rdp }
+    image: aegiron-gwtest-rdp
+    container_name: aegiron-gwtest-rdp-tls
+    hostname: rdp-tls-target
+    environment: { RDP_PASSWORD: "${GWTEST_RDP_PASSWORD:?}", RDP_SECURITY: tls }
+    networks: [targets]
+
+  rdp-nla:   # FreeRDP shadow server requiring NLA (CredSSP), like a default Windows host
+    build: { context: ., dockerfile: Dockerfile.nla }
+    image: aegiron-gwtest-nla
+    container_name: aegiron-gwtest-rdp-nla
+    hostname: nla-target
+    environment: { RDP_PASSWORD: "${GWTEST_RDP_PASSWORD:?}" }
+    networks: [targets]
+
+  vnc:
+    build: { context: ., dockerfile: Dockerfile.vnc }
+    image: aegiron-gwtest-vnc
+    container_name: aegiron-gwtest-vnc
+    hostname: vnc-target
+    environment: { VNC_PASSWORD: "${GWTEST_VNC_PASSWORD:?}" }
+    networks: [targets]
+
+  ssh:
+    build: { context: ., dockerfile: Dockerfile.ssh }
+    image: aegiron-gwtest-ssh
+    container_name: aegiron-gwtest-ssh
+    hostname: ssh-target
+    environment: { SSH_PASSWORD: "${GWTEST_SSH_PASSWORD:?}", SSH_AUTHORIZED_KEYS: "${GWTEST_SSH_PUBKEYS:?}" }
+    networks: [targets]
+
+networks:
+  targets:
+    name: aegiron-gwtest
+
+volumes:
+  recordings:
+    name: aegiron-gwtest-recordings

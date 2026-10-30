@@ -31,9 +31,38 @@ Browser (guacamole-common-js) ──WSS /ws/gateway──▶ aegiron-server ─�
 - เปิดใช้โดยตั้ง `AEGIRON_GUACD_ADDR=host:4822` (docker-compose ตั้งไว้ให้แล้ว)
 - เบราว์เซอร์ไม่ได้รับรหัสผ่าน: เซิร์ฟเวอร์ใส่รหัสใน `connect` ของ guacd เอง
 - เซิร์ฟเวอร์ส่งต่อเฉพาะ instruction ที่สมบูรณ์ ตอบ ping ภายในของ tunnel เอง และนับ byte ของแต่ละเซสชัน (ดูได้ในหน้าเซสชัน)
-- **บันทึกเซสชัน:** ตั้ง `AEGIRON_GATEWAY_RECORDING_PATH` (เป็น path **ภายใน container ของ guacd**) แล้ว guacd จะบันทึกทุกเซสชันเป็นไฟล์ Guacamole recording ชื่อตาม session id สำหรับ SSH จะได้ typescript ด้วย ไฟล์เหล่านี้เปิดดูย้อนหลังได้ด้วย `guacamole-common-js` (`Guacamole.SessionRecording`) ซึ่งยังไม่มีหน้าเล่นซ้ำในคอนโซล
+- **บันทึกเซสชัน:** ตั้ง `AEGIRON_GATEWAY_RECORDING_PATH` (เป็น path **ภายใน container ของ guacd**) แล้ว guacd จะบันทึกทุกเซสชันเป็นไฟล์ Guacamole recording ชื่อ `<sid>` (sid อยู่ใน audit `gateway.start`) สำหรับ SSH จะได้ typescript ด้วยที่ `<sid>.typescript` และ `<sid>.typescript.timing` (เล่นซ้ำด้วย `scriptreplay`) ไฟล์ recording เปิดดูย้อนหลังได้ด้วย `guacamole-common-js` (`Guacamole.SessionRecording`) ซึ่งยังไม่มีหน้าเล่นซ้ำในคอนโซล
+  - guacd ทำงานเป็น uid 1000 แต่ Docker volume ที่สร้างใหม่เป็นของ root ถ้าไม่ `chown` ให้ก่อน guacd จะเขียนไม่ได้ (log: `Creation of recording failed: Permission denied`) และ**ไม่บันทึกอะไรเลยโดยไม่แจ้งผู้ใช้** docker-compose.yml (service `guacd-recordings`), `deploy/macos/install.sh` และ `make dev-guacd` จัดการให้แล้ว ถ้าตั้ง guacd เอง ให้รัน `docker run --rm --user root --entrypoint chown -v <volume>:/recordings guacamole/guacd:1.5.5 guacd:guacd /recordings`
+- **Audit ของ gateway:** `gateway.end` มี `reason` (`browser_closed` = ผู้ใช้ปิด, `target_closed` = เครื่องปลายทาง/guacd ตัด เช่นรหัสผิด) และ `error` เมื่อ guacd แจ้งสาเหตุ (เช่น `SSL/TLS connection failed (untrusted/self-signed certificate?) (status 519)`) guacd 1.5.5 บางครั้งทิ้งข้อความ error ถ้าการเชื่อมต่อล้มเหลวเร็วมาก คอนโซลจึงแสดง "เชื่อมต่อไม่สำเร็จ" ทุกครั้งที่ปิดก่อนเชื่อมต่อได้
+- **รหัสผ่านกับ "เปิดด้วยโปรแกรมในเครื่อง":** เมื่อเปิด gateway ไว้ รหัสผ่าน RDP/VNC/SSH จะถูกคัดลอกไปเบราว์เซอร์ให้เฉพาะผู้ดูแลระบบและผู้สร้างรายการเท่านั้น สมาชิกกลุ่มที่ได้รับแชร์ใช้ผ่าน gateway ได้แต่ไม่เห็นรหัส (ถ้าปิด gateway ทุกคนที่มีสิทธิ์ยังได้รับรหัสเพื่อเปิดโปรแกรมในเครื่อง)
+- **SSH ด้วยกุญแจ:** เลือก "ยืนยันตัวตนด้วย: กุญแจ SSH" แล้ววาง private key (OpenSSH หรือ PEM) ที่**ไม่มี passphrase** กุญแจเก็บเข้ารหัสใน vault ใช้ได้เฉพาะผ่าน gateway และไม่ถูกส่งไปเบราว์เซอร์ในทุกกรณี ทดสอบแล้วทั้ง ed25519 และ RSA กับ OpenSSH 9.2
 - RDP ใช้ `resize-method=display-update` ทำให้ปรับขนาดหน้าต่างแล้วความละเอียดหน้าจอปลายทางปรับตาม ตั้ง "ไม่ตรวจใบรับรอง" ได้ทีละเครื่อง สำหรับเซิร์ฟเวอร์ภายในที่ใช้ใบรับรอง self-signed
 - SSH: guacd **ไม่ได้ตรวจ host key** (log จะเตือน "No known host keys provided") ถ้าต้องการกัน MITM ภายในเครือข่าย ให้วาง guacd ไว้ในเครือข่ายเดียวกับเซิร์ฟเวอร์ปลายทาง
+
+### ทดสอบ gateway กับเซิร์ฟเวอร์จริง (end-to-end)
+
+```bash
+deploy/test/gateway-e2e.sh          # up + ทดสอบ + down ในคำสั่งเดียว
+deploy/test/gateway-e2e.sh up       # เปิดเครื่องทดสอบ ฐานข้อมูล และเซิร์ฟเวอร์ค้างไว้
+deploy/test/gateway-e2e.sh run      # รันเฉพาะการทดสอบ (GWTEST_ONLY=ssh-key-rsa,vnc-password เลือกบางกรณี)
+deploy/test/gateway-e2e.sh down     # หยุด container ทั้งหมดและลบฐานข้อมูลทดสอบ
+```
+
+ต้องมี Docker (เช่น Colima), Go, bun, PostgreSQL 16 และ Google Chrome สคริปต์แยกจากระบบจริงทั้งหมด: ฐานข้อมูล `aegiron_gw`, เซิร์ฟเวอร์ที่ `127.0.0.1:21300` พร้อม data dir ของตัวเอง (`GWTEST_DIR`, ค่าเริ่มต้น `$TMPDIR/aegiron-gwtest`), guacd ที่ `127.0.0.1:14822` และ container ชื่อ `aegiron-gwtest-*` จาก [deploy/test/gateway/compose.yml](../deploy/test/gateway/compose.yml)
+
+| เครื่องทดสอบ | ซอฟต์แวร์ | ใช้ทดสอบ |
+|---|---|---|
+| `aegiron-gwtest-rdp` | xrdp (security negotiate) | RDP โหมด any, rdp, nla (คาดว่าล้มเหลว), รหัสผิด |
+| `aegiron-gwtest-rdp-tls` | xrdp (TLS อย่างเดียว, self-signed) | โหมด tls, ปฏิเสธใบรับรองเมื่อไม่ติ๊ก "ไม่ตรวจใบรับรอง" |
+| `aegiron-gwtest-rdp-nla` | FreeRDP shadow server (`/sec:nla`) | NLA/CredSSP จริง: รหัสถูกเข้าได้ รหัสผิดถูกปฏิเสธ |
+| `aegiron-gwtest-vnc` | TigerVNC (VncAuth) | VNC รหัสถูก/ผิด |
+| `aegiron-gwtest-ssh` | OpenSSH 9.2 | SSH รหัสผ่าน, กุญแจ ed25519 และ RSA, รหัสผิด |
+
+[web/scripts/e2e-gateway.ts](../web/scripts/e2e-gateway.ts) ใช้ Chrome แบบ headless (playwright-core) ล็อกอินคอนโซล เพิ่มการเชื่อมต่อผ่านฟอร์ม (VNC, SSH key) และ API แล้วตรวจแต่ละกรณี: หน้าจอปลายทางแสดงผลจริง (อ่านพิกเซลจาก canvas), พิมพ์คำสั่งแล้วตรวจผลในเครื่องปลายทาง (RDP/VNC ตรวจไฟล์ที่ xterm เขียน, SSH ตรวจผลลัพธ์ใน typescript), คลิปบอร์ดทั้งสองทาง, ปล่อยเครื่องว่าง 25 วินาทีแล้วยังใช้งานได้, ตัดการเชื่อมต่อ, audit `gateway.start/end`, ไฟล์ recording, สิทธิ์ตามกลุ่ม (เห็น/เข้าได้เฉพาะรายการในกลุ่ม และถูกตัดสิทธิ์เมื่อออกจากกลุ่ม), WebSocket ที่ไม่มี session หรือมาจาก Origin อื่นถูกปฏิเสธ และไม่มีรหัสผ่านหรือกุญแจโผล่ใน WebSocket frame หรือ response ใดที่เบราว์เซอร์ได้รับ ภาพหน้าจอเก็บใน `$GWTEST_DIR/shots`
+
+**สิ่งที่การทดสอบนี้ไม่ได้พิสูจน์เกี่ยวกับ Windows:** xrdp และ FreeRDP shadow ไม่ใช่ Windows ผลนี้ยืนยันว่า Aegiron ส่งพารามิเตอร์ ข้อมูลรับรอง และสตรีมผ่าน guacd ได้ถูกต้อง และ guacd (FreeRDP 2) ต่อ RDP, TLS และ NLA ได้ แต่ยังไม่ได้ทดสอบกับ Windows Server/Windows 10-11 จริง เช่น NLA กับ Kerberos/โดเมน, การ login ด้วยบัญชีโดเมน, RemoteFX/GFX, display-update ของ Windows, คลิปบอร์ดของ rdpclip และ Restricted Admin เครื่อง shadow server ส่งภาพหน้าจอได้น้อยมาก จึงตรวจเฉพาะการ login ด้วย NLA ไม่ได้ตรวจภาพ
+
+ข้อจำกัดที่พบ (ไม่ใช่ bug ของ Aegiron): โหมด `rdp` (Standard RDP Security แบบ RC4) ของ guacd 1.5.5 ใช้กับ xrdp ไม่ได้ (`MAC checksum error for non-FIPS PDU`), xrdp ไม่รองรับ NLA และเมื่อรหัสผิด xrdp จะแสดงหน้า login ของตัวเองแทนการปฏิเสธ, image `guacamole/guacd:1.5.5` มีแค่ amd64 จึงรันแบบ emulation บน Apple Silicon
 
 ## 3. TeamViewer API
 
