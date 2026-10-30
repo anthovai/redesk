@@ -30,7 +30,7 @@ const bin = process.env.AEGIRON_AGENT_BIN;
 const deviceConfig = process.env.AEGIRON_AGENT_CONFIG;
 if (!deviceId || !bin || !deviceConfig) throw new Error('usage: AEGIRON_AGENT_BIN=… AEGIRON_AGENT_CONFIG=… e2e-remote.ts <device-id>');
 
-const admin = await Api.login(adminEmail, adminPassword());
+const admin = await Api.admin();
 const work = mkdtempSync(join(tmpdir(), 'aegiron-e2e-remote-'));
 const viewerConfig = join(work, 'viewer.toml');
 

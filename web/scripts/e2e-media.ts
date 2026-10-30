@@ -29,11 +29,11 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Browser, Page } from 'puppeteer-core';
-import { adminEmail, adminPassword, Api, base, check, done, launchChrome, sleep, waitFor } from './e2e-lib';
+import { Api, base, check, done, launchChrome, sleep, waitFor } from './e2e-lib';
 
 const [deviceId, devicePassword] = process.argv.slice(2);
 if (!deviceId || !devicePassword) throw new Error('usage: e2e-media.ts <device-id> <device-password>');
-const admin = await Api.login(adminEmail, adminPassword());
+const admin = await Api.admin();
 
 // Instrumentation injected into every page: what the decoders produce and when audio is due.
 declare global {

@@ -33,6 +33,8 @@ pub enum Phase {
     Password,
     Approval,
     Connected,
+    /// The remote machine is restarting at our request; reconnecting when it is back.
+    Reconnecting,
     Closed,
 }
 
@@ -138,7 +140,39 @@ impl Info {
     pub fn clip_files(&self) -> bool {
         self.files && self.clipboard && self.has("clipfiles")
     }
+
+    /// Whether the agent offers a session control: "view_only", "block_input", "privacy",
+    /// "lock" or "restart" (absent on older agents and when the device does not allow it).
+    pub fn control(&self, name: &str) -> bool {
+        self.has(name)
+    }
 }
+
+/// Session controls the agent confirmed (`ctl` replies), reset with every new session.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Controls {
+    pub block_input: bool,
+    pub privacy: bool,
+    pub lock_after: bool,
+}
+
+/// Waiting for a restarted machine: how many tries so far and when the next one starts.
+#[derive(Clone, Copy, Debug)]
+pub struct Reconnect {
+    pub attempt: u32,
+    pub next: Instant,
+}
+
+/// Delay before reconnect attempt `n` (1-based) after a restart: 3 s, doubling up to 30 s.
+pub fn reconnect_delay(n: u32) -> Duration {
+    Duration::from_secs((3u64 << n.saturating_sub(1).min(4)).min(30))
+}
+
+/// How long a restarted machine has to come back before the viewer gives up (the agent's
+/// reconnect token lasts 15 minutes).
+const RECONNECT_FOR: Duration = Duration::from_secs(12 * 60);
+/// Keepalive while the machine is blocked (the agent ends the session after 30 s of silence).
+const KEEPALIVE: Duration = Duration::from_secs(10);
 
 /// Video codecs this viewer decodes, best first: H.264 unless the user picked AV1. AV1 is
 /// listed either way, so the agent can say whether a switch to it is possible.
@@ -331,6 +365,13 @@ pub struct State {
     pub extra: HashMap<usize, Extra>,
     /// Modes of the display last asked about with `res_list`.
     pub modes: Option<Modes>,
+    /// This viewer sends no input (and tells agents that know `view_only`).
+    pub view_only: bool,
+    pub controls: Controls,
+    /// Token from the agent for reconnecting after the restart we asked for.
+    pub resume: Option<String>,
+    /// Set while waiting for a restarted machine to come back.
+    pub reconnect: Option<Reconnect>,
 }
 
 enum Cmd {
@@ -454,6 +495,10 @@ impl Viewer {
                 display_all: false,
                 extra: HashMap::new(),
                 modes: None,
+                view_only: false,
+                controls: Controls::default(),
+                resume: None,
+                reconnect: None,
             }),
             tx,
             repaint,
@@ -467,12 +512,49 @@ impl Viewer {
         });
         let task = v.clone();
         crate::runtime().spawn(async move {
-            let res = run(&task, target, rx).await;
+            let mut rx = rx;
+            let mut res = run(&task, &target, &mut rx).await;
+            // After a restart this viewer asked for, come back automatically once the machine is
+            // online again (the agent's one-time token replaces the password).
+            let started = Instant::now();
+            let mut attempt = 0;
+            while task.state.lock().unwrap().resume.is_some() {
+                if let Err(e) = &res {
+                    tracing::info!("viewer: reconnect after restart: {e:#}");
+                }
+                attempt += 1;
+                if started.elapsed() > RECONNECT_FOR {
+                    task.update(|st| {
+                        st.resume = None;
+                        st.reconnect = None;
+                        st.error = Some("เครื่องปลายทางยังไม่กลับมาออนไลน์หลังรีสตาร์ท".into());
+                    });
+                    res = Ok(());
+                    break;
+                }
+                let wait = reconnect_delay(attempt);
+                task.update(|st| {
+                    st.phase = Phase::Reconnecting;
+                    st.error = None;
+                    st.reconnect = Some(Reconnect { attempt, next: Instant::now() + wait });
+                });
+                let closed = tokio::select! {
+                    _ = tokio::time::sleep(wait) => false,
+                    c = rx.recv() => matches!(c, Some(Cmd::Close) | None),
+                };
+                if closed {
+                    task.update(|st| st.resume = None);
+                    res = Ok(());
+                    break;
+                }
+                res = run(&task, &target, &mut rx).await;
+            }
             match &res {
                 Ok(()) => tracing::info!("viewer session ended"),
                 Err(e) => tracing::warn!("viewer session failed: {e:#}"),
             }
             let mut st = task.state.lock().unwrap();
+            st.reconnect = None;
             if let Err(e) = res {
                 st.error.get_or_insert_with(|| format!("{e:#}"));
             }
@@ -502,7 +584,7 @@ impl Viewer {
             files: true,
             recording: std::env::var_os("AEGIRON_UI_DEMO_RECORDING").is_some(),
             whiteboard: true,
-            features: crate::files::FEATURES.iter().chain(&proto::DISPLAY_FEATURES).chain(&[proto::FEATURE_CHAT, proto::FEATURE_VOICE, proto::FEATURE_SWITCH]).map(|f| f.to_string()).collect(),
+            features: crate::files::FEATURES.iter().chain(&proto::DISPLAY_FEATURES).chain(&["view_only", "block_input", "privacy", "lock", "restart"]).chain(&[proto::FEATURE_CHAT, proto::FEATURE_VOICE, proto::FEATURE_SWITCH]).map(|f| f.to_string()).collect(),
             audio: true,
             codecs: vec!["av1".into(), "h264".into(), "jpeg".into()],
             resolution: true,
@@ -539,6 +621,10 @@ impl Viewer {
                 display_all: false,
                 extra: HashMap::new(),
                 modes: None,
+                view_only: false,
+                controls: Controls::default(),
+                resume: None,
+                reconnect: None,
             }),
             tx,
             repaint: Arc::new(|| {}),
@@ -608,6 +694,29 @@ impl Viewer {
     pub fn set_codec(&self, codec: Codec) {
         self.update(|st| st.want_codec = codec);
         self.send(json!({"t": "cfg", "codec": codec.name()}));
+    }
+
+    /// View-only: this window stops sending input; agents that know it show it to the person
+    /// at the machine.
+    pub fn set_view_only(&self, on: bool) {
+        let tell = {
+            let mut st = self.state.lock().unwrap();
+            st.view_only = on;
+            st.info.as_ref().is_some_and(|i| i.control("view_only"))
+        };
+        if tell {
+            self.send(json!({"t": "view_only", "on": on}));
+        }
+        (self.repaint)();
+    }
+
+    /// A session control the agent offered: `block_input`, `privacy` or `lock_after` with `on`,
+    /// or `lock` / `restart` (`on` ignored). The agent answers with `ctl`.
+    pub fn session_control(&self, op: &str, on: bool) {
+        match op {
+            "lock" | "restart" => self.send(json!({"t": op})),
+            _ => self.send(json!({"t": op, "on": on})),
+        }
     }
 
     /// Mutes or unmutes the remote audio; the agent stops sending while muted.
@@ -838,13 +947,13 @@ async fn next_text(rx: &mut crate::direct::WsRx, what: &str, secs: u64) -> Resul
     }
 }
 
-async fn run(v: &Arc<Viewer>, mut t: Target, mut cmds: mpsc::UnboundedReceiver<Cmd>) -> Result<()> {
+async fn run(v: &Arc<Viewer>, t: &Target, cmds: &mut mpsc::UnboundedReceiver<Cmd>) -> Result<()> {
     // 1. Ask the server to wake the agent (blocking HTTPS call off the async threads). A
     //    switched session already has its ticket (the server issued it for the invitation).
     let (server, token, id) = (t.server.clone(), t.token.clone(), t.device_id.clone());
     let direct = t.direct && t.only != Some(crate::direct::Path::Relay);
-    let ticket = match t.switch.take() {
-        Some(s) => s.ticket,
+    let ticket = match t.switch.as_ref() {
+        Some(s) => s.ticket.clone(),
         None => tokio::task::spawn_blocking(move || account::start_session(&server, &token, &id, direct))
             .await?
             .map_err(|e| anyhow!(e))?,
@@ -854,7 +963,9 @@ async fn run(v: &Arc<Viewer>, mut t: Target, mut cmds: mpsc::UnboundedReceiver<C
     v.update(|st| {
         st.fingerprint = fingerprint(&device_key);
         st.device_name = name;
-        st.phase = Phase::Waiting;
+        if st.resume.is_none() {
+            st.phase = Phase::Waiting;
+        }
     });
 
     // 2. Relay: the viewer token plus this user's bearer token (the server checks both).
@@ -890,7 +1001,9 @@ async fn run(v: &Arc<Viewer>, mut t: Target, mut cmds: mpsc::UnboundedReceiver<C
     let crate::direct::Link { mut tx, mut rx, path, keep: _keep } = crate::direct::viewer_race(direct, relay).await?;
     tracing::info!("viewer {}: connected via {}", t.device_id, path.as_str());
     v.update(|st| {
-        st.phase = Phase::Handshake;
+        if st.resume.is_none() {
+            st.phase = Phase::Handshake;
+        }
         st.path = Some(path);
     });
 
@@ -925,9 +1038,18 @@ async fn run(v: &Arc<Viewer>, mut t: Target, mut cmds: mpsc::UnboundedReceiver<C
     let mut switch_secret: Option<String> = None;
     let sid = ticket.ticket.sid.clone();
 
+    let mut keepalive = tokio::time::interval(KEEPALIVE);
+
     loop {
         tokio::select! {
             Some(plain) = voice_rx.recv() => tx.send(Message::Binary(ch.seal(&plain)?.into())).await?,
+            _ = keepalive.tick() => {
+                // Only while the machine is blocked; older agents ignore it anyway.
+                let c = v.state.lock().unwrap().controls;
+                if c.block_input || c.privacy {
+                    tx.send(Message::Binary(ch.seal(&proto::json(&json!({"t": "ka"})))?.into())).await?;
+                }
+            }
             m = rx.next() => {
                 let m = match m {
                     None => return Ok(()),
@@ -1176,6 +1298,7 @@ async fn run(v: &Arc<Viewer>, mut t: Target, mut cmds: mpsc::UnboundedReceiver<C
                     if let Some(s) = switch_secret.take().filter(|_| !v.state.lock().unwrap().switched) {
                         crate::switch::withdraw(&s);
                     }
+                    v.state.lock().unwrap().resume = None; // closed by the user: no reconnect
                     let _ = tx.send(Message::Binary(ch.seal(&proto::json(&json!({"t": "bye"})))?.into())).await;
                     let _ = tx.close().await;
                     return Ok(());
@@ -1252,6 +1375,9 @@ fn control(v: &Viewer, m: &Value) -> Option<Value> {
     let t = m["t"].as_str().unwrap_or("");
     let mut reply = None;
     v.update(|st| match t {
+        "auth_required" if st.resume.is_some() => {
+            reply = Some(json!({"t": "auth", "password": null, "resume": st.resume, "codecs": codecs(st.want_codec), "features": v.features, "audio": audio_codecs()}));
+        }
         "auth_required" => {
             if v.switch_secret.is_some() && m["switch"] != true {
                 // An agent that does not know switch sides asks for its password instead.
@@ -1269,6 +1395,17 @@ fn control(v: &Viewer, m: &Value) -> Option<Value> {
             (true, _) => {
                 st.phase = Phase::Connected;
                 st.error = None;
+                st.resume = None;
+                st.reconnect = None;
+            }
+            // The reconnect token was not accepted (expired, or the device was reset): ask the
+            // user for the password like a new connection.
+            (false, reason) if st.resume.take().is_some() => {
+                st.reconnect = None;
+                if reason == "wrong_password" {
+                    st.phase = Phase::Password;
+                    st.error = Some("เครื่องปลายทางรีสตาร์ทแล้ว ใส่รหัสผ่านเพื่อเชื่อมต่ออีกครั้ง".into());
+                }
             }
             (false, "wrong_password") => {
                 let left = m["attempts_left"].as_u64().unwrap_or(0);
@@ -1285,6 +1422,10 @@ fn control(v: &Viewer, m: &Value) -> Option<Value> {
         },
         "info" => {
             st.info = serde_json::from_value(m.clone()).ok();
+            st.controls = Controls::default();
+            if st.view_only && st.info.as_ref().is_some_and(|i| i.control("view_only")) {
+                reply = Some(json!({"t": "view_only", "on": true}));
+            }
             st.codec = m["codec"].as_str().unwrap_or("jpeg").to_owned();
             // Older agents do not say; they always used OpenH264 for H.264.
             st.encoder = m["encoder"].as_str().unwrap_or(if st.codec == "h264" { "openh264" } else { "jpeg" }).to_owned();
@@ -1321,6 +1462,7 @@ fn control(v: &Viewer, m: &Value) -> Option<Value> {
                 },
             );
         }
+        "ctl" => apply_ctl(st, m),
         "res_list" => {
             let mode = |v: &Value| serde_json::from_value::<Mode>(v.clone()).unwrap_or_default();
             st.modes = Some(Modes {
@@ -1394,6 +1536,38 @@ fn control(v: &Viewer, m: &Value) -> Option<Value> {
     reply
 }
 
+
+/// The agent's answer to a session control (`ctl {op, ok, on?, resume?, message?}`).
+fn apply_ctl(st: &mut State, m: &Value) {
+    let op = m["op"].as_str().unwrap_or("");
+    let on = m["on"].as_bool().unwrap_or(false);
+    if !m["ok"].as_bool().unwrap_or(false) {
+        let why = m["message"].as_str().unwrap_or("");
+        let what = match op {
+            "block_input" => "บล็อกเมาส์และคีย์บอร์ด",
+            "privacy" => "โหมดความเป็นส่วนตัว",
+            "lock" | "lock_after" => "ล็อกหน้าจอ",
+            "restart" => "รีสตาร์ท",
+            _ => "คำสั่ง",
+        };
+        st.notice = Some(format!("เครื่องปลายทางทำ{what}ไม่สำเร็จ: {why}"));
+        if op == "restart" {
+            st.resume = None;
+        }
+        return;
+    }
+    match op {
+        "block_input" => st.controls.block_input = on,
+        "privacy" => st.controls.privacy = on,
+        "lock_after" => st.controls.lock_after = on,
+        "lock" => st.notice = Some("ล็อกหน้าจอเครื่องปลายทางแล้ว".into()),
+        "restart" => {
+            st.resume = m["resume"].as_str().map(str::to_owned);
+            st.notice = Some("เครื่องปลายทางกำลังรีสตาร์ท จะเชื่อมต่อใหม่ให้อัตโนมัติ".into());
+        }
+        _ => {}
+    }
+}
 
 /// What a paste in the remote window should do.
 #[derive(Debug, PartialEq)]
@@ -1913,6 +2087,48 @@ impl Link {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconnect_backs_off_to_thirty_seconds() {
+        let secs: Vec<u64> = (1..=7).map(|n| reconnect_delay(n).as_secs()).collect();
+        assert_eq!(secs, [3, 6, 12, 24, 30, 30, 30]);
+        assert_eq!(reconnect_delay(0).as_secs(), 3);
+        assert_eq!(reconnect_delay(u32::MAX).as_secs(), 30);
+    }
+
+    #[test]
+    fn session_controls_follow_the_agent() {
+        let v = Viewer::demo("pc", "123456789", "", &image::RgbaImage::new(4, 4));
+        let st = &mut *v.state.lock().unwrap();
+        assert!(st.info.as_ref().unwrap().control("restart"));
+        apply_ctl(st, &json!({"t": "ctl", "op": "block_input", "ok": true, "on": true}));
+        apply_ctl(st, &json!({"t": "ctl", "op": "lock_after", "ok": true, "on": true}));
+        assert_eq!(st.controls, Controls { block_input: true, privacy: false, lock_after: true });
+        apply_ctl(st, &json!({"t": "ctl", "op": "privacy", "ok": false, "message": "no"}));
+        assert!(!st.controls.privacy && st.notice.take().unwrap().contains("ไม่สำเร็จ"));
+        apply_ctl(st, &json!({"t": "ctl", "op": "restart", "ok": true, "resume": "tok"}));
+        assert_eq!(st.resume.as_deref(), Some("tok"));
+        // A restart that failed afterwards: no automatic reconnect.
+        apply_ctl(st, &json!({"t": "ctl", "op": "restart", "ok": false, "message": "cancelled"}));
+        assert!(st.resume.is_none());
+    }
+
+    #[test]
+    fn reconnect_authenticates_with_the_token() {
+        let v = Viewer::demo("pc", "123456789", "", &image::RgbaImage::new(4, 4));
+        v.state.lock().unwrap().resume = Some("tok".into());
+        let r = control(&v, &json!({"t": "auth_required", "password": true, "click": false})).unwrap();
+        assert_eq!((r["t"].as_str(), r["resume"].as_str(), r["password"].is_null()), (Some("auth"), Some("tok"), true));
+        // Refused (expired): back to the password prompt, without retrying the token.
+        control(&v, &json!({"t": "auth_result", "ok": false, "reason": "wrong_password", "attempts_left": 2}));
+        let st = v.state.lock().unwrap();
+        assert!(st.resume.is_none() && st.phase == Phase::Password);
+        drop(st);
+        // View-only survives the new session.
+        v.state.lock().unwrap().view_only = true;
+        let r = control(&v, &json!({"t": "info", "features": ["view_only"]})).unwrap();
+        assert_eq!(r, json!({"t": "view_only", "on": true}));
+    }
 
     #[test]
     fn features_come_from_info() {

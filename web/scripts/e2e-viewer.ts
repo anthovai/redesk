@@ -12,7 +12,7 @@
 // With a remote dir, also lists it, uploads a random file there, downloads it back and compares.
 
 import { b64decode, b64encode, completeHandshake, newViewerKeys, type Channel } from '../src/lib/crypto';
-import { adminEmail, adminPassword, Api, base, check, done, sleep } from './e2e-lib';
+import { Api, base, check, done, sleep } from './e2e-lib';
 
 const [deviceId, devicePassword, fileDir] = process.argv.slice(2);
 if (!deviceId || !devicePassword) throw new Error('usage: e2e-viewer.ts <device-id> <device-password>');
@@ -22,7 +22,7 @@ const expectAudio = process.env.AEGIRON_EXPECT_AUDIO !== '0';
 const expectCm = process.env.AEGIRON_EXPECT_CM === '1';
 const features = expectCm ? ['chat', 'voice'] : undefined;
 
-const api = await Api.login(adminEmail, adminPassword());
+const api = await Api.admin();
 const t = await api.post<any>('/api/sessions', { device_id: deviceId });
 console.log('ticket', t.ticket.sid, 'device', t.device.hostname);
 

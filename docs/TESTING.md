@@ -26,9 +26,10 @@ The server limits sign-ins to 20 per address per 10 minutes, and one run uses mo
 | Native viewer | `agent/examples/media_probe.rs` | The desktop app's viewer code (`AEGIRON_CODEC=av1`) gets H.264, decodes frames and audio (`AEGIRON_AUDIO_OUT=0` decodes without playing) |
 | Browser media | `web/scripts/e2e-media.ts <id> <password>` | Live viewer with AV1 remembered: decoder configured for H.264, quality monitor shows H264 and Opus, the menu shows AV1 disabled ("ปลายทางไม่รองรับ") with H.264 marked, `AudioDecoder` output, mute/unmute; chat panel round trip; voice call from the toolbar with the fake microphone (the agent's voice decodes as mono Opus, the agent reports the browser's packets), back to idle after hanging up; recording policy "all": the session is uploaded with `codec h264`, `audio opus` and plays with sound; synthetic AV1 + Opus recordings (below): what is drawn and heard at each moment, audio within 60 ms of video, seeking forward, back, across a muted stretch and while paused, AV1 → H.264 switch, 2× with sound, 4× silent |
 | Tunnels and terminals | `web/scripts/e2e-remote.ts <id>` | `aegiron-agent tunnel` to a local HTTP server (one page, 8 parallel 3 MiB downloads) and to a server that answers only after the client half-closed; a private-network target refused before the password is used; `aegiron-agent terminal --command` with Thai output and the remote exit status; the terminal protocol with the browser's crypto (start size, resize, Ctrl-C interrupts `sleep`, exit status); the console's xterm.js page in Chrome; recording policy "all": tunnels refused (422), a terminal session recorded and played back; audit entries with type and target |
+| Session controls | `web/scripts/e2e-controls.ts <id> <password>` | `info.features` lists `view_only`, `lock`, `restart` but not `block_input`/`privacy` (the test agent has input off); view-only, refusals, lock, lock after the session, restart answers with a reconnect token and runs the restart command (logged, see below), the token replaces the password once and only once; the `agent.*` audit entries |
 | Sign-in | `web/scripts/e2e-auth.ts` | 2FA user in Chrome: TOTP with "จดจำอุปกรณ์นี้ 30 วัน", cookie attributes and lifetime, account page, password-only sign-in, wrong password still fails, admin revokes from the Users page, TOTP required again and the cookie cleared; `aegiron-agent login --remember-device`, second login without a code, admin revoke, code required and the token forgotten; every audit entry |
 
-Each script prints `PASS`/`FAIL` lines and exits non-zero on a failure. They take `AEGIRON_URL` and `AEGIRON_PASSWORD` (admin) and can run against any test server; see the header of each file for its other variables.
+Each script prints `PASS`/`FAIL` lines and exits non-zero on a failure. With `AEGIRON_E2E_COOKIE=<file>` (set by `make e2e`), the scripts that only need an admin session share one sign-in. They take `AEGIRON_URL` and `AEGIRON_PASSWORD` (admin) and can run against any test server; see the header of each file for its other variables.
 
 ### Test audio
 
@@ -37,6 +38,15 @@ Live audio is captured with ScreenCaptureKit on macOS and needs the Screen Recor
 ### Test display resolution
 
 `AEGIRON_TEST_RESOLUTION=fake` on the agent replaces the CoreGraphics / `ChangeDisplaySettingsEx` backend with an in-memory list of modes (1920×1080, 1600×900, 1280×720, 1024×768), so `res_list` / `res_set` / `res_restore` can be exercised without touching the real screen. Like the test audio it is read from the environment only. The unit tests (`cargo test resolution`) use the same fake and check that the original mode comes back when a session ends.
+### Session controls without touching the machine
+
+`AEGIRON_TEST_CONTROLS=<file>` in the agent's environment replaces every effect of the session controls (block input, privacy windows, lock, restart) with a line appended to that file (`block_input on`, `privacy off`, `lock`, `restart: <command>`), and offers all of them regardless of platform. Like `AEGIRON_TEST_AUDIO`, it is read from the environment only and never set by the app, the installers or the login service. `make e2e` uses it, so a run never locks, blacks out or restarts the Mac it runs on. The logic around them (permissions, reports, cleanup when the session ends, reconnect tokens, the platform's restart commands) is covered by `cargo test` (`controls`, `block_input`, `privacy`) with a fake platform.
+
+The macOS capture that leaves the privacy windows out is checked against the real screen with `cargo test -- --ignored capture_without` (Screen Recording permission). The real input blocker, the black windows and the lock/restart calls need a person at a test machine:
+
+- Block input: from another machine, turn on บล็อกเมาส์และคีย์บอร์ดปลายทาง; local typing and clicks do nothing, the viewer's input works, clicks on the connection manager work, Ctrl+Alt+Shift+Esc ends the session; killing the agent (`kill -9`) gives input back at once.
+- Privacy mode: the local screens turn black with the escape hint, the viewer still sees the desktop; turning it off or disconnecting removes the black windows.
+- Lock and restart: the machine locks; restart asks for confirmation, the viewer shows *เครื่องปลายทางกำลังรีสตาร์ท* and reconnects without a password once the agent is back (it must start at login).
 
 ### Synthetic recordings
 
@@ -72,3 +82,4 @@ Automated: protocol and browser (above), unit tests for the grant rules (`server
 - AV1 from a live session (needs a Windows machine with a hardware AV1 encoder; rav1d decoding in the app is covered by `cargo test`)
 - Windows audio capture (WASAPI loopback), Media Foundation encoders
 - Voice calls with a real microphone (the automated tests use the test tone and Chrome's fake microphone) and switch sides between two desktop apps (needs two machines: see above)
+- Windows session controls: input hooks, privacy windows with `WDA_EXCLUDEFROMCAPTURE`, `LockWorkStation`, `shutdown /r` (compiled with `cargo check --target x86_64-pc-windows-gnu`, not yet run)

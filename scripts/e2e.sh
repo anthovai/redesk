@@ -74,7 +74,8 @@ TONE=tone
 # With the test tone, the agent also answers voice calls and echoes chat (AEGIRON_TEST_CM).
 CM=auto
 [ -n "${E2E_REAL_AUDIO:-}" ] && CM=
-AEGIRON_TEST_AUDIO=$TONE AEGIRON_TEST_CM=$CM RUST_LOG=info "${AGENT[@]}" run >"$WORK/agent.log" 2>&1 &
+# Session controls only log what they would do (never lock, black out or restart this machine).
+AEGIRON_TEST_AUDIO=$TONE AEGIRON_TEST_CM=$CM AEGIRON_TEST_CONTROLS="$WORK/controls.log" RUST_LOG=info "${AGENT[@]}" run >"$WORK/agent.log" 2>&1 &
 PIDS+=($!)
 for _ in $(seq 50); do grep -q 'registered with server' "$WORK/agent.log" && break; sleep 0.2; done
 ID=$(sed -n 's/^id = "\(.*\)"/\1/p' "$WORK/agent/agent.toml")
@@ -82,7 +83,8 @@ echo "device $ID"
 # The temporary password changes after every successful session: read it before each step.
 pw() { "${AGENT[@]}" show-password; }
 
-export AEGIRON_URL="$URL" AEGIRON_PASSWORD="$ADMIN_PW" ROOT ID REL
+# Scripts that only need an admin session share one sign-in (the server allows 20 per 10 min).
+export AEGIRON_URL="$URL" AEGIRON_PASSWORD="$ADMIN_PW" AEGIRON_E2E_COOKIE="$WORK/admin.cookie" ROOT ID REL
 export AEGIRON_EXPECT_CM=$([ -n "$CM" ] && echo 1 || echo 0)
 export PW=
 FAILED=0
@@ -96,7 +98,7 @@ step() {
 	# (a crashed script does not always exit non-zero, and may never reach its own summary).
 	local log="$WORK/step-$key.log" code=0
 	"$@" 2>&1 | tee "$log" || code=$? # pipefail: the step's own status
-	if [ "$code" -ne 0 ] || grep -qE '^(FAIL |error: |Uncaught |[A-Za-z]*Error: )' "$log"; then
+	if [ "$code" -ne 0 ] || grep -qE '^(FAIL |error: |Uncaught |[A-Z][A-Za-z]+Error: )' "$log"; then
 		echo "=== step $key FAILED (exit $code)"
 		FAILED=$((FAILED + 1))
 	fi
@@ -111,6 +113,8 @@ step native "native viewer asks for AV1 (examples/media_probe)" bash -c '
 step media "browser: live viewer, chat, voice call, recordings, AV1 playback (web/scripts/e2e-media.ts)" \
 	env AEGIRON_AGENT_CONFIG="$WORK/agent/agent.toml" AEGIRON_E2E_DB="$DB_URL" PSQL="$PG_BIN/psql" \
 	AEGIRON_MAKE_RECORDING="$REL/examples/make_recording" bash -c 'cd "$ROOT/web" && bun scripts/e2e-media.ts "$ID" "$PW"'
+step controls "session controls: lock, restart and reconnect, audit (web/scripts/e2e-controls.ts)" \
+	env AEGIRON_CONTROLS_LOG="$WORK/controls.log" bash -c 'cd "$ROOT/web" && bun scripts/e2e-controls.ts "$ID" "$PW"'
 step auth "browser + CLI: remembered 2FA devices (web/scripts/e2e-auth.ts)" \
 	env AEGIRON_AGENT_BIN="$REL/aegiron-agent" bash -c 'cd "$ROOT/web" && bun scripts/e2e-auth.ts'
 step remote "CLI + browser: TCP tunnels and terminals (web/scripts/e2e-remote.ts)" \

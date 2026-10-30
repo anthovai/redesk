@@ -8,7 +8,7 @@ use egui::{Order, Popup, RectAlign, Shadow};
 
 use crate::codec::Codec;
 use crate::status::ChatLine;
-use crate::viewer::{CallState, ClipEntry, Info, Paste, Phase, RemoteDir, Transfer, TransferStatus};
+use crate::viewer::{CallState, ClipEntry, Controls, Info, Paste, Phase, Reconnect, RemoteDir, Transfer, TransferStatus};
 
 const QUALITY: [(&str, u8, u32); 3] = [("คมชัด", 85, 2560), ("สมดุล", 70, 1920), ("ประหยัดเน็ต", 45, 1280)];
 
@@ -100,6 +100,8 @@ struct WinUi {
     chat_seen: usize,
     /// Asking whether to let the other side control this machine.
     confirm_switch: bool,
+    /// Asking whether to restart the remote machine.
+    confirm_restart: bool,
 }
 
 /// What input forwarding remembers between frames for one remote screen.
@@ -179,6 +181,8 @@ struct Frame1<'a> {
     display_all: bool,
     modes: Option<&'a crate::viewer::Modes>,
     host: Host,
+    view_only: bool,
+    controls: Controls,
 }
 
 impl ViewerWindow {
@@ -249,7 +253,7 @@ impl ViewerWindow {
             self.close_window();
             return;
         }
-        let (phase, error, name, fp, info, fps, kbps, clip, transfers, fb_size, cursor, codec, path, browser, clip_offer, notice, encoder, muted, audio_level, display_all, modes) = {
+        let (phase, error, name, fp, info, fps, kbps, clip, transfers, fb_size, cursor, codec, path, browser, clip_offer, notice, encoder, muted, audio_level, display_all, modes, view_only, controls, reconnect) = {
             let mut st = self.viewer.state.lock().unwrap();
             sync_texture(&ctx, &mut w.texture, &mut st.fb, &format!("remote-{}", self.device_id));
             (
@@ -274,6 +278,9 @@ impl ViewerWindow {
                 st.audio_level,
                 st.display_all,
                 st.modes.clone(),
+                st.view_only,
+                st.controls,
+                st.reconnect,
             )
         };
         let connected = phase == Phase::Connected;
@@ -369,7 +376,7 @@ impl ViewerWindow {
                 if drawing {
                     self.draw(&mut w.pen, &resp, rect);
                     w.input.held = 0;
-                } else if connected && info.as_ref().is_some_and(|i| i.input) && ui.input(|i| i.viewport().focused != Some(false)) && !typing {
+                } else if connected && !view_only && info.as_ref().is_some_and(|i| i.input) && ui.input(|i| i.viewport().focused != Some(false)) && !typing {
                     let keys = KeyMap { remote_mac, raw: w.raw_keys, map: w.key_map, relative: w.relative };
                     forward_input(&self.viewer, ui, rect, area, keys, &mut w.input, None);
                     if resp.hovered() {
@@ -412,6 +419,8 @@ impl ViewerWindow {
                 display_all,
                 modes: modes.as_ref(),
                 host,
+                view_only,
+                controls,
             };
             if w.show_quality {
                 self.quality_monitor(&ctx, &f, w.top);
@@ -419,6 +428,7 @@ impl ViewerWindow {
             if f.info.is_some_and(|i| i.recording) {
                 self.recording_badge(&ctx, w.top);
             }
+            self.control_badges(&ctx, &f);
             self.toolbar(&ctx, w, &f);
             if w.confirm_switch {
                 self.switch_dialog(&ctx, w, &name);
@@ -426,8 +436,12 @@ impl ViewerWindow {
             if call != CallState::Idle {
                 self.call_badge(&ctx, call);
             }
+            if w.confirm_restart {
+                self.restart_dialog(&ctx, w, &name);
+            }
         } else {
-            self.dialog(&ctx, w, &phase, error.as_deref(), &name);
+            w.confirm_restart = false;
+            self.dialog(&ctx, w, &phase, error.as_deref(), &name, reconnect);
         }
         self.transfers(&ctx, &transfers);
         if connected && let Some(offer) = &clip_offer {
@@ -515,13 +529,14 @@ impl ViewerWindow {
         }
         let mut guard = self.ui.lock().unwrap();
         let w = &mut *guard;
-        let (connected, info, size, cursor) = {
+        let (live, info, size, cursor) = {
             let mut st = self.viewer.state.lock().unwrap();
-            let connected = st.phase == Phase::Connected;
+            // View-only applies to every window of the session.
+            let live = st.phase == Phase::Connected && !st.view_only;
             let info = st.info.clone();
             let Some(e) = st.extra.get_mut(&d) else { return };
             sync_texture(&ctx, w.extra_tex.entry(d).or_default(), &mut e.fb, &format!("remote-{}-{d}", self.device_id));
-            (connected, info, vec2(e.fb.w as f32, e.fb.h as f32), e.cursor)
+            (live, info, vec2(e.fb.w as f32, e.fb.h as f32), e.cursor)
         };
         let remote_mac = info.as_ref().is_some_and(|i| i.os == "macos");
         egui::CentralPanel::default().frame(Frame::new().fill(SCREEN_BG)).show(ui, |ui| {
@@ -539,7 +554,7 @@ impl ViewerWindow {
             ui.painter().image(tex.id(), rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
             let resp = ui.allocate_rect(rect.intersect(area), Sense::click_and_drag());
             let st = w.extra_input.entry(d).or_default();
-            if connected && info.as_ref().is_some_and(|i| i.input) && ui.input(|i| i.viewport().focused != Some(false)) {
+            if live && info.as_ref().is_some_and(|i| i.input) && ui.input(|i| i.viewport().focused != Some(false)) {
                 let keys = KeyMap { remote_mac, raw: w.raw_keys, map: w.key_map, relative: false };
                 forward_input(&self.viewer, ui, rect, area, keys, st, Some(d));
             } else {
@@ -760,13 +775,45 @@ impl ViewerWindow {
             if menu_row(ui, Lead::Glyph(Glyph::Keyboard), "ส่ง Ctrl + Alt + Del", "", input).clicked() {
                 send_combo(&self.viewer, &[("ControlLeft", "Control"), ("AltLeft", "Alt")], ("Delete", "Delete"));
             }
-            if menu_row(ui, Lead::Glyph(Glyph::Lock), "ล็อกหน้าจอเครื่องปลายทาง", "", input).clicked() {
+            let has = |c: &str| f.info.is_some_and(|i| i.control(c));
+            if has("lock") {
+                // The agent locks the machine itself (and reports it for the audit log).
+                if menu_row(ui, Lead::Glyph(Glyph::Lock), "ล็อกหน้าจอเครื่องปลายทาง", "", true).clicked() {
+                    self.viewer.session_control("lock", true);
+                }
+                if menu_row(ui, Lead::Tick(f.controls.lock_after), "ล็อกเมื่อจบการเชื่อมต่อ", "", true).clicked() {
+                    self.viewer.session_control("lock_after", !f.controls.lock_after);
+                }
+            } else if menu_row(ui, Lead::Glyph(Glyph::Lock), "ล็อกหน้าจอเครื่องปลายทาง", "", input && !f.view_only).clicked() {
+                // Older agents: press the system's lock shortcut.
                 if f.info.is_some_and(|i| i.os == "macos") {
                     send_combo(&self.viewer, &[("ControlLeft", "Control"), ("MetaLeft", "Meta")], ("KeyQ", "q"));
                 } else {
                     send_combo(&self.viewer, &[("MetaLeft", "Meta")], ("KeyL", "l"));
                 }
                 Self::flash(w, "ส่งคำสั่งล็อกหน้าจอแล้ว");
+            }
+            if has("restart") && menu_row(ui, Lead::Glyph(Glyph::Power), "รีสตาร์ทเครื่องปลายทาง", "", true).clicked() {
+                w.confirm_restart = true;
+            }
+            menu_separator(ui);
+            if menu_row(ui, Lead::Tick(f.view_only), "ดูอย่างเดียว", "ไม่ส่งเมาส์/คีย์บอร์ด", input).clicked() {
+                self.viewer.set_view_only(!f.view_only);
+                Self::flash(w, if f.view_only { "กลับมาควบคุมได้แล้ว" } else { "โหมดดูอย่างเดียว: ไม่ส่งเมาส์และคีย์บอร์ด" });
+            }
+            if has("block_input")
+                && menu_row(ui, Lead::Tick(f.controls.block_input), "บล็อกเมาส์และคีย์บอร์ดปลายทาง", "", true)
+                    .on_hover_text("คนที่เครื่องปลายทางใช้เมาส์และคีย์บอร์ดไม่ได้ จนกว่าจะปิดหรือจบการเชื่อมต่อ (กด Ctrl+Alt+Shift+Esc ที่เครื่องนั้นเพื่อยกเลิก)")
+                    .clicked()
+            {
+                self.viewer.session_control("block_input", !f.controls.block_input);
+            }
+            if has("privacy")
+                && menu_row(ui, Lead::Tick(f.controls.privacy), "โหมดความเป็นส่วนตัว", "จอปลายทางดำ", true)
+                    .on_hover_text("หน้าจอของเครื่องปลายทางเป็นสีดำสำหรับคนที่อยู่หน้าเครื่อง แต่คุณยังเห็นภาพตามปกติ และบล็อกเมาส์/คีย์บอร์ดของเครื่องนั้นด้วย")
+                    .clicked()
+            {
+                self.viewer.session_control("privacy", !f.controls.privacy);
             }
             if menu_row(ui, Lead::Glyph(Glyph::Refresh), "รีเฟรชภาพ", "", true).clicked() {
                 self.viewer.send(serde_json::json!({"t": "refresh"}));
@@ -1346,7 +1393,7 @@ impl ViewerWindow {
     // -----------------------------------------------------------------------------------------
     // Dialogs (connecting, password, closed)
 
-    fn dialog(&self, ctx: &egui::Context, w: &mut WinUi, phase: &Phase, error: Option<&str>, name: &str) {
+    fn dialog(&self, ctx: &egui::Context, w: &mut WinUi, phase: &Phase, error: Option<&str>, name: &str, reconnect: Option<Reconnect>) {
         egui::Area::new(egui::Id::unique(("dialog", self.viewport)))
             .order(Order::Foreground)
             .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
@@ -1363,6 +1410,31 @@ impl ViewerWindow {
                         ui.spacing_mut().item_spacing.y = 10.0;
                         match phase {
                             Phase::Password => self.password_dialog(ui, w, error, name),
+                            Phase::Reconnecting => {
+                                dialog_title(ui, Glyph::Power, "เครื่องปลายทางกำลังรีสตาร์ท", pal.accent);
+                                let text = match reconnect {
+                                    Some(r) => {
+                                        let left = r.next.saturating_duration_since(Instant::now()).as_secs();
+                                        if left > 0 {
+                                            format!("รอให้ {name} กลับมาออนไลน์ · ลองครั้งที่ {} ใน {left} วินาที", r.attempt)
+                                        } else {
+                                            format!("กำลังเชื่อมต่อกับ {name} อีกครั้ง (ครั้งที่ {})…", r.attempt)
+                                        }
+                                    }
+                                    None => format!("รอให้ {name} กลับมาออนไลน์…"),
+                                };
+                                ui.horizontal(|ui| {
+                                    ui.add(egui::Spinner::new().size(18.0).color(pal.accent));
+                                    ui.label(RichText::new(text).size(14.0).color(pal.fg));
+                                });
+                                ui.label(RichText::new("จะเชื่อมต่อให้อัตโนมัติโดยไม่ต้องใส่รหัสผ่าน (ภายใน 15 นาที)").size(12.5).color(pal.muted));
+                                ui.add_space(6.0);
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if dialog_button(ui, "เลิกรอ", false, true).clicked() {
+                                        self.close_window();
+                                    }
+                                });
+                            }
                             Phase::Closed => {
                                 let failed = error.is_some_and(|e| !e.is_empty());
                                 let title = if failed { "เชื่อมต่อไม่สำเร็จ" } else { "ตัดการเชื่อมต่อแล้ว" };
@@ -1407,6 +1479,68 @@ impl ViewerWindow {
                             }
                         }
                     });
+            });
+    }
+
+    /// "Restart the remote machine?" — it goes away for a minute or two, so ask first.
+    fn restart_dialog(&self, ctx: &egui::Context, w: &mut WinUi, name: &str) {
+        egui::Area::new(egui::Id::unique(("restart-confirm", self.viewport)))
+            .order(Order::Foreground)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                let pal = Palette::of(ui);
+                Frame::new()
+                    .fill(pal.bg)
+                    .corner_radius(12)
+                    .stroke(Stroke::new(1.0, if ui.visuals().dark_mode { pal.line } else { Color32::TRANSPARENT }))
+                    .shadow(Shadow { offset: [0, 8], blur: 28, spread: 0, color: Color32::from_black_alpha(90) })
+                    .inner_margin(Margin { left: 24, right: 24, top: 20, bottom: 20 })
+                    .show(ui, |ui| {
+                        ui.set_width(360.0);
+                        ui.spacing_mut().item_spacing.y = 10.0;
+                        dialog_title(ui, Glyph::Power, "รีสตาร์ทเครื่องปลายทาง?", pal.danger);
+                        let body = format!("{name} จะปิดโปรแกรมทั้งหมดแล้วเริ่มใหม่ งานที่ยังไม่บันทึกอาจหายไป เมื่อเครื่องกลับมาออนไลน์ หน้าต่างนี้จะเชื่อมต่อให้อีกครั้ง");
+                        ui.label(RichText::new(body).size(13.5).color(pal.muted));
+                        ui.add_space(6.0);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if dialog_button(ui, "รีสตาร์ท", true, true).clicked() {
+                                self.viewer.session_control("restart", true);
+                                w.confirm_restart = false;
+                            }
+                            if dialog_button(ui, "ยกเลิก", false, true).clicked() {
+                                w.confirm_restart = false;
+                            }
+                        });
+                    });
+            });
+    }
+
+    /// Chips in the bottom-left corner for the controls in effect on the remote machine.
+    fn control_badges(&self, ctx: &egui::Context, f: &Frame1) {
+        let chips: Vec<&str> = [
+            (f.view_only, "ดูอย่างเดียว"),
+            (f.controls.privacy, "จอปลายทางถูกซ่อน"),
+            (f.controls.block_input && !f.controls.privacy, "บล็อกเมาส์/คีย์บอร์ดปลายทาง"),
+            (f.controls.lock_after, "ล็อกเมื่อจบ"),
+        ]
+        .into_iter()
+        .filter_map(|(on, t)| on.then_some(t))
+        .collect();
+        if chips.is_empty() {
+            return;
+        }
+        egui::Area::new(egui::Id::unique(("controls", self.viewport)))
+            .order(Order::Middle)
+            .interactable(false)
+            .anchor(Align2::LEFT_BOTTOM, [12.0, -12.0])
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    for c in chips {
+                        Frame::new().fill(Color32::from_black_alpha(175)).corner_radius(12).inner_margin(Margin::symmetric(10, 4)).show(ui, |ui| {
+                            ui.label(RichText::new(c).font(semi(12.5)).color(Color32::WHITE));
+                        });
+                    }
+                });
             });
     }
 
@@ -1772,6 +1906,7 @@ enum Glyph {
     Mic,
     MicOff,
     Swap,
+    Power,
     Camera,
     /// A window with an arrow out of it (open in a new window).
     PopOut,
@@ -1837,6 +1972,10 @@ fn glyph(ui: &Ui, rect: Rect, g: Glyph, color: Color32) {
         }
         Glyph::ChevronDown => {
             line(&[(3.5, 5.8), (8.0, 10.3), (12.5, 5.8)]);
+        }
+        Glyph::Power => {
+            p.add(Shape::line(arc(at(8.0, 8.8), 5.6 * s, -0.17 * TAU, 0.67 * TAU), st));
+            line(&[(8.0, 1.6), (8.0, 7.6)]);
         }
         Glyph::Lock => {
             p.rect_filled(Rect::from_min_max(at(2.8, 7.0), at(13.2, 14.6)), 2.0 * s, color);

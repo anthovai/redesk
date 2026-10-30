@@ -153,6 +153,20 @@ pub struct Config {
     /// Let viewers change this machine's display resolution (restored when the session ends).
     #[serde(default = "yes")]
     pub allow_resolution: bool,
+    /// Let viewers block the keyboard and mouse of this machine during their session (also
+    /// needs `allow_input`; macOS and Windows).
+    #[serde(default = "yes")]
+    pub allow_block_input: bool,
+    /// Let viewers black out this screen for people at the machine while they still see it
+    /// (also needs `allow_input`; Windows 10 2004+, and macOS with the desktop app).
+    #[serde(default = "yes")]
+    pub allow_privacy_mode: bool,
+    /// Let viewers lock this machine, now or when their session ends.
+    #[serde(default = "yes")]
+    pub allow_lock: bool,
+    /// Let viewers restart this machine (macOS and Windows).
+    #[serde(default = "yes")]
+    pub allow_restart: bool,
     /// Allow direct sessions (LAN/TCP and P2P over UDP hole punching). False = always through
     /// the server relay (enterprise policy). Applies to both incoming and outgoing sessions.
     #[serde(default = "yes")]
@@ -219,6 +233,10 @@ impl Config {
             unlock_pin: None,
             allow_whiteboard: true,
             allow_resolution: true,
+            allow_block_input: true,
+            allow_privacy_mode: true,
+            allow_lock: true,
+            allow_restart: true,
             direct_enabled: true,
             direct_port: crate::direct::DEFAULT_PORT,
             proxy: None,

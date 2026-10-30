@@ -1073,6 +1073,7 @@ impl App {
                 kill: Default::default(),
                 recording: view == "home" && std::env::var_os("AEGIRON_UI_DEMO_RECORDING").is_some(),
                 link: crate::status::SessionLink::none(),
+                controls: Default::default(),
                 purpose: String::new(),
             });
             if std::env::var_os("AEGIRON_UI_DEMO_WHITEBOARD").is_some() {
