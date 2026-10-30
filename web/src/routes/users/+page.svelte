@@ -104,8 +104,8 @@
 						<p class="font-medium">{u.name || '—'}</p>
 						<p class="text-xs text-muted">{u.email}</p>
 					</td>
-					<td>{u.role === 'admin' ? 'ผู้ดูแลระบบ' : 'ผู้ใช้'}</td>
-					<td>{#if u.totp_enabled}<span class="text-ok">เปิด</span>{:else}<span class="text-muted">ปิด</span>{/if}</td>
+					<td>{u.role === 'admin' ? 'ผู้ดูแลระบบ' : 'ผู้ใช้'}{#if u.auth_source === 'ldap'} <span class="badge" title="รหัสผ่านตรวจที่ LDAP / Active Directory">LDAP</span>{/if}</td>
+					<td>{#if u.totp_enabled}<span class="text-ok">แอป</span>{:else if u.email_otp}<span class="text-ok">อีเมล</span>{:else}<span class="text-muted">ปิด</span>{/if}</td>
 					<td class="text-muted">{ago(u.last_login_at)}</td>
 					<td>{u.disabled ? 'ระงับ' : 'ใช้งาน'}</td>
 					<td class="text-right">
@@ -177,7 +177,7 @@
 				{/if}
 			</div>
 			<div class="flex flex-wrap justify-between gap-2 border-t border-line pt-4">
-				<button type="button" class="btn" disabled={!editing.u.totp_enabled} onclick={() => resetTotp(editing!.u)}>รีเซ็ต 2FA</button>
+				<button type="button" class="btn" disabled={!editing.u.totp_enabled && !editing.u.email_otp} onclick={() => resetTotp(editing!.u)}>รีเซ็ต 2FA</button>
 				<div class="flex gap-2"><button type="button" class="btn" onclick={() => (editing = null)}>ยกเลิก</button><button class="btn btn-primary">บันทึก</button></div>
 			</div>
 		</form>

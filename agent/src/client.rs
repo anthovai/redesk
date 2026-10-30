@@ -38,7 +38,8 @@ impl Target {
             server: c.server_url.clone(),
             token: acc.token,
             insecure: c.allow_insecure_transport,
-            device_id: device_id.replace(' ', ""),
+            // "123 456 789" or a custom ID in any case (see valid_device_id); the server checks it.
+            device_id: crate::local::normalize_id(device_id).unwrap_or_else(|| device_id.replace(' ', "")),
             direct: c.direct_enabled,
         })
     }

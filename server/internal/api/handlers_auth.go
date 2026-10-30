@@ -19,6 +19,9 @@ func (a *API) serverInfo(w http.ResponseWriter, r *http.Request) {
 	if o, err := a.oidcEnabled(r.Context()); err == nil && o != nil {
 		oidcInfo = map[string]any{"enabled": true, "name": o.Name}
 	}
+	// With LDAP the sign-in name may be a directory user name instead of an email.
+	l, _ := a.ldapEnabled(r.Context())
+	mailCfg, _, _ := a.mailConfig(r.Context())
 	writeJSON(w, http.StatusOK, map[string]any{
 		"oidc":           oidcInfo,
 		"name":           "Aegiron",
@@ -26,6 +29,8 @@ func (a *API) serverInfo(w http.ResponseWriter, r *http.Request) {
 		"public_key":     auth.PublicKeyB64(a.key),
 		"require_enroll": st.RequireEnroll,
 		"gateway":        a.cfg.GuacdAddr != "",
+		"ldap":           l != nil,
+		"email_otp":      mailCfg != nil,
 	})
 }
 
@@ -109,6 +114,10 @@ func (a *API) changePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u := userFrom(r)
+	if u.AuthSource == "ldap" {
+		writeErr(w, http.StatusConflict, "this account's password is managed by the directory (LDAP)")
+		return
+	}
 	if !auth.VerifyPassword(u.PasswordHash, req.Current) {
 		writeErr(w, http.StatusUnauthorized, "current password is incorrect")
 		return
@@ -180,7 +189,7 @@ func (a *API) totpDisable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u := userFrom(r)
-	if !auth.VerifyPassword(u.PasswordHash, req.Password) {
+	if !a.verifyOwnPassword(r.Context(), u, req.Password) {
 		writeErr(w, http.StatusUnauthorized, "password is incorrect")
 		return
 	}

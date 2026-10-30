@@ -214,7 +214,7 @@ pub async fn handle_wol(agent: Arc<Agent>, macs: Vec<String>, target: Option<Str
     let p = parsed.clone();
     let sent = tokio::task::spawn_blocking(move || wake(&p)).await.unwrap_or(0);
     tracing::info!("wake-on-lan: {sent} packets for {list}");
-    let target = target.filter(|t| t.len() == 9 && t.bytes().all(|c| c.is_ascii_digit())).unwrap_or_default();
+    let target = target.filter(|t| crate::valid_device_id(t)).unwrap_or_default();
     agent.report("", "wol_sent", json!({"macs": list, "packets": sent, "target": target}));
 }
 
@@ -231,7 +231,7 @@ pub fn parse_reply(p: &[u8], from: IpAddr) -> Option<LanPeer> {
         return None;
     }
     let mut peer: LanPeer = serde_json::from_slice(p).ok()?;
-    if peer.id.len() != 9 || !peer.id.bytes().all(|c| c.is_ascii_digit()) {
+    if !crate::valid_device_id(&peer.id) {
         return None;
     }
     if peer.hostname.len() > 128 || peer.os.len() > 64 {

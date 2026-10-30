@@ -196,6 +196,8 @@ pub async fn run(
         })
     };
     let mut ctl = controls::SessionCtl::new(perms, platform, report, &agent.config_path, &viewer.email, None);
+    // This machine's own "lock after session" (Settings, CLI or the organisation's strategy).
+    ctl.host_lock_after = agent.config.lock().unwrap().lock_after_session;
     let mut escapes = controls::escape_signal();
 
     let kill = Arc::new(tokio::sync::Notify::new());

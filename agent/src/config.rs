@@ -77,6 +77,91 @@ pub struct TrustedLogin {
     pub token: String,
 }
 
+/// An organisation strategy received from the server: settings the administrator manages for
+/// this device. `None` fields are not managed (the local value applies and may be changed).
+/// Applied over the local settings whenever it arrives and after every local change, so the
+/// app, the CLI and sessions all see the managed values.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Policy {
+    #[serde(default)]
+    pub id: i64,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub settings: PolicySettings,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicySettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approve_mode: Option<ApproveMode>,
+    /// false: one-time passwords only (a permanent password is neither accepted nor settable).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_permanent_password: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_input: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_clipboard: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_file_transfer: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_audio: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_whiteboard: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_resolution: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_block_input: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_privacy_mode: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_lock: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_restart: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_tunnel: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_tunnel_lan: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_terminal: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lan_discovery: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_after_session: Option<bool>,
+    /// Enforced by the server (sessions are recorded); shown for information only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_sessions: Option<bool>,
+}
+
+/// Settings a strategy can manage, by their config / CLI names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Managed {
+    ApproveMode,
+    Verification,
+    PermanentPassword,
+    AllowInput,
+    AllowClipboard,
+    AllowFileTransfer,
+    AllowAudio,
+    AllowWhiteboard,
+    AllowResolution,
+    AllowBlockInput,
+    AllowPrivacyMode,
+    AllowLock,
+    AllowRestart,
+    AllowTunnel,
+    AllowTunnelLan,
+    AllowTerminal,
+    DirectEnabled,
+    LanDiscovery,
+    LockAfterSession,
+}
+
+/// Shown next to settings a strategy manages (app) and in CLI refusals.
+pub const MANAGED_TEXT: &str = "จัดการโดยองค์กรของคุณ";
+
 /// Transport policy for talking to the server: https, or plain http only to this machine
 /// (or when explicitly allowed). Never falls back silently.
 pub fn check_server_url(url: &str, allow_insecure: bool) -> Result<()> {
@@ -188,6 +273,15 @@ pub struct Config {
     /// owner-only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trusted_logins: Vec<TrustedLogin>,
+    /// Lock this machine's screen whenever a remote session ends (strategy key of the same
+    /// name). Done by the session controls (controls::SessionCtl), like a viewer's
+    /// "lock after session", but without needing `allow_lock`.
+    #[serde(default)]
+    pub lock_after_session: bool,
+    /// The organisation's strategy for this device, as last received from the server (kept so
+    /// it also applies while offline). None = no strategy: every setting is local.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed: Option<Policy>,
 }
 
 fn yes() -> bool {
@@ -240,7 +334,96 @@ impl Config {
             allow_tunnel_lan: false,
             allow_terminal: false,
             trusted_logins: Vec::new(),
+            lock_after_session: false,
+            managed: None,
         })
+    }
+
+    /// Whether the organisation's strategy manages this setting.
+    pub fn is_managed(&self, what: Managed) -> bool {
+        let Some(p) = &self.managed else { return false };
+        let s = &p.settings;
+        match what {
+            Managed::ApproveMode => s.approve_mode.is_some(),
+            // One-time passwords only: the accepted password kind is fixed too.
+            Managed::Verification | Managed::PermanentPassword => s.allow_permanent_password == Some(false),
+            Managed::AllowInput => s.allow_input.is_some(),
+            Managed::AllowClipboard => s.allow_clipboard.is_some(),
+            Managed::AllowFileTransfer => s.allow_file_transfer.is_some(),
+            Managed::AllowAudio => s.allow_audio.is_some(),
+            Managed::AllowWhiteboard => s.allow_whiteboard.is_some(),
+            Managed::AllowResolution => s.allow_resolution.is_some(),
+            Managed::AllowBlockInput => s.allow_block_input.is_some(),
+            Managed::AllowPrivacyMode => s.allow_privacy_mode.is_some(),
+            Managed::AllowLock => s.allow_lock.is_some(),
+            Managed::AllowRestart => s.allow_restart.is_some(),
+            Managed::AllowTunnel => s.allow_tunnel.is_some(),
+            Managed::AllowTunnelLan => s.allow_tunnel_lan.is_some(),
+            Managed::AllowTerminal => s.allow_terminal.is_some(),
+            Managed::DirectEnabled => s.direct_enabled.is_some(),
+            Managed::LanDiscovery => s.lan_discovery.is_some(),
+            Managed::LockAfterSession => s.lock_after_session.is_some(),
+        }
+    }
+
+    /// Writes the managed values over the local ones. Returns true when something changed.
+    pub fn apply_policy(&mut self) -> bool {
+        let Some(p) = self.managed.clone() else { return false };
+        let before = (
+            self.approve_mode,
+            self.verification,
+            self.permanent_password.clone(),
+            (self.allow_input, self.allow_clipboard, self.allow_file_transfer, self.allow_audio, self.allow_whiteboard),
+            (self.direct_enabled, self.lan_discovery, self.lock_after_session),
+            (self.allow_resolution, self.allow_tunnel, self.allow_tunnel_lan, self.allow_terminal),
+            (self.allow_block_input, self.allow_privacy_mode, self.allow_lock, self.allow_restart),
+        );
+        let s = &p.settings;
+        fn set<T: Copy>(dst: &mut T, v: Option<T>) {
+            if let Some(v) = v {
+                *dst = v;
+            }
+        }
+        set(&mut self.approve_mode, s.approve_mode);
+        if s.allow_permanent_password == Some(false) {
+            self.verification = Verification::Temporary;
+            self.permanent_password = None;
+        }
+        set(&mut self.allow_input, s.allow_input);
+        set(&mut self.allow_clipboard, s.allow_clipboard);
+        set(&mut self.allow_file_transfer, s.allow_file_transfer);
+        set(&mut self.allow_audio, s.allow_audio);
+        set(&mut self.allow_whiteboard, s.allow_whiteboard);
+        set(&mut self.allow_resolution, s.allow_resolution);
+        set(&mut self.allow_block_input, s.allow_block_input);
+        set(&mut self.allow_privacy_mode, s.allow_privacy_mode);
+        set(&mut self.allow_lock, s.allow_lock);
+        set(&mut self.allow_restart, s.allow_restart);
+        set(&mut self.allow_tunnel, s.allow_tunnel);
+        set(&mut self.allow_tunnel_lan, s.allow_tunnel_lan);
+        set(&mut self.allow_terminal, s.allow_terminal);
+        set(&mut self.direct_enabled, s.direct_enabled);
+        set(&mut self.lan_discovery, s.lan_discovery);
+        set(&mut self.lock_after_session, s.lock_after_session);
+        let after = (
+            self.approve_mode,
+            self.verification,
+            self.permanent_password.clone(),
+            (self.allow_input, self.allow_clipboard, self.allow_file_transfer, self.allow_audio, self.allow_whiteboard),
+            (self.direct_enabled, self.lan_discovery, self.lock_after_session),
+            (self.allow_resolution, self.allow_tunnel, self.allow_tunnel_lan, self.allow_terminal),
+            (self.allow_block_input, self.allow_privacy_mode, self.allow_lock, self.allow_restart),
+        );
+        before != after
+    }
+
+    /// Takes a strategy from the server (None = the device has none) and applies it. Returns
+    /// true when the config changed and should be saved. Settings stay as they were when a
+    /// strategy is removed, but become editable again.
+    pub fn set_policy(&mut self, policy: Option<Policy>) -> bool {
+        let changed = self.managed != policy;
+        self.managed = policy;
+        self.apply_policy() || changed
     }
 
     pub fn default_path() -> PathBuf {
@@ -252,7 +435,9 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let s = std::fs::read_to_string(path)
             .with_context(|| format!("cannot read {} (run `aegiron-agent init` first)", path.display()))?;
-        let c: Self = toml::from_str(&s).context("invalid agent config")?;
+        let mut c: Self = toml::from_str(&s).context("invalid agent config")?;
+        // A file edited by hand cannot loosen what the organisation manages.
+        c.apply_policy();
         crate::net::set_proxy(c.proxy.clone());
         Ok(c)
     }
@@ -345,6 +530,45 @@ mod tests {
         c.set_trust_token("https://a.example", "me@example.com", None);
         assert_eq!(c.trust_token("https://a.example", "me@example.com"), None);
         assert_eq!(c.trust_token("https://a.example", "other@example.com").as_deref(), Some("t2"));
+    }
+
+    #[test]
+    fn policy_locks_and_releases() {
+        let mut c = Config::new("https://a.example".into(), B64.encode([7u8; 32])).unwrap();
+        c.permanent_password = Some("hash".into());
+        c.verification = Verification::Both;
+        let p: Policy = serde_json::from_str(
+            r#"{"id":3,"name":"Kiosk","settings":{"allow_restart":false,"allow_terminal":false,"allow_tunnel":true,"approve_mode":"click","allow_file_transfer":false,"allow_permanent_password":false,"direct_enabled":false,"lock_after_session":true,"record_sessions":true}}"#,
+        )
+        .unwrap();
+        assert!(c.set_policy(Some(p.clone())));
+        assert_eq!(c.approve_mode, ApproveMode::Click);
+        assert!(!c.allow_file_transfer && !c.direct_enabled && c.lock_after_session);
+        assert_eq!((c.verification, c.permanent_password.as_deref()), (Verification::Temporary, None));
+        assert!(c.is_managed(Managed::AllowFileTransfer) && c.is_managed(Managed::PermanentPassword));
+        assert!(!c.is_managed(Managed::AllowInput) && c.allow_input);
+        assert!(!c.allow_restart && c.is_managed(Managed::AllowRestart) && !c.is_managed(Managed::AllowLock));
+        assert!(c.allow_tunnel && !c.allow_terminal && c.is_managed(Managed::AllowTerminal) && !c.is_managed(Managed::AllowTunnelLan));
+        // Same policy again: nothing to save.
+        assert!(!c.set_policy(Some(p)));
+        // A local change to a managed setting is undone; unmanaged ones stay.
+        c.allow_file_transfer = true;
+        c.allow_input = false;
+        assert!(c.apply_policy());
+        assert!(!c.allow_file_transfer && !c.allow_input);
+        // Survives a save/load round trip, including a hand edit of the file.
+        let text = toml::to_string_pretty(&c).unwrap().replacen("allow_file_transfer = false", "allow_file_transfer = true", 1);
+        let mut back: Config = toml::from_str(&text).unwrap();
+        back.apply_policy();
+        assert!(!back.allow_file_transfer && back.managed.as_ref().unwrap().name == "Kiosk");
+        // Removed: values stay, nothing is managed any more.
+        assert!(c.set_policy(None));
+        assert!(!c.allow_file_transfer && !c.is_managed(Managed::AllowFileTransfer));
+        // Configs without the new fields still load.
+        let old = toml::to_string_pretty(&Config::new("https://a.example".into(), B64.encode([7u8; 32])).unwrap()).unwrap();
+        let old = old.lines().filter(|l| !l.starts_with("lock_after_session")).collect::<Vec<_>>().join("\n");
+        let c: Config = toml::from_str(&old).unwrap();
+        assert!(c.managed.is_none() && !c.lock_after_session);
     }
 
     #[test]

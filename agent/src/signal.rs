@@ -83,6 +83,47 @@ impl Agent {
         }
     }
 
+    /// Takes the organisation's strategy from the server (None = none) and saves it when it
+    /// changed anything.
+    pub fn set_policy(&self, policy: Option<crate::config::Policy>) {
+        let changed = {
+            let mut c = self.config.lock().unwrap();
+            let changed = c.set_policy(policy);
+            if changed && let Err(e) = c.save(&self.config_path) {
+                tracing::warn!("cannot save the organisation's strategy: {e:#}");
+            }
+            changed
+        };
+        if changed {
+            let c = self.config.lock().unwrap();
+            match &c.managed {
+                Some(p) => tracing::info!("organisation strategy \"{}\" applied", p.name),
+                None => tracing::info!("organisation strategy removed"),
+            }
+            drop(c);
+            self.changed();
+        }
+    }
+
+    /// An administrator changed this device's ID: use the new one from now on (the key stays).
+    /// Returns false for an ID this agent would not accept.
+    pub fn adopt_id(&self, id: &str) -> Result<bool> {
+        if !crate::valid_device_id(id) {
+            tracing::warn!("ignoring invalid new device id from server");
+            return Ok(false);
+        }
+        let mut c = self.config.lock().unwrap();
+        if c.id == id {
+            return Ok(false);
+        }
+        tracing::info!("device id changed by the administrator: {} -> {id}", c.id);
+        c.id = id.to_string();
+        c.save(&self.config_path)?;
+        drop(c);
+        self.changed();
+        Ok(true)
+    }
+
     /// Reports a session event for the server's audit log.
     pub fn report(&self, sid: &str, kind: &str, detail: serde_json::Value) {
         self.send_server(json!({"t": "event", "sid": sid, "kind": kind, "detail": detail}));
@@ -111,9 +152,27 @@ enum ServerMsg {
         /// UDP port of the server's NAT probe / P2P rendezvous (absent on older servers).
         #[serde(default)]
         udp_port: Option<u16>,
+        /// The organisation's strategy for this device (null or absent = none).
+        #[serde(default)]
+        policy: Option<crate::config::Policy>,
     },
     #[serde(rename = "error")]
-    Error { code: String, message: String },
+    Error {
+        code: String,
+        message: String,
+        /// With code "id_changed": the ID an administrator gave this device.
+        #[serde(default)]
+        id: Option<String>,
+    },
+    /// The strategy changed while connected (null = removed).
+    #[serde(rename = "policy")]
+    Policy {
+        #[serde(default)]
+        policy: Option<crate::config::Policy>,
+    },
+    /// An administrator changed this device's ID; reconnect with the new one.
+    #[serde(rename = "id_changed")]
+    IdChanged { id: String },
     #[serde(rename = "pong")]
     Pong,
     #[serde(rename = "session")]
@@ -235,18 +294,26 @@ async fn run_once(agent: &Arc<Agent>) -> Result<()> {
     tx.send(Message::Text(reg.to_string().into())).await?;
 
     match next_msg(&mut rx).await? {
-        ServerMsg::Registered { sig, udp_port } => {
+        ServerMsg::Registered { sig, udp_port, policy } => {
             let sig: [u8; 64] = B64.decode(sig)?.try_into().map_err(|_| anyhow!("bad server signature"))?;
             let msg = format!("redesk-server-v1\n{id}\n{my_nonce}\n{server_nonce}");
             server_key
                 .verify(msg.as_bytes(), &Signature::from_bytes(&sig))
                 .map_err(|_| anyhow!("Handshake failed: invalid public key from server (pinned key mismatch)"))?;
+            // Only after the server proved its identity.
+            agent.set_policy(policy);
             if let Some(port) = udp_port.filter(|p| *p > 0 && direct) {
                 let server_url = agent.config.lock().unwrap().server_url.clone();
                 tokio::spawn(crate::direct::probe_and_store(server_url, port));
             }
         }
-        ServerMsg::Error { code, message } => {
+        ServerMsg::Error { code, id: Some(new_id), .. } if code == "id_changed" => {
+            // Arrives over the server's TLS; the server only sends it to the key bound to the old
+            // ID, and the device keeps that key under the new ID.
+            agent.adopt_id(&new_id)?;
+            bail!("device id changed to {new_id}; reconnecting");
+        }
+        ServerMsg::Error { code, message, .. } => {
             let mut c = agent.config.lock().unwrap();
             if code == "id_taken" && !c.registered {
                 // Collision on a never-registered id: pick a new one and retry.
@@ -304,6 +371,12 @@ async fn run_once(agent: &Arc<Agent>) -> Result<()> {
                     }
                     Some(ServerMsg::Wol { macs, target }) => {
                         tokio::spawn(crate::lan::handle_wol(agent.clone(), macs, target));
+                    }
+                    Some(ServerMsg::Policy { policy }) => agent.set_policy(policy),
+                    Some(ServerMsg::IdChanged { id }) => {
+                        if agent.adopt_id(&id)? {
+                            return Err(anyhow!("device id changed to {id}; reconnecting"));
+                        }
                     }
                     Some(ServerMsg::Pong) | None => {}
                     Some(other) => tracing::debug!("ignoring {other:?}"),

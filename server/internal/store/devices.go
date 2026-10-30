@@ -28,6 +28,8 @@ type Device struct {
 	CreatedAt    time.Time  `json:"created_at"`
 	GroupID      *int64     `json:"group_id"`
 	OwnerID      *int64     `json:"owner_id"`
+	// StrategyID is the device's own strategy (nil = its group's, if any).
+	StrategyID *int64 `json:"strategy_id"`
 	// LAN facts from the agent (admin-only in API responses; cleared for other users).
 	Macs []string  `json:"macs,omitempty"`
 	LAN  []LanAddr `json:"lan,omitempty"`
@@ -39,11 +41,11 @@ type LanAddr struct {
 	Prefix int    `json:"prefix"`
 }
 
-const deviceCols = `id, public_key, hostname, os, agent_version, last_ip, last_seen_at, alias, note, disabled, created_at, group_id, owner_id, macs, lan`
+const deviceCols = `id, public_key, hostname, os, agent_version, last_ip, last_seen_at, alias, note, disabled, created_at, group_id, owner_id, macs, lan, strategy_id`
 
 func scanDevice(r scanner) (*Device, error) {
 	var d Device
-	err := r.Scan(&d.ID, &d.PublicKey, &d.Hostname, &d.OS, &d.AgentVersion, &d.LastIP, &d.LastSeenAt, &d.Alias, &d.Note, &d.Disabled, &d.CreatedAt, &d.GroupID, &d.OwnerID, &d.Macs, &d.LAN)
+	err := r.Scan(&d.ID, &d.PublicKey, &d.Hostname, &d.OS, &d.AgentVersion, &d.LastIP, &d.LastSeenAt, &d.Alias, &d.Note, &d.Disabled, &d.CreatedAt, &d.GroupID, &d.OwnerID, &d.Macs, &d.LAN, &d.StrategyID)
 	if err != nil {
 		return nil, notFound(err)
 	}
@@ -127,11 +129,66 @@ func (s *Store) queryDevices(ctx context.Context, sql string, args ...any) ([]*D
 	return out, rows.Err()
 }
 
-func (s *Store) UpdateDevice(ctx context.Context, id, alias, note string, disabled bool, groupID *int64) error {
-	tag, err := s.DB.Exec(ctx, `UPDATE devices SET alias=$2, note=$3, disabled=$4, group_id=$5 WHERE id=$1`, id, alias, note, disabled, groupID)
+func (s *Store) UpdateDevice(ctx context.Context, id, alias, note string, disabled bool, groupID, strategyID *int64) error {
+	tag, err := s.DB.Exec(ctx, `UPDATE devices SET alias=$2, note=$3, disabled=$4, group_id=$5, strategy_id=$6 WHERE id=$1`, id, alias, note, disabled, groupID, strategyID)
 	if err == nil && tag.RowsAffected() == 0 {
 		return ErrNotFound
 	}
+	return err
+}
+
+// ErrIDTaken: the requested device id belongs to another device or is still reserved by a
+// pending id change of another device.
+var ErrIDTaken = errors.New("device id is taken")
+
+// ChangeDeviceID renames a device. History (address books, sessions, recordings) follows the
+// device; the old id is kept in device_id_changes until the agent registers with the new one.
+func (s *Store) ChangeDeviceID(ctx context.Context, oldID, newID string, by int64) error {
+	return pgx.BeginFunc(ctx, s.DB, func(tx pgx.Tx) error {
+		var taken bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM devices WHERE id=$1) OR EXISTS(SELECT 1 FROM device_id_changes WHERE old_id=$1 AND device_id<>$2)`,
+			newID, oldID).Scan(&taken); err != nil {
+			return err
+		}
+		if taken {
+			return ErrIDTaken
+		}
+		tag, err := tx.Exec(ctx, `UPDATE devices SET id=$2 WHERE id=$1`, oldID, newID)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrNotFound
+		}
+		// Changing back to an earlier id: that id is the device's again, not a redirect.
+		if _, err := tx.Exec(ctx, `DELETE FROM device_id_changes WHERE old_id=$1`, newID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO device_id_changes(old_id, device_id, changed_by) VALUES ($1,$2,$3)`, oldID, newID, by); err != nil {
+			return err
+		}
+		for _, q := range []string{
+			`UPDATE address_book SET device_id=$2 WHERE device_id=$1 AND NOT EXISTS (SELECT 1 FROM address_book b WHERE b.user_id=address_book.user_id AND b.device_id=$2)`,
+			`UPDATE address_book_entries SET device_id=$2 WHERE device_id=$1 AND NOT EXISTS (SELECT 1 FROM address_book_entries b WHERE b.book_id=address_book_entries.book_id AND b.device_id=$2)`,
+			`UPDATE remote_sessions SET device_id=$2 WHERE device_id=$1`,
+			`UPDATE session_recordings SET device_id=$2 WHERE device_id=$1`,
+		} {
+			if _, err := tx.Exec(ctx, q, oldID, newID); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// RenamedDevice returns the device an old id was changed to (ErrNotFound if none).
+func (s *Store) RenamedDevice(ctx context.Context, oldID string) (*Device, error) {
+	return scanDevice(s.DB.QueryRow(ctx, `SELECT `+prefixed("d.", deviceCols)+` FROM device_id_changes c JOIN devices d ON d.id=c.device_id WHERE c.old_id=$1`, oldID))
+}
+
+// ConfirmDeviceID forgets the old ids of a device once its agent registered with the new one.
+func (s *Store) ConfirmDeviceID(ctx context.Context, id string) error {
+	_, err := s.DB.Exec(ctx, `DELETE FROM device_id_changes WHERE device_id=$1`, id)
 	return err
 }
 

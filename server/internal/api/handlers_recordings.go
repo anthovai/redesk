@@ -57,9 +57,16 @@ func (a *API) recordingApplies(ctx context.Context, deviceID string) (bool, erro
 		if err != nil {
 			return false, err
 		}
-		return d.GroupID != nil && slices.Contains(st.GroupIDs, *d.GroupID), nil
+		if d.GroupID != nil && slices.Contains(st.GroupIDs, *d.GroupID) {
+			return true, nil
+		}
 	}
-	return false, nil
+	// A strategy can require recording for its devices whatever the server-wide mode.
+	strat, err := a.store.EffectiveStrategy(ctx, deviceID)
+	if err != nil {
+		return false, err
+	}
+	return strat != nil && strat.Settings.RecordSessions != nil && *strat.Settings.RecordSessions, nil
 }
 
 // recordingToken is the hub hook: decides by policy whether to record a new session.
