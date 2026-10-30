@@ -67,7 +67,7 @@ pass "aegiron.desktop valid and registered for aegiron://"
 # hands it over through the instance socket and exits.
 export XDG_RUNTIME_DIR="$(mktemp -d)"
 CFG="$(mktemp -d)/agent.toml"
-Xvfb :97 -screen 0 1280x720x24 >/dev/null 2>&1 &
+Xvfb :97 -screen 0 1280x720x24 -noreset >/dev/null 2>&1 &
 XVFB=$!
 sleep 2
 DISPLAY=:97 "$BIN/aegiron" --config "$CFG" &

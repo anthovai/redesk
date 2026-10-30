@@ -64,8 +64,24 @@ fn be16(b: &[u8]) -> usize {
     u16::from_be_bytes([b[0], b[1]]) as usize
 }
 
-fn assert_reddish(px: &[u8], what: &str) {
-    assert!(px[0] > 180 && px[1] < 70 && px[2] < 70, "{what}: expected red, got {:?}", &px[..3]);
+fn reddish(px: &[u8]) -> bool {
+    px[0] > 180 && px[1] < 70 && px[2] < 70
+}
+
+/// Paints the screen red and captures until the frame shows it (the X server repaints the
+/// root window asynchronously). `check` returns the center pixel of a captured frame.
+fn capture_red(codec: Codec, check: impl Fn(&[u8]) -> Vec<u8>, what: &str) -> Vec<u8> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        paint_screen("#ff0000");
+        std::thread::sleep(Duration::from_millis(200));
+        let m = first_frame(codec);
+        let px = check(&m);
+        if reddish(&px) {
+            return m;
+        }
+        assert!(Instant::now() < deadline, "{what}: expected a red screen, center pixel is {:?}", &px[..3]);
+    }
 }
 
 #[test]
@@ -80,21 +96,28 @@ fn x11_capture_jpeg_and_h264() {
     let g = capture::geometry(0).unwrap();
     assert_eq!((g.width as usize, g.height as usize), (w, h));
 
-    paint_screen("#ff0000");
-
     // JPEG: one full-screen rectangle at first.
-    let m = first_frame(Codec::Jpeg);
-    assert_eq!(m[0], proto::MSG_FRAME);
+    let jpeg_center = |m: &[u8]| -> Vec<u8> {
+        assert_eq!(m[0], proto::MSG_FRAME);
+        let img = image::load_from_memory_with_format(&m[9..], image::ImageFormat::Jpeg).unwrap().to_rgb8();
+        img.get_pixel(img.width() / 2, img.height() / 2).0.to_vec()
+    };
+    let m = capture_red(Codec::Jpeg, jpeg_center, "jpeg");
     let (x, y, fw, fh) = (be16(&m[1..]), be16(&m[3..]), be16(&m[5..]), be16(&m[7..]));
     assert_eq!((x, y), (0, 0));
     assert_eq!((fw, fh), (w, h), "frame size");
     let img = image::load_from_memory_with_format(&m[9..], image::ImageFormat::Jpeg).unwrap().to_rgb8();
     assert_eq!((img.width() as usize, img.height() as usize), (w, h));
-    assert_reddish(&img.get_pixel(w as u32 / 2, h as u32 / 2).0, "jpeg");
 
     // H.264 (OpenH264): a keyframe that decodes to the same picture.
-    let m = first_frame(Codec::H264);
-    assert_eq!(m[0], proto::MSG_VIDEO);
+    let h264_center = |m: &[u8]| -> Vec<u8> {
+        assert_eq!(m[0], proto::MSG_VIDEO);
+        let mut dec = H264Decoder::new().unwrap();
+        let (dw, dh, rgba) = dec.decode(&m[7..]).unwrap().expect("a picture from the keyframe");
+        let c = (dh / 2 * dw + dw / 2) * 4;
+        rgba[c..c + 4].to_vec()
+    };
+    let m = capture_red(Codec::H264, h264_center, "h264");
     assert_eq!(m[1], Codec::H264.id());
     assert_eq!(m[2] & proto::VIDEO_KEYFRAME, proto::VIDEO_KEYFRAME, "first video frame is a keyframe");
     let (vw, vh) = (be16(&m[3..]), be16(&m[5..]));
@@ -102,8 +125,7 @@ fn x11_capture_jpeg_and_h264() {
     let mut dec = H264Decoder::new().unwrap();
     let (dw, dh, rgba) = dec.decode(&m[7..]).unwrap().expect("a picture from the keyframe");
     assert_eq!((dw, dh), (vw, vh));
-    let c = (dh / 2 * dw + dw / 2) * 4;
-    assert_reddish(&rgba[c..c + 4], "h264");
+    assert!(reddish(&rgba[(dh / 2 * dw + dw / 2) * 4..]));
 
     paint_screen("#000000");
 }

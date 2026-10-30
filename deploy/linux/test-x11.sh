@@ -9,12 +9,15 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-export DISPLAY="${TEST_DISPLAY:-:99}"
-Xvfb "$DISPLAY" -screen 0 1280x720x24 -nolisten tcp >/tmp/aegiron-xvfb.log 2>&1 &
+# Our own server on an unusual display number; -noreset keeps the root window (painted by the
+# tests with xsetroot) when the last client disconnects.
+export DISPLAY="${TEST_DISPLAY:-:87}"
+Xvfb "$DISPLAY" -screen 0 1280x720x24 -nolisten tcp -noreset >/tmp/aegiron-xvfb.log 2>&1 &
 XVFB=$!
 trap 'kill $XVFB 2>/dev/null || true; pulseaudio --kill 2>/dev/null || true' EXIT
 for _ in $(seq 50); do xdpyinfo >/dev/null 2>&1 && break; sleep 0.1; done
-xdpyinfo | grep dimensions
+kill -0 $XVFB 2>/dev/null || { cat /tmp/aegiron-xvfb.log; echo "Xvfb did not start" >&2; exit 1; }
+xdpyinfo | grep -E 'dimensions|depths'
 
 # PulseAudio for the current user (as root in a container it only warns).
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-$(mktemp -d)}"
