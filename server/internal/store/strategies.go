@@ -19,8 +19,10 @@ type StrategySettings struct {
 	AllowClipboard         *bool `json:"allow_clipboard,omitempty"`
 	AllowFileTransfer      *bool `json:"allow_file_transfer,omitempty"`
 	AllowAudio             *bool `json:"allow_audio,omitempty"`
-	AllowWhiteboard        *bool `json:"allow_whiteboard,omitempty"`
-	AllowResolution        *bool `json:"allow_resolution,omitempty"`
+	// AllowVoice: viewers may ask for voice calls (each call is still answered on the device).
+	AllowVoice      *bool `json:"allow_voice,omitempty"`
+	AllowWhiteboard *bool `json:"allow_whiteboard,omitempty"`
+	AllowResolution *bool `json:"allow_resolution,omitempty"`
 	// Session controls a viewer may use (block input, privacy mode, lock, restart).
 	AllowBlockInput  *bool `json:"allow_block_input,omitempty"`
 	AllowPrivacyMode *bool `json:"allow_privacy_mode,omitempty"`

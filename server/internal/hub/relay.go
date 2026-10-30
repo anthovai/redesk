@@ -24,6 +24,9 @@ type relay struct {
 	created   time.Time
 	kind      string // KindScreen, KindTunnel or KindTerminal
 	target    string // tunnel target host:port
+	// viewerDevice is set for a switch-sides session: the viewer is that device's agent, which
+	// got the token over its own signaling connection, so no console login is required.
+	viewerDevice string
 
 	mu     sync.Mutex
 	viewer *websocket.Conn
@@ -71,6 +74,12 @@ func (h *Hub) StartSession(ctx context.Context, deviceID string, userID int64, v
 // StartSessionOf is StartSession for any session type (tunnel, terminal). Agents that did not
 // advertise the type get ErrUnsupported and are never asked.
 func (h *Hub) StartSessionOf(ctx context.Context, deviceID string, userID int64, viewer ViewerInfo, wantDirect bool, opts SessionOptions) (*Ticket, error) {
+	return h.startSession(ctx, deviceID, userID, viewer, wantDirect, opts, "")
+}
+
+// startSession is StartSessionOf; viewerDevice (switch sides) names the device whose agent is
+// the viewer, and marks the request to the target agent with "switch": true.
+func (h *Hub) startSession(ctx context.Context, deviceID string, userID int64, viewer ViewerInfo, wantDirect bool, opts SessionOptions, viewerDevice string) (*Ticket, error) {
 	opts, err := opts.Normalize()
 	if err != nil {
 		return nil, err
@@ -96,6 +105,8 @@ func (h *Hub) StartSessionOf(ctx context.Context, deviceID string, userID int64,
 		done:      make(chan struct{}),
 		kind:      opts.Kind,
 		target:    opts.Target,
+
+		viewerDevice: viewerDevice,
 	}
 	if wantDirect && h.P2P && a.direct {
 		rl.direct = newDirectState()
@@ -111,6 +122,10 @@ func (h *Hub) StartSessionOf(ctx context.Context, deviceID string, userID int64,
 	h.mu.Unlock()
 
 	msg := map[string]any{"t": "session", "sid": rl.sid, "token": rl.agentTok, "relay": "/ws/relay", "viewer": viewer}
+	if viewerDevice != "" {
+		// Older agents ignore it and ask for the password as usual (the switch then fails).
+		msg["switch"] = true
+	}
 	if rl.kind != KindScreen {
 		msg["type"] = rl.kind
 		if rl.target != "" {
@@ -214,7 +229,7 @@ func (h *Hub) HandleRelay(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// The viewer token is only ever handed to the logged-in requester; require that same login.
-	if isViewer && (h.ViewerUserID == nil || h.ViewerUserID(r) != rl.userID) {
+	if isViewer && rl.viewerDevice == "" && (h.ViewerUserID == nil || h.ViewerUserID(r) != rl.userID) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}

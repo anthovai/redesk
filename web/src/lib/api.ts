@@ -314,6 +314,7 @@ export interface StrategySettings {
 	allow_clipboard?: boolean;
 	allow_file_transfer?: boolean;
 	allow_audio?: boolean;
+	allow_voice?: boolean;
 	allow_whiteboard?: boolean;
 	allow_resolution?: boolean;
 	allow_block_input?: boolean;

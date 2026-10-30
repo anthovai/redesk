@@ -2,6 +2,9 @@
 // WebCodecs and played through Web Audio with a small jitter buffer.
 
 export const OPUS_CONFIG: AudioDecoderConfig = { codec: 'opus', sampleRate: 48000, numberOfChannels: 2 };
+/** Voice calls (0x07): mono Opus, 20 ms frames, in both directions. */
+export const VOICE_CONFIG: AudioDecoderConfig = { codec: 'opus', sampleRate: 48000, numberOfChannels: 1 };
+const VOICE_ENCODER: AudioEncoderConfig = { codec: 'opus', sampleRate: 48000, numberOfChannels: 1, bitrate: 32000 };
 
 /** Audio codecs to offer the agent; empty when this browser cannot decode Opus with WebCodecs. */
 export async function supportedAudioCodecs(): Promise<string[]> {
@@ -13,7 +16,7 @@ export async function supportedAudioCodecs(): Promise<string[]> {
 	}
 }
 
-function opusDecoder(output: (data: AudioData) => void, failed: () => void): AudioDecoder {
+function opusDecoder(output: (data: AudioData) => void, failed: () => void, config = OPUS_CONFIG): AudioDecoder {
 	const decoder = new AudioDecoder({
 		output,
 		error: (e) => {
@@ -21,7 +24,7 @@ function opusDecoder(output: (data: AudioData) => void, failed: () => void): Aud
 			failed();
 		}
 	});
-	decoder.configure(OPUS_CONFIG);
+	decoder.configure(config);
 	return decoder;
 }
 
@@ -59,6 +62,9 @@ export class RemoteAudio {
 	private decoded = false;
 	muted = false;
 
+	/** `config`: system audio (stereo, the default) or a voice call (mono). */
+	constructor(private config: AudioDecoderConfig = OPUS_CONFIG) {}
+
 	/** Creates or resumes the AudioContext; call from a user gesture (autoplay policy). */
 	unlock() {
 		try {
@@ -74,7 +80,8 @@ export class RemoteAudio {
 		if (!this.decoder || this.decoder.state === 'closed') {
 			this.decoder = opusDecoder(
 				(data) => this.play(data),
-				() => (this.decoder = null)
+				() => (this.decoder = null),
+				this.config
 			);
 		}
 		this.decoder.decode(new EncodedAudioChunk({ type: 'key', timestamp: seq * 20_000, data: packet }));
@@ -118,6 +125,124 @@ export class RemoteAudio {
 		this.decoder = null;
 		this.ctx?.close().catch(() => {});
 		this.ctx = null;
+	}
+}
+
+/** Whether this browser can take part in a voice call (microphone + Opus encode and decode). */
+export async function voiceSupported(): Promise<boolean> {
+	try {
+		if (typeof AudioEncoder === 'undefined' || typeof AudioDecoder === 'undefined' || !navigator.mediaDevices?.getUserMedia) return false;
+		const [e, d] = await Promise.all([AudioEncoder.isConfigSupported(VOICE_ENCODER), AudioDecoder.isConfigSupported(VOICE_CONFIG)]);
+		return !!e.supported && !!d.supported;
+	} catch {
+		return false;
+	}
+}
+
+/** Samples per 20 ms frame at 48 kHz. */
+const VOICE_FRAME = 960;
+
+/**
+ * The microphone during a voice call, encoded as 20 ms mono Opus packets. `open` asks for the
+ * microphone (call it from the click that starts the call); nothing is sent before `start`.
+ * The browser's echo cancellation and noise suppression are on.
+ */
+export class Microphone {
+	private stream: MediaStream | null = null;
+	private ctx: AudioContext | null = null;
+	private node: ScriptProcessorNode | null = null;
+	private encoder: AudioEncoder | null = null;
+	private pending = new Float32Array(VOICE_FRAME);
+	private filled = 0;
+	/** Resampling to 48 kHz: read position into the next input block, and the last sample. */
+	private pos = 0;
+	private last = 0;
+	private frames = 0;
+	private seq = 0;
+	muted = false;
+
+	async open() {
+		this.stream = await navigator.mediaDevices.getUserMedia({
+			audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+		});
+	}
+
+	/** Starts sending: `packet(seq, opus)` for every 20 ms of sound (nothing while muted). */
+	start(packet: (seq: number, data: Uint8Array<ArrayBuffer>) => void) {
+		if (!this.stream || this.ctx) return;
+		// The device's own rate: Chrome cannot connect a microphone to a context at another rate.
+		// `feed` resamples to 48 kHz.
+		const ctx = new AudioContext({ latencyHint: 'interactive' });
+		this.ctx = ctx;
+		const encoder = new AudioEncoder({
+			output: (chunk) => {
+				const data = new Uint8Array(chunk.byteLength);
+				chunk.copyTo(data);
+				this.seq = (this.seq + 1) >>> 0;
+				packet(this.seq, data);
+			},
+			error: (e) => console.warn('voice encoder error', e)
+		});
+		encoder.configure(VOICE_ENCODER);
+		this.encoder = encoder;
+		const src = ctx.createMediaStreamSource(this.stream);
+		// ScriptProcessorNode is deprecated but runs everywhere without a separate worklet file.
+		const node = ctx.createScriptProcessor(2048, 1, 1);
+		node.onaudioprocess = (ev) => this.feed(ev.inputBuffer.getChannelData(0));
+		src.connect(node);
+		node.connect(ctx.destination); // it only runs when connected; its output stays silent
+		this.node = node;
+		if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+	}
+
+	private feed(raw: Float32Array) {
+		const enc = this.encoder;
+		if (!enc || enc.state !== 'configured' || !this.ctx) return;
+		const input = this.resample(raw, this.ctx.sampleRate);
+		let i = 0;
+		while (i < input.length) {
+			const n = Math.min(VOICE_FRAME - this.filled, input.length - i);
+			this.pending.set(input.subarray(i, i + n), this.filled);
+			this.filled += n;
+			i += n;
+			if (this.filled < VOICE_FRAME) break;
+			this.filled = 0;
+			const ts = this.frames++ * 20_000;
+			if (this.muted) continue;
+			const data = new AudioData({ format: 'f32-planar', sampleRate: 48000, numberOfFrames: VOICE_FRAME, numberOfChannels: 1, timestamp: ts, data: this.pending.slice() });
+			enc.encode(data);
+			data.close();
+		}
+	}
+
+	/** Linear resampling of one block from `rate` to 48 kHz, continuing from the previous block. */
+	private resample(input: Float32Array, rate: number): Float32Array {
+		if (rate === 48000) return input;
+		const step = rate / 48000;
+		const out: number[] = [];
+		let p = this.pos;
+		while (p < input.length - 1 + 1e-9) {
+			const k = Math.floor(p);
+			const t = p - k;
+			const a = k < 0 ? this.last : input[k];
+			const b = input[Math.max(0, k + 1)];
+			out.push(a + (b - a) * t);
+			p += step;
+		}
+		this.pos = p - input.length;
+		if (input.length) this.last = input[input.length - 1];
+		return Float32Array.from(out);
+	}
+
+	close() {
+		this.node?.disconnect();
+		this.node = null;
+		if (this.encoder && this.encoder.state !== 'closed') this.encoder.close();
+		this.encoder = null;
+		this.ctx?.close().catch(() => {});
+		this.ctx = null;
+		for (const t of this.stream?.getTracks() ?? []) t.stop();
+		this.stream = null;
 	}
 }
 

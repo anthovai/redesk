@@ -187,6 +187,9 @@ enum ServerMsg {
         /// Present when the viewer may also connect directly (see direct.rs).
         #[serde(default)]
         direct: Option<crate::direct::Offer>,
+        /// Switch sides: the viewer is the agent of the device this app invited (switch.rs).
+        #[serde(default)]
+        switch: bool,
         /// Session type ("screen", "tunnel", "terminal"); absent = screen.
         #[serde(default, rename = "type")]
         kind: Option<String>,
@@ -351,11 +354,20 @@ async fn run_once(agent: &Arc<Agent>) -> Result<()> {
             Some(m) = out_rx.recv() => tx.send(Message::Text(m.into())).await?,
             m = tokio::time::timeout(Duration::from_secs(70), rx.next()) => {
                 let Some(m) = m.context("server silent for 70s")? else { return Ok(()) };
-                match parse(m?) {
-                    Some(ServerMsg::Session { sid, token, relay, viewer, record, direct, kind, target }) => {
+                let m = m?;
+                if let Message::Text(t) = &m
+                    && t.as_str().contains("\"switch_ticket\"")
+                    && let Ok(v) = serde_json::from_str::<serde_json::Value>(t.as_str())
+                    && v["t"] == "switch_ticket"
+                {
+                    crate::switch::ticket_arrived(v);
+                    continue;
+                }
+                match parse(m) {
+                    Some(ServerMsg::Session { sid, token, relay, viewer, record, direct, kind, target, switch }) => {
                         let agent = agent.clone();
                         tokio::spawn(async move {
-                            tracing::info!("session {sid} requested by {} from {}", viewer.email, viewer.ip);
+                            tracing::info!("session {sid} requested by {} from {}{}", viewer.email, viewer.ip, if switch { " (switch sides)" } else { "" });
                             let kind = match crate::remote::SessionKind::from_request(kind.as_deref(), target.as_deref()) {
                                 Ok(k) => k,
                                 Err(e) => {
@@ -363,7 +375,7 @@ async fn run_once(agent: &Arc<Agent>) -> Result<()> {
                                     return;
                                 }
                             };
-                            if let Err(e) = crate::session::run(agent.clone(), &sid, &token, &relay, viewer, record, direct, kind).await {
+                            if let Err(e) = crate::session::run(agent.clone(), &sid, &token, &relay, viewer, record, direct, kind, switch).await {
                                 tracing::warn!("session {sid} ended: {e:#}");
                                 agent.send_server(json!({"t": "session_reject", "sid": sid, "reason": format!("{e}")}));
                             }

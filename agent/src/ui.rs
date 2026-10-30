@@ -21,13 +21,35 @@ use crate::account::{self, BookEntry};
 use crate::config::{Account, ApproveMode, Config, EncoderPref, Verification, ViewerCodec};
 use crate::local::{self, LocalState, WindowGeom};
 use crate::signal::Agent;
-use crate::status::{ApprovalRequest, ServerState, SessionInfo, UiHooks};
+use crate::status::{ApprovalRequest, Attention, HostCmd, ServerState, SessionInfo, SessionLink, UiHooks};
 use crate::lan::LanPeer;
 use crate::viewer::Viewer;
 use crate::updater::{self, Release};
 use crate::{fingerprint, format_id, lan, service};
 
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A desktop notification for in-session events (chat, calls) the person here may not be
+/// looking at. macOS only (Notification Center through osascript); elsewhere the connection
+/// manager flashes in the taskbar instead.
+fn system_notification(title: &str, body: &str) {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let esc = |s: &str| s.chars().take(200).collect::<String>().replace('\\', "\\\\").replace('"', "\\\"");
+    let script = format!("display notification \"{}\" with title \"Aegiron\" subtitle \"{}\"", esc(body), esc(title));
+    let child = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    if let Ok(mut c) = child {
+        std::thread::spawn(move || c.wait());
+    }
+}
+
 const SIDEBAR_WIDTH: f32 = 290.0;
 const TABBAR_HEIGHT: f32 = 38.0;
 const CARD_MIN_W: f32 = 190.0;
@@ -838,6 +860,8 @@ enum Job {
     Lan(Vec<LanPeer>),
     UpdateCheck(Result<Option<Release>, String>),
     UpdateDownload(Result<PathBuf, String>),
+    /// Switch sides: the redeemed invitation (ticket for a session to the other machine).
+    Switch { result: Result<account::SessionTicket, String>, secret: String, link: Arc<SessionLink> },
 }
 
 /// Things outside the window that may ask it to show itself (tray, second launch).
@@ -883,6 +907,8 @@ pub struct App {
     lan_busy: bool,
     update: UpdateState,
     viewers: Vec<Arc<ViewerWindow>>,
+    /// Newest in-session event (chat, call, switch invitation) for the connection manager.
+    cm_attention: Option<(Attention, Instant)>,
     /// Terminal windows (one per remote shell).
     terminals: Vec<Arc<remote_ui::TerminalWindow>>,
     /// TCP tunnels opened from this app, with a key for the list.
@@ -978,6 +1004,7 @@ impl App {
             tab_active: Arc::default(),
             demo_scroll: None,
             settings_tab: false,
+            cm_attention: None,
         };
         if let Some(a) = agent {
             app.attach(&cc.egui_ctx, a);
@@ -1045,6 +1072,7 @@ impl App {
                 started: SystemTime::now() - Duration::from_secs(754),
                 kill: Default::default(),
                 recording: view == "home" && std::env::var_os("AEGIRON_UI_DEMO_RECORDING").is_some(),
+                link: crate::status::SessionLink::none(),
                 controls: Default::default(),
                 purpose: String::new(),
             });
@@ -1258,7 +1286,9 @@ impl App {
         let insecure = agent.config.lock().unwrap().allow_insecure_transport;
         let direct = agent.config.lock().unwrap().direct_enabled;
         let codec = agent.config.lock().unwrap().viewer_codec.codec();
-        let target = crate::viewer::Target { server, token: acc.token, insecure, device_id: id.to_string(), name: name.to_string(), direct, only: None, codec };
+        // Switch sides needs this machine's own agent online to accept the other side.
+        let local_id = (agent.status.lock().unwrap().server == ServerState::Online).then(|| agent.config.lock().unwrap().id.clone());
+        let target = crate::viewer::Target { server, token: acc.token, insecure, device_id: id.to_string(), name: name.to_string(), direct, only: None, codec, local_id, switch: None };
         // Frames arrive on the network thread: wake the windows showing that connection (its
         // own window or the tabs, and its extra display windows; kept up to date in
         // show_viewers).
@@ -1282,6 +1312,59 @@ impl App {
         let name = if name == format_id(id) { "" } else { name };
         self.local.record(id, name, local::unix_now());
         self.mark_local();
+    }
+
+    /// Switch sides: the person here accepted the viewer's invitation to control its machine.
+    /// The grant is redeemed over this agent's signaling connection, then a window opens.
+    fn accept_switch(&mut self, ctx: &egui::Context, link: Arc<SessionLink>) {
+        let Some(agent) = self.agent.clone() else { return };
+        let Some((grant, secret, _)) = link.switch_offer.lock().unwrap().take() else { return };
+        let direct = agent.config.lock().unwrap().direct_enabled;
+        self.flash("กำลังเชื่อมต่อเครื่องของอีกฝ่าย…");
+        self.spawn_job(ctx, move || {
+            let result = crate::runtime().block_on(crate::switch::connect(&agent, &grant, direct)).map_err(|e| format!("{e:#}"));
+            Job::Switch { result, secret, link }
+        });
+    }
+
+    /// Opens the window for a switched session (no sign-in needed: the ticket came with the
+    /// invitation).
+    fn open_switched(&mut self, ctx: &egui::Context, ticket: account::SessionTicket, secret: String) {
+        let Some(agent) = self.agent.clone() else { return };
+        let (server, insecure, direct, codec) = {
+            let c = agent.config.lock().unwrap();
+            (c.server_url.clone(), c.allow_insecure_transport, c.direct_enabled, c.viewer_codec.codec())
+        };
+        let id = ticket.device.id.clone();
+        let name = [&ticket.device.alias, &ticket.device.hostname].into_iter().find(|s| !s.is_empty()).cloned().unwrap_or_else(|| format_id(&id));
+        let target = crate::viewer::Target {
+            server,
+            token: String::new(),
+            insecure,
+            device_id: id.clone(),
+            name,
+            direct,
+            only: None,
+            codec,
+            local_id: None,
+            switch: Some(crate::viewer::SwitchTarget { ticket, secret }),
+        };
+        let viewport = egui::ViewportId::from_hash_of(("remote", &id, Instant::now()));
+        let rctx = ctx.clone();
+        let repaint_to: Arc<Mutex<Vec<egui::ViewportId>>> = Arc::new(Mutex::new(vec![viewport]));
+        let targets = repaint_to.clone();
+        let viewer = Viewer::connect(
+            target,
+            Arc::new(move || {
+                for v in targets.lock().unwrap().iter() {
+                    rctx.request_repaint_of(*v);
+                }
+            }),
+        );
+        self.viewers.push(ViewerWindow::new(viewer, id, viewport, repaint_to));
+        if self.local.viewer_tabs {
+            *self.tab_active.lock().unwrap() = Some(viewport);
+        }
     }
 
     fn mark_local(&mut self) {
@@ -1402,6 +1485,13 @@ impl App {
 
     fn handle_job(&mut self, ctx: &egui::Context, job: Job) {
         match job {
+            Job::Switch { result, secret, link } => match result {
+                Ok(ticket) => self.open_switched(ctx, ticket, secret),
+                Err(e) => {
+                    let _ = link.cmd.send(HostCmd::SwitchFailed(e.clone()));
+                    self.flash(format!("สลับฝั่งไม่สำเร็จ: {e}"));
+                }
+            },
             Job::Login { server, insecure, result } => {
                 self.login.busy = false;
                 self.login.sso = None;
@@ -1620,6 +1710,11 @@ impl eframe::App for App {
             self.pending.push_back((req, Instant::now()));
             Self::bring_to_front(ctx);
             ctx.send_viewport_cmd(ViewportCommand::RequestUserAttention(egui::UserAttentionType::Critical));
+        }
+        let events = self.agent.as_ref().map(|a| std::mem::take(&mut a.status.lock().unwrap().attention)).unwrap_or_default();
+        for a in events {
+            system_notification(&a.who, &a.text);
+            self.cm_attention = Some((a, Instant::now()));
         }
         if let Ok(id) = std::env::var("AEGIRON_UI_CONNECT")
             && self.viewers.is_empty()

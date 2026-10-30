@@ -7,7 +7,9 @@
 // A payload is one plaintext message exactly as the agent streamed it inside the encrypted
 // channel (type byte first: 0x01 JSON, 0x02 JPEG rectangle, 0x04 video frame, 0x05 audio
 // packet, 0x11 terminal output). Recordings made before audio was recorded simply have no 0x05
-// records; terminal sessions have only 0x11 output and 0x01 term_size records.
+// records; terminal sessions have only 0x11 output and 0x01 term_size records. Other types
+// (extra display streams 0x06, voice calls 0x07, tunnel data 0x10) are never recorded and
+// would be skipped.
 package recording
 
 import (

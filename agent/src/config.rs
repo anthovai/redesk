@@ -107,6 +107,8 @@ pub struct PolicySettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_audio: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_voice: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_whiteboard: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_resolution: Option<bool>,
@@ -145,6 +147,7 @@ pub enum Managed {
     AllowClipboard,
     AllowFileTransfer,
     AllowAudio,
+    AllowVoice,
     AllowWhiteboard,
     AllowResolution,
     AllowBlockInput,
@@ -212,6 +215,9 @@ pub struct Config {
     /// Send this machine's sound to viewers that ask for it.
     #[serde(default = "yes")]
     pub allow_audio: bool,
+    /// Let viewers ask for a voice call (each call still has to be accepted here).
+    #[serde(default = "yes")]
+    pub allow_voice: bool,
     /// Hardware or software H.264 (absent in older configs = auto).
     #[serde(default)]
     pub video_encoder: EncoderPref,
@@ -313,6 +319,7 @@ impl Config {
             allow_clipboard: true,
             allow_file_transfer: true,
             allow_audio: true,
+            allow_voice: true,
             video_encoder: EncoderPref::Auto,
             viewer_codec: ViewerCodec::H264,
             max_fps: 15,
@@ -351,6 +358,7 @@ impl Config {
             Managed::AllowClipboard => s.allow_clipboard.is_some(),
             Managed::AllowFileTransfer => s.allow_file_transfer.is_some(),
             Managed::AllowAudio => s.allow_audio.is_some(),
+            Managed::AllowVoice => s.allow_voice.is_some(),
             Managed::AllowWhiteboard => s.allow_whiteboard.is_some(),
             Managed::AllowResolution => s.allow_resolution.is_some(),
             Managed::AllowBlockInput => s.allow_block_input.is_some(),
@@ -377,6 +385,7 @@ impl Config {
             (self.direct_enabled, self.lan_discovery, self.lock_after_session),
             (self.allow_resolution, self.allow_tunnel, self.allow_tunnel_lan, self.allow_terminal),
             (self.allow_block_input, self.allow_privacy_mode, self.allow_lock, self.allow_restart),
+            self.allow_voice,
         );
         let s = &p.settings;
         fn set<T: Copy>(dst: &mut T, v: Option<T>) {
@@ -393,6 +402,7 @@ impl Config {
         set(&mut self.allow_clipboard, s.allow_clipboard);
         set(&mut self.allow_file_transfer, s.allow_file_transfer);
         set(&mut self.allow_audio, s.allow_audio);
+        set(&mut self.allow_voice, s.allow_voice);
         set(&mut self.allow_whiteboard, s.allow_whiteboard);
         set(&mut self.allow_resolution, s.allow_resolution);
         set(&mut self.allow_block_input, s.allow_block_input);
@@ -413,6 +423,7 @@ impl Config {
             (self.direct_enabled, self.lan_discovery, self.lock_after_session),
             (self.allow_resolution, self.allow_tunnel, self.allow_tunnel_lan, self.allow_terminal),
             (self.allow_block_input, self.allow_privacy_mode, self.allow_lock, self.allow_restart),
+            self.allow_voice,
         );
         before != after
     }
@@ -538,7 +549,7 @@ mod tests {
         c.permanent_password = Some("hash".into());
         c.verification = Verification::Both;
         let p: Policy = serde_json::from_str(
-            r#"{"id":3,"name":"Kiosk","settings":{"allow_restart":false,"allow_terminal":false,"allow_tunnel":true,"approve_mode":"click","allow_file_transfer":false,"allow_permanent_password":false,"direct_enabled":false,"lock_after_session":true,"record_sessions":true}}"#,
+            r#"{"id":3,"name":"Kiosk","settings":{"allow_restart":false,"allow_terminal":false,"allow_tunnel":true,"approve_mode":"click","allow_file_transfer":false,"allow_permanent_password":false,"direct_enabled":false,"lock_after_session":true,"record_sessions":true,"allow_voice":false}}"#,
         )
         .unwrap();
         assert!(c.set_policy(Some(p.clone())));
@@ -549,6 +560,7 @@ mod tests {
         assert!(!c.is_managed(Managed::AllowInput) && c.allow_input);
         assert!(!c.allow_restart && c.is_managed(Managed::AllowRestart) && !c.is_managed(Managed::AllowLock));
         assert!(c.allow_tunnel && !c.allow_terminal && c.is_managed(Managed::AllowTerminal) && !c.is_managed(Managed::AllowTunnelLan));
+        assert!(!c.allow_voice && c.is_managed(Managed::AllowVoice));
         // Same policy again: nothing to save.
         assert!(!c.set_policy(Some(p)));
         // A local change to a managed setting is undone; unmanaged ones stay.

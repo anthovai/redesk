@@ -27,6 +27,7 @@ pub mod service;
 pub mod session;
 pub mod signal;
 pub mod status;
+pub mod switch;
 pub mod terminal;
 pub mod tunnel;
 pub mod ui;
@@ -34,6 +35,7 @@ pub mod updater;
 #[cfg(target_os = "macos")]
 pub mod url_event;
 pub mod viewer;
+pub mod voice;
 pub mod whiteboard;
 
 use anyhow::{Result, anyhow};

@@ -81,6 +81,9 @@ enum Cmd {
         /// Send this machine's audio to viewers (macOS 13+, Windows).
         #[arg(long)]
         allow_audio: Option<bool>,
+        /// Let viewers ask for voice calls (each call is accepted in the desktop app).
+        #[arg(long)]
+        allow_voice: Option<bool>,
         /// Let viewers block this machine's keyboard and mouse (needs input; macOS, Windows)
         #[arg(long)]
         allow_block_input: Option<bool>,
@@ -289,6 +292,7 @@ async fn main() -> Result<()> {
             allow_whiteboard,
             allow_resolution,
             allow_audio,
+            allow_voice,
             allow_block_input,
             allow_privacy_mode,
             allow_lock,
@@ -317,6 +321,7 @@ async fn main() -> Result<()> {
                 (Managed::AllowFileTransfer, allow_file_transfer.is_some()),
                 (Managed::AllowWhiteboard, allow_whiteboard.is_some()),
                 (Managed::AllowAudio, allow_audio.is_some()),
+                (Managed::AllowVoice, allow_voice.is_some()),
                 (Managed::AllowResolution, allow_resolution.is_some()),
                 (Managed::AllowBlockInput, allow_block_input.is_some()),
                 (Managed::AllowPrivacyMode, allow_privacy_mode.is_some()),
@@ -342,6 +347,7 @@ async fn main() -> Result<()> {
             if let Some(v) = allow_whiteboard { c.allow_whiteboard = v; }
             if let Some(v) = allow_resolution { c.allow_resolution = v; }
             if let Some(v) = allow_audio { c.allow_audio = v; }
+            if let Some(v) = allow_voice { c.allow_voice = v; }
             if let Some(v) = allow_block_input { c.allow_block_input = v; }
             if let Some(v) = allow_privacy_mode { c.allow_privacy_mode = v; }
             if let Some(v) = allow_lock { c.allow_lock = v; }
@@ -386,7 +392,10 @@ async fn main() -> Result<()> {
             println!("Verification: {:?}, approve mode: {:?}", c.verification, c.approve_mode);
             println!("Device key:   {}", fingerprint(identity(&c)?.verifying_key().as_bytes()));
             println!("Server key:   {}", fingerprint(&B64.decode(&c.server_key)?));
-            println!("Input: {}, clipboard: {}, file transfer: {}, whiteboard: {}, resolution: {}, audio: {}", c.allow_input, c.allow_clipboard, c.allow_file_transfer, c.allow_whiteboard, c.allow_resolution, c.allow_audio);
+            println!(
+                "Input: {}, clipboard: {}, file transfer: {}, whiteboard: {}, resolution: {}, audio: {}, voice calls: {}",
+                c.allow_input, c.allow_clipboard, c.allow_file_transfer, c.allow_whiteboard, c.allow_resolution, c.allow_audio, c.allow_voice
+            );
             println!("Controls:     block input {}, privacy mode {}, lock {}, restart {}", c.allow_block_input, c.allow_privacy_mode, c.allow_lock, c.allow_restart);
             println!("Encoder:      {:?}", c.video_encoder);
             let tunnel = match (c.allow_tunnel, c.allow_tunnel_lan) {
@@ -461,6 +470,7 @@ fn refuse_managed(c: &Config, wanted: &[(Managed, bool)]) -> Result<()> {
         Managed::AllowClipboard => "--allow-clipboard",
         Managed::AllowFileTransfer => "--allow-file-transfer",
         Managed::AllowAudio => "--allow-audio",
+        Managed::AllowVoice => "--allow-voice",
         Managed::AllowWhiteboard => "--allow-whiteboard",
         Managed::AllowResolution => "--allow-resolution",
         Managed::AllowBlockInput => "--allow-block-input",
@@ -508,6 +518,8 @@ async fn connect(path: &std::path::Path, id: &str, seconds: u64, only: Option<St
         direct: c.direct_enabled,
         only,
         codec: codec.unwrap_or(c.viewer_codec).codec(),
+        local_id: None,
+        switch: None,
     };
     let viewer = Viewer::connect(target, std::sync::Arc::new(|| {}));
     let started = Instant::now();

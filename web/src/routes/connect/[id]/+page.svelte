@@ -3,6 +3,7 @@
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { formatId } from '#lib/format.js';
+	import ChatPanel from '#lib/ChatPanel.svelte';
 	import FilePanel from '#lib/FilePanel.svelte';
 	import { walkEntry } from '#lib/filetree.js';
 	import Icon from '#lib/Icon.svelte';
@@ -18,6 +19,7 @@
 	let focused = $state(false);
 	let toast = $state('');
 	let showFiles = $state(false);
+	let showChat = $state(false);
 	let dragging = $state(false);
 	let confirmRestart = $state(false);
 	// Seconds until the next reconnect attempt after a restart (ticks while waiting).
@@ -28,6 +30,26 @@
 		return () => clearInterval(t);
 	});
 	const reconnectIn = $derived(viewer.reconnect ? Math.max(0, Math.ceil((viewer.reconnect.next - now) / 1000)) : 0);
+	// Call timer (mm:ss), ticking while a call is on (shares `now` with the reconnect countdown).
+	$effect(() => {
+		if (viewer.call !== 'active') return;
+		const t = setInterval(() => (now = Date.now()), 1000);
+		return () => clearInterval(t);
+	});
+	const callTime = $derived.by(() => {
+		const s = Math.max(0, Math.floor((now - viewer.callSince) / 1000));
+		return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+	});
+	// A message while the chat is closed: a toast and a count on the chat button.
+	let chatSeen = 0;
+	$effect(() => {
+		const n = viewer.chat.length;
+		if (n > chatSeen) {
+			const last = viewer.chat[n - 1];
+			if (!showChat && !last.mine) flash(`ข้อความจาก ${peerName}: ${last.text.slice(0, 80)}`);
+			chatSeen = n;
+		}
+	});
 	const held = new Map<string, string>(); // code -> key, for releasing on blur
 
 	// Floating toolbar (RustDesk-style): pinned stays open, unpinned collapses to a handle.
@@ -931,6 +953,35 @@
 							</div>
 						{/if}
 
+						{#if viewer.canChat}
+							<button class="relative {tb(showChat)}" title="แชท" aria-pressed={showChat} onclick={() => (showChat = !showChat)}>
+								<Icon name="message" />
+								{#if viewer.chatUnread && !showChat}
+									<span class="absolute -top-1 -right-1 grid h-4 min-w-4 place-items-center rounded-full bg-danger px-1 text-[10px] font-bold text-white">{Math.min(viewer.chatUnread, 99)}</span>
+								{/if}
+							</button>
+						{/if}
+
+						{#if viewer.canCall}
+							{#if viewer.call === 'idle'}
+								<button class={tb()} title="โทรคุยด้วยเสียง" onclick={() => act(() => viewer.startCall())}><Icon name="phone" /></button>
+							{:else if viewer.call === 'calling'}
+								<button
+									class="grid size-8 shrink-0 animate-pulse place-items-center rounded-md bg-danger text-white"
+									title="กำลังรอปลายทางรับสาย · คลิกเพื่อยกเลิก"
+									onclick={() => act(() => viewer.hangup())}><Icon name="phoneOff" /></button
+								>
+							{:else}
+								<button class={tb(!viewer.micMuted)} title={viewer.micMuted ? 'เปิดไมค์' : 'ปิดไมค์'} aria-pressed={viewer.micMuted} onclick={() => act(() => viewer.setMicMuted(!viewer.micMuted))}>
+									<Icon name={viewer.micMuted ? 'micOff' : 'mic'} />
+								</button>
+								<span class="mono px-1 text-xs text-ok" title={viewer.remoteMuted ? 'อีกฝ่ายปิดไมค์อยู่' : 'กำลังคุย'}>{callTime}</span>
+								<button class="grid size-8 shrink-0 place-items-center rounded-md bg-danger text-white transition-[filter] hover:brightness-110" title="วางสาย" onclick={() => act(() => viewer.hangup())}>
+									<Icon name="phoneOff" />
+								</button>
+							{/if}
+						{/if}
+
 						{#if viewer.info?.audio}
 							<button
 								class={tb()}
@@ -1078,6 +1129,9 @@
 	</div>
 	{#if showFiles && viewer.phase === 'connected'}
 		<FilePanel {viewer} onclose={() => (showFiles = false)} />
+	{/if}
+	{#if showChat && viewer.phase === 'connected' && viewer.canChat}
+		<ChatPanel {viewer} peer={peerName} onclose={() => (showChat = false)} />
 	{/if}
 </div>
 

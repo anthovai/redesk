@@ -413,6 +413,75 @@ func (a *API) createSession(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// switchSides: the viewer of session {sid} lets the person at the controlled device control
+// device_id (the viewer's own device) in return. Returns a one-time grant, valid 60 s, that the
+// viewer passes to the controlled agent inside the end-to-end channel (docs/PROTOCOL.md §11).
+func (a *API) switchSides(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		DeviceID string `json:"device_id"`
+	}
+	if !readJSON(w, r, &req) {
+		return
+	}
+	u := userFrom(r)
+	if !a.limiter.allow("switch:"+u.Email, 10, time.Minute) {
+		writeErr(w, http.StatusTooManyRequests, "too many requests")
+		return
+	}
+	sid := r.PathValue("sid")
+	id := normalizeDeviceID(req.DeviceID) // custom and alias IDs as well as 9-digit ones
+	d, err := a.store.GetDevice(r.Context(), id)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		writeErr(w, http.StatusNotFound, "unknown device id")
+		return
+	case err != nil:
+		a.internal(w, err)
+		return
+	case d.Disabled || d.PublicKey == nil:
+		writeErr(w, http.StatusConflict, "device is not available")
+		return
+	}
+	// Only a device this user owns or may control can be handed over.
+	if d.OwnerID == nil || *d.OwnerID != u.ID {
+		if ok, err := a.canAccess(r, id); err != nil {
+			a.internal(w, err)
+			return
+		} else if !ok {
+			a.audit(r, "session.switch_denied", id, map[string]any{"sid": sid, "reason": "not_in_group"})
+			writeErr(w, http.StatusForbidden, "you are not allowed to share this device")
+			return
+		}
+	}
+	from, err := a.hub.SessionOf(sid, u.ID)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "no such active session")
+		return
+	}
+	name := u.Email
+	if fd, err := a.store.GetDevice(r.Context(), from); err == nil {
+		name = fd.Hostname
+		if fd.Alias != "" {
+			name = fd.Alias
+		}
+	}
+	device := map[string]any{"id": d.ID, "public_key": d.PublicKey, "hostname": d.Hostname, "os": d.OS, "alias": d.Alias}
+	grant, err := a.hub.OfferSwitch(sid, u.ID, d.ID, name, device)
+	switch {
+	case errors.Is(err, hub.ErrOffline):
+		writeErr(w, http.StatusConflict, "device is offline")
+		return
+	case errors.Is(err, hub.ErrSameDevice):
+		writeErr(w, http.StatusBadRequest, "cannot switch sides with the same device")
+		return
+	case err != nil:
+		writeErr(w, http.StatusNotFound, "no such active session")
+		return
+	}
+	a.audit(r, "session.switch_offered", d.ID, map[string]any{"sid": sid, "from": from})
+	writeJSON(w, http.StatusOK, map[string]any{"grant": grant, "expires_in": 60})
+}
+
 func (a *API) listSessions(w http.ResponseWriter, r *http.Request) {
 	s, err := a.store.ListRemoteSessions(r.Context(), 200)
 	if err != nil {

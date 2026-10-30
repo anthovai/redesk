@@ -14,6 +14,8 @@
 #   ScreenCapture  AllowStandardUserToSetSystemService   NOT a silent grant: macOS never lets MDM
 #                  allow screen recording. This only lets a standard (non-admin) user switch it
 #                  on in System Settings > Privacy & Security > Screen & System Audio Recording.
+# Not granted: Microphone (voice calls). MDM can only deny it; macOS asks the person the first
+# time a call is answered or made (NSMicrophoneUsageDescription in the app's Info.plist).
 #
 # macOS honours TCC payloads only from an MDM enrolled with user approval (or via ADE); a
 # profile installed by double-clicking it is ignored for these settings. An ad-hoc signed app

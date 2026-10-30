@@ -4,7 +4,7 @@ import { api, ApiError, type SessionTicket } from './api';
 import { b64decode, b64encode, completeHandshake, newViewerKeys, type Channel, type ViewerKeys } from './crypto';
 import { fingerprint } from './format';
 import { sanitizeRel, ZIP_LIMIT, ZipWriter, type LocalTree } from './filetree';
-import { RemoteAudio, supportedAudioCodecs } from './audio';
+import { Microphone, RemoteAudio, supportedAudioCodecs, VOICE_CONFIG, voiceSupported } from './audio';
 import { decodableCodecs, decoderConfig, type VideoCodec } from './videocodec';
 import { applyCtl, hasControl, KEEPALIVE_MS, noControls, RECONNECT_FOR_MS, reconnectDelay, type ControlFeature } from './controls';
 
@@ -66,6 +66,18 @@ export interface AgentInfo {
 	resolution?: boolean;
 }
 
+/** One chat message of this session (kept in the page only; never stored by the server). */
+export interface ChatMessage {
+	mine: boolean;
+	text: string;
+	at: number;
+}
+
+export type CallState = 'idle' | 'calling' | 'active';
+
+/** Longest chat message in characters (same as the agent). */
+export const CHAT_MAX = 4000;
+
 /** A whiteboard stroke, normalised to the remote screen. */
 export interface Stroke {
 	color: string;
@@ -117,6 +129,7 @@ const MSG_FRAME = 0x02;
 const MSG_FILE = 0x03;
 const MSG_VIDEO = 0x04;
 const MSG_AUDIO = 0x05;
+const MSG_VOICE = 0x07;
 const AUDIO_OPUS = 1;
 const CODEC_KEY = 'aegiron.viewer.codec';
 
@@ -183,6 +196,17 @@ export class RemoteViewer {
 	wantCodec = $state<VideoCodec>(storedCodec());
 	/** Codecs this browser decodes with WebCodecs. */
 	decodable = $state<VideoCodec[]>([]);
+	/** Chat with the person at the remote machine (feature "chat"). */
+	chat = $state<ChatMessage[]>([]);
+	/** Messages from the remote side not seen yet (the page resets it while the chat is open). */
+	chatUnread = $state(0);
+	/** Voice call (feature "voice"). */
+	call = $state<CallState>('idle');
+	callSince = $state(0);
+	micMuted = $state(false);
+	remoteMuted = $state(false);
+	/** This browser can take part in voice calls. */
+	canVoice = $state(false);
 	/** Streaming every display as one picture (feature "alldisp"). */
 	displayAll = $state(false);
 	/** Display modes of the display asked for with `listModes` (feature "resolution"). */
@@ -217,6 +241,9 @@ export class RemoteViewer {
 	private codecs: Promise<VideoCodec[]> = decodableCodecs().then((c) => (this.decodable = c));
 	private audioCodecs: Promise<string[]> = supportedAudioCodecs();
 	private audio = new RemoteAudio();
+	private voiceCheck: Promise<boolean> = voiceSupported().then((v) => (this.canVoice = v));
+	private mic: Microphone | null = null;
+	private voiceOut: RemoteAudio | null = null;
 	private decoder: VideoDecoder | null = null;
 	/** WebCodecs codec string the decoder is configured for (codec, and level for AV1). */
 	private decoderCodec = '';
@@ -337,6 +364,8 @@ export class RemoteViewer {
 		else if (plain[0] === MSG_FILE) this.onFileChunk(plain);
 		else if (plain[0] === MSG_AUDIO && plain.length > 6 && plain[1] === AUDIO_OPUS) {
 			this.audio.push(new DataView(plain.buffer, plain.byteOffset).getUint32(2), plain.subarray(6));
+		} else if (plain[0] === MSG_VOICE && plain.length > 6 && plain[1] === AUDIO_OPUS && this.call === 'active') {
+			this.voiceOut?.push(new DataView(plain.buffer, plain.byteOffset).getUint32(2), plain.subarray(6));
 		}
 	}
 
@@ -470,6 +499,17 @@ export class RemoteViewer {
 				this.remoteClipboard = m.s;
 				navigator.clipboard?.writeText(m.s).catch(() => {});
 				break;
+			case 'chat': {
+				const text = String(m.text ?? '').slice(0, CHAT_MAX);
+				if (text.trim()) {
+					this.chat = [...this.chat, { mine: false, text, at: Date.now() }];
+					this.chatUnread++;
+				}
+				break;
+			}
+			case 'voice':
+				this.onVoice(m);
+				break;
 		}
 	}
 
@@ -552,6 +592,7 @@ export class RemoteViewer {
 	}
 
 	private stopStats() {
+		this.endCall();
 		if (this.statsTimer) clearInterval(this.statsTimer);
 		this.statsTimer = null;
 		if (this.keepalive) clearInterval(this.keepalive);
@@ -873,7 +914,113 @@ export class RemoteViewer {
 		const order: VideoCodec[] = this.wantCodec === 'av1' ? ['av1', 'h264'] : ['h264', 'av1'];
 		const decodable = await this.codecs;
 		const codecs = [...order.filter((c) => decodable.includes(c)), 'jpeg'];
-		return { t: 'auth', password, codecs, audio: await this.audioCodecs };
+		// Chat always; voice calls when this browser has Opus encode/decode and getUserMedia.
+		const features = (await this.voiceCheck) ? ['chat', 'voice'] : ['chat'];
+		return { t: 'auth', password, codecs, features, audio: await this.audioCodecs };
+	}
+
+	// --- chat and voice calls (agent features "chat" / "voice") ---
+
+	get canChat(): boolean {
+		return !!this.info?.features?.includes('chat');
+	}
+
+	/** The remote machine allows calls and this browser can make them. */
+	get canCall(): boolean {
+		return this.canVoice && !!this.info?.features?.includes('voice');
+	}
+
+	sendChat(text: string) {
+		const t = text.trim().slice(0, CHAT_MAX);
+		if (!t || !this.canChat) return;
+		this.chat = [...this.chat, { mine: true, text: t, at: Date.now() }];
+		this.send({ t: 'chat', text: t });
+	}
+
+	/** Asks for a voice call; call from a click (the microphone prompt and audio playback need one). */
+	async startCall() {
+		if (this.call !== 'idle' || !this.canCall) return;
+		this.call = 'calling';
+		this.voiceOut = new RemoteAudio(VOICE_CONFIG);
+		this.voiceOut.unlock();
+		const mic = new Microphone();
+		this.mic = mic;
+		try {
+			await mic.open();
+		} catch (e) {
+			this.endCall();
+			this.say(e instanceof DOMException && e.name === 'NotAllowedError' ? 'เบราว์เซอร์ไม่อนุญาตให้ใช้ไมโครโฟน' : 'เปิดไมโครโฟนไม่สำเร็จ');
+			return;
+		}
+		if (this.mic !== mic) return; // hung up while asking
+		this.send({ t: 'voice', op: 'call' });
+	}
+
+	hangup() {
+		if (this.call === 'idle') return;
+		this.send({ t: 'voice', op: 'hangup' });
+		this.endCall();
+	}
+
+	setMicMuted(muted: boolean) {
+		if (this.call !== 'active' || !this.mic) return;
+		this.micMuted = muted;
+		this.mic.muted = muted;
+		this.send({ t: 'voice', op: 'mute', muted });
+	}
+
+	private onVoice(m: any) {
+		switch (m.op) {
+			case 'accept':
+				if (this.call !== 'calling' || !this.mic) return;
+				try {
+					this.mic.start((seq, data) => {
+						const plain = new Uint8Array(6 + data.length);
+						plain[0] = MSG_VOICE;
+						plain[1] = AUDIO_OPUS;
+						new DataView(plain.buffer).setUint32(2, seq);
+						plain.set(data, 6);
+						this.enqueue(plain);
+					});
+				} catch (e) {
+					console.warn('voice: cannot start the microphone', e);
+					this.hangup();
+					this.say('เปิดไมโครโฟนไม่สำเร็จ');
+					return;
+				}
+				this.call = 'active';
+				this.callSince = Date.now();
+				break;
+			case 'decline':
+				if (this.call === 'idle') return;
+				this.endCall();
+				this.say(
+					m.reason === 'timeout'
+						? 'ปลายทางไม่รับสาย'
+						: m.reason === 'unavailable'
+							? 'ปลายทางรับสายไม่ได้ (ไม่อนุญาตการโทร หรือไม่มีไมโครโฟน)'
+							: 'ปลายทางปฏิเสธการโทร'
+				);
+				break;
+			case 'hangup':
+				if (this.call === 'idle') return;
+				this.endCall();
+				this.say('ปลายทางวางสายแล้ว');
+				break;
+			case 'mute':
+				this.remoteMuted = !!m.muted;
+				break;
+		}
+	}
+
+	private endCall() {
+		this.mic?.close();
+		this.mic = null;
+		this.voiceOut?.close();
+		this.voiceOut = null;
+		this.call = 'idle';
+		this.micMuted = false;
+		this.remoteMuted = false;
 	}
 
 	/** Lets audio play after a user gesture (browsers block autoplay until one). */

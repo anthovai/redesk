@@ -449,7 +449,8 @@ impl App {
         };
 
         card_title(ui, "สิทธิ์ของผู้ควบคุม");
-        let (mut input, mut clip, mut files, mut board, mut sound) = (c.allow_input, c.allow_clipboard, c.allow_file_transfer, c.allow_whiteboard, c.allow_audio);
+        let (mut input, mut clip, mut files, mut board, mut sound, mut voice) =
+            (c.allow_input, c.allow_clipboard, c.allow_file_transfer, c.allow_whiteboard, c.allow_audio, c.allow_voice);
         let mut lock = c.lock_after_session;
         let mut res = c.allow_resolution;
         let changed = card(ui, |ui| {
@@ -468,6 +469,13 @@ impl App {
             };
             changed |= row(ui, "อนุญาตเสียง", hint, &mut sound, Managed::AllowAudio);
             sep(ui);
+            let hint = if crate::audio::voice_supported() {
+                "ผู้ควบคุมขอโทรคุยได้ ต้องกดรับสายที่เครื่องนี้ทุกครั้ง (ใช้ไมโครโฟนของเครื่องนี้)"
+            } else {
+                "ผู้ควบคุมขอโทรคุยได้ ต้องกดรับสายที่เครื่องนี้ทุกครั้ง (ไม่พบไมโครโฟนหรือลำโพง)"
+            };
+            changed |= row(ui, "อนุญาตการโทรคุย", hint, &mut voice, Managed::AllowVoice);
+            sep(ui);
             let hint = if crate::resolution::supported() {
                 "ผู้ควบคุมเปลี่ยนความละเอียดของหน้าจอนี้ได้ และคืนค่าเดิมเมื่อจบเซสชัน"
             } else {
@@ -485,6 +493,7 @@ impl App {
                 c.allow_file_transfer = files;
                 c.allow_whiteboard = board;
                 c.allow_audio = sound;
+                c.allow_voice = voice;
                 c.lock_after_session = lock;
                 c.allow_resolution = res;
             });

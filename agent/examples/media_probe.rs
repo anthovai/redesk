@@ -26,7 +26,7 @@ fn main() -> anyhow::Result<()> {
 
     // AEGIRON_CODEC=av1 asks for AV1 (the agent falls back to H.264 without an AV1 encoder).
     let codec = std::env::var("AEGIRON_CODEC").ok().and_then(|c| Codec::from_name(&c)).unwrap_or(Codec::H264);
-    let target = Target { server, token: session.token, insecure: true, device_id: id, name: "probe".into(), direct: true, only: None, codec };
+    let target = Target { server, token: session.token, insecure: true, device_id: id, name: "probe".into(), direct: true, only: None, codec, local_id: None, switch: None };
     let v = Viewer::connect(target, Arc::new(|| {}));
     let mut sent = false;
     let mut connected_for = 0;

@@ -18,6 +18,8 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::audio::{self, OpusDecoder, Player};
+use crate::status::ChatLine;
+use crate::voice::Call;
 use crate::codec::{Codec, VideoDecoder};
 use crate::crypto::{Channel, ViewerKeys};
 use crate::files::{self, ensure_dirs, rel_components, unique_path};
@@ -114,6 +116,16 @@ impl Info {
         self.features.iter().any(|f| f == feature)
     }
 
+    /// Text chat with the person at the remote machine.
+    pub fn chat(&self) -> bool {
+        self.has(proto::FEATURE_CHAT)
+    }
+
+    /// Voice calls (the remote machine allows them and has a microphone).
+    pub fn voice(&self) -> bool {
+        self.has(proto::FEATURE_VOICE) && audio::voice_supported()
+    }
+
     /// Display resolution can be changed from here.
     pub fn can_resize(&self) -> bool {
         self.resolution && self.has("resolution")
@@ -170,8 +182,28 @@ fn codecs(prefer: Codec) -> [&'static str; 3] {
         _ => ["h264", "av1", "jpeg"],
     }
 }
-/// Optional protocol features this viewer supports (sent in `auth`).
-const FEATURES: [&str; 1] = ["clipfiles"];
+/// Optional protocol features this viewer supports (sent in `auth`): clipboard files and chat
+/// always, voice calls with a microphone and speaker, switch sides when this app runs its own
+/// agent (`local_id`).
+fn features(switch: bool) -> Vec<&'static str> {
+    let mut f = vec!["clipfiles", proto::FEATURE_CHAT];
+    if audio::voice_supported() {
+        f.push(proto::FEATURE_VOICE);
+    }
+    if switch {
+        f.push(proto::FEATURE_SWITCH);
+    }
+    f
+}
+
+/// Voice call state as seen from the viewer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CallState {
+    Idle,
+    /// Waiting for the person at the remote machine to accept.
+    Calling(Instant),
+    Active { since: Instant, muted: bool, remote_muted: bool },
+}
 
 fn clip_tmp_dir() -> PathBuf {
     static N: AtomicU32 = AtomicU32::new(0);
@@ -318,6 +350,15 @@ pub struct State {
     pub clip_offer: Option<Vec<ClipEntry>>,
     /// Message for the window to show once (from background transfers).
     pub notice: Option<String>,
+    /// Chat with the person at the remote machine (this session only, never stored).
+    pub chat: Vec<ChatLine>,
+    /// Messages from the remote side not seen yet.
+    pub chat_unread: usize,
+    pub call: CallState,
+    /// Waiting for the other side to answer a switch-sides invitation.
+    pub switch_pending: bool,
+    /// The sides were switched: the other side now controls this machine and this window closes.
+    pub switched: bool,
     /// Every remote display in one picture (feature "alldisp").
     pub display_all: bool,
     /// Extra display streams, each shown in its own window (feature "multidisp").
@@ -335,6 +376,11 @@ pub struct State {
 
 enum Cmd {
     Json(Value),
+    Chat(String),
+    Call,
+    Hangup,
+    MuteMic(bool),
+    SwitchSides,
     /// Local file or folder → remote directory ("" = ~/Downloads/Aegiron).
     Upload(PathBuf, String),
     /// Remote file or folder → local ~/Downloads/Aegiron.
@@ -383,6 +429,10 @@ pub struct Viewer {
     last_clip_files: Mutex<ClipSig>,
     /// Temporary folder for small clipboard fetches; removed when the session ends.
     clip_tmp: PathBuf,
+    /// Optional features sent in `auth`.
+    features: Vec<&'static str>,
+    /// Switch sides: the secret that admits this viewer to the other machine (see switch.rs).
+    switch_secret: Option<String>,
 }
 
 /// What a connection needs from the signed-in app.
@@ -398,6 +448,16 @@ pub struct Target {
     pub only: Option<crate::direct::Path>,
     /// Video codec to ask for (Settings → General; H.264 unless the user picked AV1).
     pub codec: Codec,
+    /// ID of this app's own (running) agent: enables switch sides.
+    pub local_id: Option<String>,
+    /// This viewer is the switched side of a switch-sides session: the ticket the server issued
+    /// for the invitation, used instead of requesting a session.
+    pub switch: Option<SwitchTarget>,
+}
+
+pub struct SwitchTarget {
+    pub ticket: account::SessionTicket,
+    pub secret: String,
 }
 
 impl Viewer {
@@ -427,6 +487,11 @@ impl Viewer {
                 browser: RemoteDir::default(),
                 clip_offer: None,
                 notice: None,
+                chat: Vec::new(),
+                chat_unread: 0,
+                call: CallState::Idle,
+                switch_pending: false,
+                switched: false,
                 display_all: false,
                 extra: HashMap::new(),
                 modes: None,
@@ -442,6 +507,8 @@ impl Viewer {
             cancels: Mutex::default(),
             last_clip_files: Mutex::default(),
             clip_tmp: clip_tmp_dir(),
+            features: features(target.local_id.is_some() && target.switch.is_none()),
+            switch_secret: target.switch.as_ref().map(|s| s.secret.clone()),
         });
         let task = v.clone();
         crate::runtime().spawn(async move {
@@ -517,7 +584,7 @@ impl Viewer {
             files: true,
             recording: std::env::var_os("AEGIRON_UI_DEMO_RECORDING").is_some(),
             whiteboard: true,
-            features: crate::files::FEATURES.iter().chain(&proto::DISPLAY_FEATURES).chain(&["view_only", "block_input", "privacy", "lock", "restart"]).map(|f| f.to_string()).collect(),
+            features: crate::files::FEATURES.iter().chain(&proto::DISPLAY_FEATURES).chain(&["view_only", "block_input", "privacy", "lock", "restart"]).chain(&[proto::FEATURE_CHAT, proto::FEATURE_VOICE, proto::FEATURE_SWITCH]).map(|f| f.to_string()).collect(),
             audio: true,
             codecs: vec!["av1".into(), "h264".into(), "jpeg".into()],
             resolution: true,
@@ -546,6 +613,11 @@ impl Viewer {
                 browser: RemoteDir::default(),
                 clip_offer: None,
                 notice: None,
+                chat: Vec::new(),
+                chat_unread: 0,
+                call: CallState::Idle,
+                switch_pending: false,
+                switched: false,
                 display_all: false,
                 extra: HashMap::new(),
                 modes: None,
@@ -561,6 +633,8 @@ impl Viewer {
             cancels: Mutex::default(),
             last_clip_files: Mutex::default(),
             clip_tmp: clip_tmp_dir(),
+            features: features(true),
+            switch_secret: None,
         })
     }
 
@@ -574,7 +648,45 @@ impl Viewer {
             st.error = None;
             st.want_codec
         };
-        self.send(json!({"t": "auth", "password": pw, "codecs": codecs(prefer), "features": FEATURES, "audio": audio_codecs()}));
+        self.send(json!({"t": "auth", "password": pw, "codecs": codecs(prefer), "features": self.features, "audio": audio_codecs()}));
+    }
+
+    /// This window can offer switch sides (this app runs its own agent, online).
+    pub fn can_switch(&self) -> bool {
+        self.features.contains(&proto::FEATURE_SWITCH)
+    }
+
+    /// Sends a chat message to the person at the remote machine.
+    pub fn send_chat(&self, text: &str) {
+        let text: String = text.trim().chars().take(proto::CHAT_MAX).collect();
+        if !text.is_empty() {
+            let _ = self.tx.send(Cmd::Chat(text));
+        }
+    }
+
+    /// The chat panel shows everything received so far.
+    pub fn mark_chat_read(&self) {
+        self.state.lock().unwrap().chat_unread = 0;
+    }
+
+    /// Asks the person at the remote machine for a voice call.
+    pub fn call(&self) {
+        let _ = self.tx.send(Cmd::Call);
+    }
+
+    /// Ends the call (or stops calling).
+    pub fn hangup(&self) {
+        let _ = self.tx.send(Cmd::Hangup);
+    }
+
+    pub fn set_mic_muted(&self, muted: bool) {
+        let _ = self.tx.send(Cmd::MuteMic(muted));
+    }
+
+    /// Invites the person at the remote machine to control this machine (the user confirmed).
+    pub fn switch_sides(&self) {
+        self.update(|st| st.switch_pending = true);
+        let _ = self.tx.send(Cmd::SwitchSides);
     }
 
     /// Switches the video codec for this session (H.264 or AV1). Agents that cannot, or that
@@ -836,12 +948,16 @@ async fn next_text(rx: &mut crate::direct::WsRx, what: &str, secs: u64) -> Resul
 }
 
 async fn run(v: &Arc<Viewer>, t: &Target, cmds: &mut mpsc::UnboundedReceiver<Cmd>) -> Result<()> {
-    // 1. Ask the server to wake the agent (blocking HTTPS call off the async threads).
+    // 1. Ask the server to wake the agent (blocking HTTPS call off the async threads). A
+    //    switched session already has its ticket (the server issued it for the invitation).
     let (server, token, id) = (t.server.clone(), t.token.clone(), t.device_id.clone());
     let direct = t.direct && t.only != Some(crate::direct::Path::Relay);
-    let ticket = tokio::task::spawn_blocking(move || account::start_session(&server, &token, &id, direct))
-        .await?
-        .map_err(|e| anyhow!(e))?;
+    let ticket = match t.switch.as_ref() {
+        Some(s) => s.ticket.clone(),
+        None => tokio::task::spawn_blocking(move || account::start_session(&server, &token, &id, direct))
+            .await?
+            .map_err(|e| anyhow!(e))?,
+    };
     let device_key: [u8; 32] = B64.decode(&ticket.device.public_key)?.try_into().map_err(|_| anyhow!("bad device key"))?;
     let name = [&ticket.device.alias, &ticket.device.hostname].into_iter().find(|s| !s.is_empty()).cloned().unwrap_or(t.name.clone());
     v.update(|st| {
@@ -858,7 +974,9 @@ async fn run(v: &Arc<Viewer>, t: &Target, cmds: &mut mpsc::UnboundedReceiver<Cmd
         ticket.ticket.relay_path, ticket.ticket.sid, ticket.ticket.token
     ))?;
     let mut req = url.as_str().into_client_request()?;
-    req.headers_mut().insert("Authorization", format!("Bearer {}", t.token).parse()?);
+    if !t.token.is_empty() {
+        req.headers_mut().insert("Authorization", format!("Bearer {}", t.token).parse()?);
+    }
     let relay = async move {
         let (ws, _) = crate::net::connect_ws(req).await.context("เชื่อมต่อ relay ไม่สำเร็จ")?;
         let mut l = crate::direct::link(ws, crate::direct::Path::Relay, Default::default());
@@ -913,10 +1031,18 @@ async fn run(v: &Arc<Viewer>, t: &Target, cmds: &mut mpsc::UnboundedReceiver<Cmd
     // where playing would loop back into the capture).
     let mut player_failed = std::env::var("AEGIRON_AUDIO_OUT").is_ok_and(|v| v == "0");
     let mut level: Option<f32> = None;
+    // Voice call: this machine's microphone as 0x07 packets, the remote side's voice played here.
+    let (voice_tx, mut voice_rx) = mpsc::channel::<Vec<u8>>(16);
+    let mut call: Option<Call> = None;
+    // Switch sides: the secret handed out with the pending invitation.
+    let mut switch_secret: Option<String> = None;
+    let sid = ticket.ticket.sid.clone();
+
     let mut keepalive = tokio::time::interval(KEEPALIVE);
 
     loop {
         tokio::select! {
+            Some(plain) = voice_rx.recv() => tx.send(Message::Binary(ch.seal(&plain)?.into())).await?,
             _ = keepalive.tick() => {
                 // Only while the machine is blocked; older agents ignore it anyway.
                 let c = v.state.lock().unwrap().controls;
@@ -1045,8 +1171,28 @@ async fn run(v: &Arc<Viewer>, t: &Target, cmds: &mut mpsc::UnboundedReceiver<Cmd
                             Err(e) => tracing::debug!("viewer: {e:#}"),
                         }
                     }
+                    Some(&proto::MSG_VOICE) => {
+                        if let Some(c) = call.as_mut() {
+                            if c.needs_output() {
+                                tokio::task::block_in_place(|| c.receive(&plain));
+                            } else {
+                                c.receive(&plain);
+                            }
+                        }
+                    }
                     Some(&proto::MSG_JSON) => {
                         let m: Value = serde_json::from_slice(&plain[1..])?;
+                        if m["t"] == "voice" {
+                            if let Some(reply) = voice_event(v, &m, &mut call, &voice_tx) {
+                                tx.send(Message::Binary(ch.seal(&proto::json(&reply))?.into())).await?;
+                            }
+                            continue;
+                        }
+                        if m["t"] == "switch_result" && m["ok"] != true {
+                            if let Some(s) = switch_secret.take() {
+                                crate::switch::withdraw(&s);
+                            }
+                        }
                         let route = m["id"].as_u64().and_then(|id| v.routes.lock().unwrap().get(&(id as u32)).cloned());
                         if let Some(r) = route {
                             let _ = r.send(Ev::Json(m));
@@ -1068,6 +1214,67 @@ async fn run(v: &Arc<Viewer>, t: &Target, cmds: &mut mpsc::UnboundedReceiver<Cmd
             }
             c = cmds.recv() => match c {
                 Some(Cmd::Json(j)) => tx.send(Message::Binary(ch.seal(&proto::json(&j))?.into())).await?,
+                Some(Cmd::Chat(text)) => {
+                    v.update(|st| st.chat.push(ChatLine { mine: true, text: text.clone(), at: std::time::SystemTime::now() }));
+                    tx.send(Message::Binary(ch.seal(&proto::json(&json!({"t": "chat", "text": text})))?.into())).await?;
+                }
+                Some(Cmd::Call) => {
+                    let ok = {
+                        let st = v.state.lock().unwrap();
+                        st.call == CallState::Idle && st.info.as_ref().is_some_and(Info::voice)
+                    };
+                    if ok {
+                        v.update(|st| st.call = CallState::Calling(Instant::now()));
+                        tx.send(Message::Binary(ch.seal(&proto::json(&json!({"t": "voice", "op": "call"})))?.into())).await?;
+                    }
+                }
+                Some(Cmd::Hangup) => {
+                    call = None;
+                    let was = std::mem::replace(&mut v.state.lock().unwrap().call, CallState::Idle);
+                    (v.repaint)();
+                    if was != CallState::Idle {
+                        tx.send(Message::Binary(ch.seal(&proto::json(&json!({"t": "voice", "op": "hangup"})))?.into())).await?;
+                    }
+                }
+                Some(Cmd::MuteMic(muted)) => {
+                    if let Some(c) = &call {
+                        c.set_muted(muted);
+                        v.update(|st| if let CallState::Active { muted: m, .. } = &mut st.call { *m = muted });
+                        tx.send(Message::Binary(ch.seal(&proto::json(&json!({"t": "voice", "op": "mute", "muted": muted})))?.into())).await?;
+                    }
+                }
+                Some(Cmd::SwitchSides) => {
+                    // The other side gets a server grant for a session to this machine's agent,
+                    // and the secret this agent admits it with (it closes this window then).
+                    let Some(local) = t.local_id.clone() else { continue };
+                    let weak = Arc::downgrade(v);
+                    let secret = crate::switch::offer(move || {
+                        if let Some(v) = weak.upgrade() {
+                            v.update(|st| st.switched = true);
+                            v.close();
+                        }
+                    });
+                    if let Some(old) = switch_secret.replace(secret.clone()) {
+                        crate::switch::withdraw(&old);
+                    }
+                    let (server, token, sid, out, v2) = (t.server.clone(), t.token.clone(), sid.clone(), up_tx.clone(), v.clone());
+                    tokio::spawn(async move {
+                        let grant = tokio::task::spawn_blocking(move || account::switch_grant(&server, &token, &sid, &local)).await;
+                        match grant {
+                            Ok(Ok(grant)) => {
+                                let _ = out.send(proto::json(&json!({"t": "switch_sides", "grant": grant, "secret": secret}))).await;
+                            }
+                            Ok(Err(e)) => {
+                                crate::switch::withdraw(&secret);
+                                v2.update(|st| {
+                                    st.switch_pending = false;
+                                    st.notice = Some(format!("สลับฝั่งไม่สำเร็จ: {e}"));
+                                });
+                            }
+                            Err(_) => crate::switch::withdraw(&secret),
+                        }
+                    });
+                }
                 Some(Cmd::Upload(path, dir)) => {
                     let link = Link { v: v.clone(), out: up_tx.clone() };
                     tokio::spawn(async move { link.upload(&path, &dir).await; });
@@ -1088,6 +1295,9 @@ async fn run(v: &Arc<Viewer>, t: &Target, cmds: &mut mpsc::UnboundedReceiver<Cmd
                     tokio::spawn(async move { link.fetch_clip(entries, temp).await; });
                 }
                 Some(Cmd::Close) | None => {
+                    if let Some(s) = switch_secret.take().filter(|_| !v.state.lock().unwrap().switched) {
+                        crate::switch::withdraw(&s);
+                    }
                     v.state.lock().unwrap().resume = None; // closed by the user: no reconnect
                     let _ = tx.send(Message::Binary(ch.seal(&proto::json(&json!({"t": "bye"})))?.into())).await;
                     let _ = tx.close().await;
@@ -1097,6 +1307,54 @@ async fn run(v: &Arc<Viewer>, t: &Target, cmds: &mut mpsc::UnboundedReceiver<Cmd
             Some(plain) = up_rx.recv() => tx.send(Message::Binary(ch.seal(&plain)?.into())).await?,
         }
     }
+}
+
+/// A `voice` message from the agent; may return a reply.
+fn voice_event(v: &Viewer, m: &Value, call: &mut Option<Call>, voice_tx: &mpsc::Sender<Vec<u8>>) -> Option<Value> {
+    let mut reply = None;
+    match m["op"].as_str().unwrap_or("") {
+        "accept" if matches!(v.state.lock().unwrap().call, CallState::Calling(_)) => match tokio::task::block_in_place(|| Call::start(voice_tx.clone())) {
+            Ok(c) => {
+                *call = Some(c);
+                v.update(|st| st.call = CallState::Active { since: Instant::now(), muted: false, remote_muted: false });
+            }
+            Err(e) => {
+                tracing::warn!("viewer: cannot start the voice call: {e:#}");
+                v.update(|st| {
+                    st.call = CallState::Idle;
+                    st.notice = Some(format!("เปิดไมโครโฟนไม่สำเร็จ: {e}"));
+                });
+                reply = Some(json!({"t": "voice", "op": "hangup"}));
+            }
+        },
+        "decline" => v.update(|st| {
+            st.call = CallState::Idle;
+            st.notice = Some(
+                match m["reason"].as_str() {
+                    Some("timeout") => "ปลายทางไม่รับสาย",
+                    Some("unavailable") => "ปลายทางรับสายไม่ได้ (ไม่อนุญาตการโทร หรือไม่มีไมโครโฟน)",
+                    _ => "ปลายทางปฏิเสธการโทร",
+                }
+                .into(),
+            );
+        }),
+        "hangup" => {
+            *call = None;
+            v.update(|st| {
+                if st.call != CallState::Idle {
+                    st.notice = Some("ปลายทางวางสายแล้ว".into());
+                }
+                st.call = CallState::Idle;
+            });
+        }
+        "mute" => v.update(|st| {
+            if let CallState::Active { remote_muted, .. } = &mut st.call {
+                *remote_muted = m["muted"].as_bool().unwrap_or(false);
+            }
+        }),
+        _ => {}
+    }
+    reply
 }
 
 /// Decodes a `0x04` message, (re)creating the decoder at a keyframe of a new codec. Ok(None):
@@ -1118,14 +1376,18 @@ fn control(v: &Viewer, m: &Value) -> Option<Value> {
     let mut reply = None;
     v.update(|st| match t {
         "auth_required" if st.resume.is_some() => {
-            reply = Some(json!({"t": "auth", "password": null, "resume": st.resume, "codecs": codecs(st.want_codec), "features": FEATURES, "audio": audio_codecs()}));
+            reply = Some(json!({"t": "auth", "password": null, "resume": st.resume, "codecs": codecs(st.want_codec), "features": v.features, "audio": audio_codecs()}));
         }
         "auth_required" => {
-            if m["password"].as_bool().unwrap_or(true) {
+            if v.switch_secret.is_some() && m["switch"] != true {
+                // An agent that does not know switch sides asks for its password instead.
+                st.error = Some("เครื่องของอีกฝ่ายใช้ Aegiron รุ่นที่ไม่รองรับการสลับฝั่ง".into());
+                reply = Some(json!({"t": "bye"}));
+            } else if m["password"].as_bool().unwrap_or(true) {
                 st.phase = Phase::Password;
             } else {
                 st.phase = Phase::Approval;
-                reply = Some(json!({"t": "auth", "password": null, "codecs": codecs(st.want_codec), "features": FEATURES, "audio": audio_codecs()}));
+                reply = Some(json!({"t": "auth", "password": null, "codecs": codecs(st.want_codec), "features": v.features, "audio": audio_codecs(), "switch": v.switch_secret}));
             }
         }
         "auth_pending" => st.phase = Phase::Approval,
@@ -1182,6 +1444,24 @@ fn control(v: &Viewer, m: &Value) -> Option<Value> {
             st.cursor = m["visible"].as_bool().unwrap_or(false).then_some((x, y));
         }
         "clip" => st.remote_clipboard = m["s"].as_str().map(str::to_owned),
+        "chat" => {
+            let text: String = m["text"].as_str().unwrap_or("").chars().take(proto::CHAT_MAX).collect();
+            if !text.trim().is_empty() {
+                st.chat.push(ChatLine { mine: false, text, at: std::time::SystemTime::now() });
+                st.chat_unread += 1;
+            }
+        }
+        "switch_result" if m["ok"] != true => {
+            st.switch_pending = false;
+            st.notice = Some(
+                match m["reason"].as_str() {
+                    Some("declined") => "ปลายทางปฏิเสธการสลับฝั่ง".to_string(),
+                    Some("unavailable") => "ปลายทางสลับฝั่งไม่ได้".to_string(),
+                    Some(r) => format!("สลับฝั่งไม่สำเร็จ: {r}"),
+                    None => "สลับฝั่งไม่สำเร็จ".to_string(),
+                },
+            );
+        }
         "ctl" => apply_ctl(st, m),
         "res_list" => {
             let mode = |v: &Value| serde_json::from_value::<Mode>(v.clone()).unwrap_or_default();

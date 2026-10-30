@@ -26,6 +26,7 @@ server → agent  {"t":"registered","sig":Ed25519(server_key, "redesk-server-v1\
 - Wake-on-LAN: `POST /api/devices/{id}/wake` picks an online agent on the same LAN (same public IP and/or subnet) and sends it `{"t":"wol","macs":[...],"target":"<id>"}`. The helper broadcasts the magic packet (UDP 9 and 7) and reports `wol_sent`. Errors: `online_already`, `no_mac`, `no_helper`, `helper_busy`, `rate_limited`.
 - LAN discovery (not through the server): a viewer broadcasts `redesk-discover v1` to UDP 21120; agents on the same subnet with `lan_discovery = true` answer `{id, hostname, os}`, rate-limited.
 - Session request: `{"t":"session","sid","token","relay":"/ws/relay","viewer":{"email","name","ip"}}`.
+- Session request: `{"t":"session",…,"switch":true}` marks a switch-sides session ([§12](#12-chat-voice-calls-and-switch-sides)).
 - Agent → server audit events: `{"t":"event","sid","kind","detail"}` with `kind` in `auth_failed | auth_ok | denied | locked | file_upload | file_download | wol_sent`, plus the file, recording and [session control](#session-controls) kinds below. They are stored as `agent.<kind>` and attributed to the viewer of that session; unknown kinds are dropped.
 
 ### Device IDs and strategies
@@ -39,6 +40,7 @@ server → agent  {"t":"registered","sig":Ed25519(server_key, "redesk-server-v1\
 | `approve_mode` | `password` \| `click` \| `both` | how sessions are accepted |
 | `allow_permanent_password` | `false` | one-time passwords only; the stored permanent password is removed |
 | `allow_input`, `allow_clipboard`, `allow_file_transfer`, `allow_audio`, `allow_whiteboard`, `allow_resolution` | bool | session permissions |
+| `allow_voice` | bool | voice calls (§12); each call is still answered on the device. Chat has no permission of its own: it is part of every remote-control session with the desktop app |
 | `allow_block_input`, `allow_privacy_mode`, `allow_lock`, `allow_restart` | bool | session controls a viewer may use |
 | `allow_tunnel`, `allow_tunnel_lan`, `allow_terminal` | bool | TCP tunnels (and whether they may reach other LAN hosts) and the remote terminal (§11) |
 | `direct_enabled`, `lan_discovery` | bool | direct/P2P sessions, LAN discovery answers |
@@ -74,12 +76,12 @@ Every later message is binary ciphertext. A dropped, reordered, or replayed mess
 
 ## 4. Messages inside the encrypted channel
 
-Byte 0 is the type: `0x01` JSON, `0x02` video rectangle (`x, y, frame_w, frame_h` as u16 BE, followed by a JPEG), `0x03` file chunk (transfer id as u32 BE, followed by up to 64 KiB of data), `0x04` video frame (codec u8 `1` = H.264 or `2` = AV1, flags u8 with bit 0 = keyframe, `width, height` as u16 BE, followed by one access unit: Annex B for H.264, one temporal unit of low-overhead OBUs for AV1), `0x05` audio packet (see [Audio](#audio)), `0x06` message of an extra display stream (see [Displays, resolution and input modes](#displays-resolution-and-input-modes)), `0x10` tunnel data and `0x11` terminal data (tunnel and terminal sessions only, see §11).
+Byte 0 is the type: `0x01` JSON, `0x02` video rectangle (`x, y, frame_w, frame_h` as u16 BE, followed by a JPEG), `0x03` file chunk (transfer id as u32 BE, followed by up to 64 KiB of data), `0x04` video frame (codec u8 `1` = H.264 or `2` = AV1, flags u8 with bit 0 = keyframe, `width, height` as u16 BE, followed by one access unit: Annex B for H.264, one temporal unit of low-overhead OBUs for AV1), `0x05` audio packet (see [Audio](#audio)), `0x06` message of an extra display stream (see [Displays, resolution and input modes](#displays-resolution-and-input-modes)), `0x07` voice-call packet (see [§12](#12-chat-voice-calls-and-switch-sides)), `0x10` tunnel data and `0x11` terminal data (tunnel and terminal sessions only, see §11).
 
 | Direction | Message |
 |---|---|
-| agent→viewer | `auth_required {password, click}`, `auth_pending`, `auth_result {ok, reason?, attempts_left?, retry_after?}`, `info {hostname, os, displays[], input, clipboard, files, codec, codecs?[], features?, encoder?, audio?, audio_codec?}`, `encoder {encoder,codec}`, `cursor {x,y,visible}`, `clip {s}` |
-| viewer→agent | `auth {password, codecs[], features?[], audio?[], resume?}`, `audio {on}`, `mm {x,y}`, `mb {b,down,x,y}`, `wh {dx,dy}`, `key {code,key,down}`, `text {s}`, `clip {s}`, `cfg {fps,quality,max_width,display,codec?}`, `refresh` (alias `keyframe`), `bye` |
+| agent→viewer | `auth_required {password, click, switch?}`, `auth_pending`, `auth_result {ok, reason?, attempts_left?, retry_after?}`, `info {hostname, os, displays[], input, clipboard, files, codec, codecs?[], features?, encoder?, audio?, audio_codec?}`, `encoder {encoder,codec}`, `cursor {x,y,visible}`, `clip {s}` |
+| viewer→agent | `auth {password, codecs[], features?[], audio?[], resume?, switch?}`, `audio {on}`, `mm {x,y}`, `mb {b,down,x,y}`, `wh {dx,dy}`, `key {code,key,down}`, `text {s}`, `clip {s}`, `cfg {fps,quality,max_width,display,codec?}`, `refresh` (alias `keyframe`), `bye` |
 | files viewer→agent | `ls {path}` (`""` = home), `put {id,dir,name,size}` followed by `0x03` chunks and then `put_end {id}`, `get {id,path}`, `cancel {id}` |
 | files agent→viewer | `ls {path,parent,sep,entries[{name,dir,size,mtime}]}`, `put_ok {id,path}`, `put_done {id,path}`, `get_start {id,name,size}` followed by `0x03` chunks and then `get_end {id}`, `fs_error {op,id?,message}` |
 
@@ -422,3 +424,65 @@ After `info` the viewer sends `term_open {cols, rows}`; the agent then starts th
 | agent→viewer | `term_exit {code, message?}` when the shell exits (`message` when it could not start); the session then ends |
 
 Clients: the console's `/terminal/<id>` (xterm.js 5.5.0, menu *เทอร์มินัล* on a device), the app's terminal window (peer menu *เปิดเทอร์มินัล*; a VT100/xterm renderer with 256 colours, scrollback, paste, Thai through the system Thai font), and `aegiron-agent terminal <id> [--command CMD]` (raw mode on macOS/Linux; with `--command` it runs `CMD`, then `exit`, and returns the remote status).
+
+## 12. Chat, voice calls and switch sides
+
+In-session communication between the viewer and the person at the controlled machine, like RustDesk's chat, voice call and "switch sides". Everything travels inside the §4 encrypted channel: the server never sees chat text or voice, and nothing of it is stored (not on the server, not in session recordings, not on disk). All of it needs the desktop app (`aegiron`) on the controlled machine, whose connection manager shows it; the headless `aegiron-agent` never offers it. Only remote-control (screen) sessions have it: tunnel and terminal sessions (§11) never list these features, and the server issues switch-sides grants only for screen sessions. In the desktop app's tabbed viewer, a background tab shows its unread chat count on the tab.
+
+**Negotiation.** The agent lists `chat`, `voice` and `switch` in `info.features` (with the existing `fs2`, `clipfiles` and the display features); the viewer lists what it supports in `auth.features`. A feature is used only when both sides list it, so 0.4/0.5 agents and viewers never see these messages, and agents ignore them from viewers that did not list the feature.
+
+| Feature | Agent offers it when | Viewers that send it |
+|---|---|---|
+| `chat` | the desktop app is running | desktop app, browser |
+| `voice` | desktop app, `allow_voice` (default on, or set by a strategy; Settings → ความปลอดภัย → อนุญาตการโทรคุย, `aegiron-agent set --allow-voice false`), a microphone and an audio output (macOS, Windows) | desktop app with microphone and speaker; browsers with WebCodecs `AudioEncoder`/`AudioDecoder` for Opus and `getUserMedia` |
+| `switch` | the desktop app is running | desktop app whose own agent is online and signed in |
+
+### Chat (`chat`)
+
+Both directions: `chat {text}`, at most 4000 characters (longer is cut, blank is ignored). The connection manager shows a ข้อมูล / แชท switch per session with a red count of unread messages on the session's tab and on แชท, flashes its window (without taking focus) and on macOS posts a Notification Center notification. The viewer window (desktop and browser) has a chat button with an unread count, a toast for messages that arrive while the panel is closed, and a side panel.
+
+### Voice calls (`voice`)
+
+```
+viewer → agent  voice {op:"call"}                  the person at the agent has 30 s to answer
+agent  → viewer voice {op:"accept"}                both sides now send 0x07 packets
+             or voice {op:"decline", reason:"declined"|"timeout"|"unavailable"}
+either side     voice {op:"mute", muted}           informational: the muted side stops sending
+either side     voice {op:"hangup"}                also cancels a call not yet answered
+```
+
+Byte `0x07`: same layout as `0x05`: codec u8 (`1` = Opus), sequence u32 BE (+1 per 20 ms frame), one Opus packet, 48 kHz, 20 ms, **mono** at about 32 kbit/s (decoders also accept stereo). Packets flow only while a call that the person at the agent accepted is on, never before `accept` or after `hangup`, and are dropped rather than queued under congestion. They are never recorded, and system audio (`0x05`) continues independently.
+
+- **Agent**: an incoming call rings in the connection manager (รับสาย / ปฏิเสธ, declined automatically after 30 s, `reason:"timeout"`); during a call it shows the duration, ปิดไมค์ and วางสาย. A microphone that cannot be opened declines with `unavailable`. The agent reports `agent.voice_call` to the audit log when a call is accepted.
+- **Desktop app** (both ends): microphone through cpal (CoreAudio, WASAPI), mono Opus (VOIP mode), playback through the default output with a ~80 ms jitter buffer. There is no echo cancellation, so two desktop apps on loudspeakers can echo; headsets avoid it. macOS asks for the Microphone permission the first time (`NSMicrophoneUsageDescription` in the app bundle; MDM cannot pre-grant the microphone).
+- **Browser**: the call button asks for the microphone (`getUserMedia` with echo cancellation, noise suppression and gain control) before calling; it is captured at the device's rate, resampled to 48 kHz, encoded with WebCodecs `AudioEncoder` and played with `AudioDecoder` + Web Audio.
+
+### Switch sides (`switch`)
+
+The viewer lets the person at the controlled machine **H** control the viewer's own machine **V** in return. Only between two desktop apps: V's app runs the agent that is to be controlled. Nothing is ever accepted without the person at V having asked for it, and the person at H decides whether to take it.
+
+```
+V's app   user clicks สลับฝั่ง and confirms → secret S (32 random characters, one-time, 60 s,
+          kept in V's process only)
+V's app → server   POST /api/sessions/{sid}/switch {device_id: V}      (V's user bearer token)
+                   ← {grant: G, expires_in: 60}
+V's app → H (E2E)  switch_sides {grant: G, secret: S}
+H's CM            "<user> เชิญให้คุณควบคุมเครื่องของเขา" — ควบคุม / ปฏิเสธ (55 s)
+                  declined / failed → agent → viewer switch_result {ok:false, reason}
+H's agent → server (signaling)  {"t":"switch_connect","grant":G,"req":n,"direct":bool}
+server → H's agent  {"t":"switch_ticket","req":n,"ticket":{…},"device":{…}}  or  {…,"error":"invalid_grant"|"offline"|…}
+server → V's agent  {"t":"session",…,"viewer":{"email":"","name":<H's alias or hostname>,"ip"},"switch":true}
+H's app (viewer) → V's agent   §3 handshake as usual (V's device key from the ticket);
+                   auth_required {password:false, click:false, switch:true}
+                   auth {password:null, switch: S, …}
+V's agent         accepts only if S matches an unexpired offer of this process (constant time),
+                  then closes the window that controlled H; otherwise auth_result denied.
+```
+
+- **Grant** (server, in memory): one-time, 60 s, bound to the offering user, the session `sid` (which must be active, with that user as its viewer), the redeeming device H and the target V. V must be enabled, online, have a key, and be owned by the user or one the user may control (`canAccess`), and differ from H. A grant presented by another device is refused and stays valid for H. Rate limit 10 per minute per user. Audit: `session.switch_offered {sid, from}`, `session.switch_denied`, and the new session's `session.request` with `switch_from` and `viewer_device`.
+- **Relay**: the viewer token of a switched session went only to H's agent over its authenticated signaling connection (like the agent token), so the relay does not require a console login for it. The session is otherwise a normal session: recording policy, permissions (`allow_input`, …), direct/P2P paths, `session.start`/`end` audit, attributed to the user who offered.
+- **Why it is safe**: the server cannot open a session to V by itself (it never sees S, and V's agent refuses a switched session without it); H cannot use S without a fresh server grant tied to its device; a stolen grant is useless to any other device; S lives only in V's process memory, works once and expires after 60 s (also withdrawn when H declines or V's window closes). A server that hides `switch:true` from V's agent only gets the normal password prompt.
+- **Older peers**: an agent that does not list `switch` never gets the offer. An agent that ignores `"switch":true` asks for its password; H's app then stops with "รุ่นที่ไม่รองรับการสลับฝั่ง". Older servers answer the grant request with 404/405 and the app says so.
+- `aegiron-agent connect` (no desktop app) never offers switch sides; the browser viewer neither (it has no agent to accept a session).
+
+**Tests.** `AEGIRON_TEST_CM=auto` together with `AEGIRON_TEST_AUDIO=tone` makes a headless agent behave as if someone sat at the connection manager: it offers `chat` and `voice`, answers every call (its microphone is the test tone), echoes chat as `echo: …` and, when the viewer hangs up, reports `test: received N voice packets, peak rms X` in the chat. Without the test tone it does nothing, so it can never open a real microphone. Read from the environment only; the app and installers never set it.

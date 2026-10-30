@@ -11,6 +11,8 @@
 //!         frame) followed by one Opus packet. Only sent to viewers that asked for audio.
 //!   0x06  extra display stream: display (u8) followed by a complete 0x01/0x02/0x04 message for
 //!         that display (feature "multidisp", only after `cfg {streams}`).
+//!   0x07  voice packet (voice calls, both directions): same layout as 0x05, Opus 48 kHz mono
+//!         (decoders accept stereo too), 20 ms. Only while a call both sides agreed to is on.
 //!   0x10  TCP tunnel data (tunnel sessions): stream id (u32 BE) followed by up to 32 KiB
 //!   0x11  terminal data (terminal sessions): raw bytes, PTY output to the viewer and keyboard
 //!         input to the agent
@@ -37,6 +39,7 @@ pub fn stream(display: u8, msg: &[u8]) -> Vec<u8> {
     out.extend_from_slice(msg);
     out
 }
+pub const MSG_VOICE: u8 = 0x07;
 pub const MSG_TUNNEL: u8 = 0x10;
 pub const MSG_TERM: u8 = 0x11;
 
@@ -107,6 +110,28 @@ pub fn parse_audio(msg: &[u8]) -> Option<(u8, u32, &[u8])> {
     Some((msg[1], u32::from_be_bytes(msg[2..6].try_into().ok()?), &msg[6..]))
 }
 
+pub fn voice(seq: u32, data: &[u8]) -> Vec<u8> {
+    let mut out = audio(AUDIO_OPUS, seq, data);
+    out[0] = MSG_VOICE;
+    out
+}
+
+/// Splits a MSG_VOICE message into (codec, sequence, payload).
+pub fn parse_voice(msg: &[u8]) -> Option<(u8, u32, &[u8])> {
+    if msg.len() < 7 || msg[0] != MSG_VOICE {
+        return None;
+    }
+    Some((msg[1], u32::from_be_bytes(msg[2..6].try_into().ok()?), &msg[6..]))
+}
+
+/// Longest chat message, in characters; longer ones are cut.
+pub const CHAT_MAX: usize = 4000;
+
+/// Optional in-session features (`info.features` from the agent, `auth.features` from the viewer).
+pub const FEATURE_CHAT: &str = "chat";
+pub const FEATURE_VOICE: &str = "voice";
+pub const FEATURE_SWITCH: &str = "switch";
+
 /// Messages the viewer may send after the handshake.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "t")]
@@ -123,6 +148,9 @@ pub enum ViewerMsg {
         /// Audio codecs the viewer can play, e.g. ["opus"]; absent = no audio is sent.
         #[serde(default)]
         audio: Vec<String>,
+        /// Switch sides: the one-time secret this device's own user handed out (see switch.rs).
+        #[serde(default)]
+        switch: Option<String>,
         /// Session type the viewer asked the server for ("tunnel", "terminal"); absent = screen.
         /// Must match the type in the server's session request.
         #[serde(default)]
@@ -135,6 +163,19 @@ pub enum ViewerMsg {
         #[serde(default)]
         resume: Option<String>,
     },
+    /// Text chat with the person at this machine (feature "chat").
+    #[serde(rename = "chat")]
+    Chat { text: String },
+    /// Voice call (feature "voice"): `op` = "call" | "hangup" | "mute" (with `muted`).
+    #[serde(rename = "voice")]
+    Voice {
+        op: String,
+        #[serde(default)]
+        muted: bool,
+    },
+    /// Switch sides (feature "switch"): the server grant plus a secret for the viewer's agent.
+    #[serde(rename = "switch_sides")]
+    SwitchSides { grant: String, secret: String },
     /// Viewer muted (`on: false`) or unmuted its speaker; the agent stops/resumes 0x05 packets.
     #[serde(rename = "audio")]
     Audio { on: bool },
@@ -278,4 +319,32 @@ pub enum ViewerMsg {
     Refresh,
     #[serde(rename = "bye")]
     Bye,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn in_session_messages_parse() {
+        let m: ViewerMsg = serde_json::from_str(r#"{"t":"chat","text":"สวัสดี"}"#).unwrap();
+        assert!(matches!(m, ViewerMsg::Chat { text } if text == "สวัสดี"));
+        let m: ViewerMsg = serde_json::from_str(r#"{"t":"voice","op":"mute","muted":true}"#).unwrap();
+        assert!(matches!(m, ViewerMsg::Voice { op, muted: true } if op == "mute"));
+        let m: ViewerMsg = serde_json::from_str(r#"{"t":"voice","op":"call"}"#).unwrap();
+        assert!(matches!(m, ViewerMsg::Voice { muted: false, .. }));
+        let m: ViewerMsg = serde_json::from_str(r#"{"t":"switch_sides","grant":"g","secret":"s"}"#).unwrap();
+        assert!(matches!(m, ViewerMsg::SwitchSides { grant, secret } if grant == "g" && secret == "s"));
+        // Older viewers send no `switch`.
+        let m: ViewerMsg = serde_json::from_str(r#"{"t":"auth","password":"x","codecs":["h264"]}"#).unwrap();
+        assert!(matches!(m, ViewerMsg::Auth { switch: None, .. }));
+    }
+
+    #[test]
+    fn voice_packet_layout() {
+        let m = voice(7, &[1, 2, 3]);
+        assert_eq!(m, vec![MSG_VOICE, AUDIO_OPUS, 0, 0, 0, 7, 1, 2, 3]);
+        assert_eq!(parse_voice(&m), Some((AUDIO_OPUS, 7, &[1u8, 2, 3][..])));
+        assert_eq!(parse_audio(&m), None, "voice is not system audio");
+    }
 }

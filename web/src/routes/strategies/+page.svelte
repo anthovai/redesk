@@ -10,6 +10,7 @@
 		{ key: 'allow_clipboard', label: 'คลิปบอร์ด', hint: '' },
 		{ key: 'allow_file_transfer', label: 'รับ-ส่งไฟล์', hint: '' },
 		{ key: 'allow_audio', label: 'ส่งเสียง', hint: '' },
+		{ key: 'allow_voice', label: 'โทรคุยด้วยเสียง', hint: 'ผู้ควบคุมขอโทรได้ คนที่เครื่องต้องรับสายทุกครั้ง' },
 		{ key: 'allow_whiteboard', label: 'วาดบนหน้าจอ', hint: '' },
 		{ key: 'allow_resolution', label: 'เปลี่ยนความละเอียดหน้าจอ', hint: '' },
 		{ key: 'allow_block_input', label: 'บล็อกเมาส์/คีย์บอร์ดของเครื่อง', hint: '' },

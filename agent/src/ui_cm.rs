@@ -6,6 +6,7 @@
 use std::sync::OnceLock;
 
 use super::*;
+use crate::status::{CallState, HostCmd};
 
 const CM_SIZE: [f32; 2] = [320.0, 580.0];
 const TAB_HEIGHT: f32 = 44.0;
@@ -27,8 +28,18 @@ struct CmState {
     selected: Option<egui::Id>,
     /// Newest approval request already announced: focus is taken once per request.
     announced: Option<Instant>,
+    /// Newest in-session event (chat, call, invitation) already announced.
+    attention: Option<Instant>,
     pos: Option<[f32; 2]>,
+    /// Chat instead of the session details.
+    chat: bool,
+    /// Message being typed, per session.
+    drafts: HashMap<String, String>,
 }
+
+/// A switch-sides invitation not answered within this time is declined (the server grant
+/// expires after 60 s).
+const SWITCH_ANSWER: Duration = Duration::from_secs(55);
 
 enum Kind {
     /// Index into `App::pending` and time left before the automatic denial.
@@ -51,6 +62,10 @@ struct Entry {
 enum CmAction {
     Answer(usize, bool),
     Disconnect(SessionInfo),
+    /// Something for the session task (chat, call answer, mute, hang up).
+    Host(Arc<SessionLink>, HostCmd),
+    /// Switch sides: accept or decline the viewer's invitation.
+    Switch(Arc<SessionLink>, bool),
 }
 
 #[derive(Clone, Copy)]
@@ -60,6 +75,7 @@ struct Perms {
     files: bool,
     whiteboard: bool,
     audio: bool,
+    voice: bool,
     block_input: bool,
     privacy: bool,
     lock: bool,
@@ -115,6 +131,7 @@ enum Glyph {
     Folder,
     Pen,
     Speaker,
+    Mic,
     Block,
     Shield,
     Lock,
@@ -153,6 +170,11 @@ fn glyph(ui: &Ui, rect: Rect, g: Glyph, color: Color32) {
         Glyph::Pen => {
             p.add(Shape::closed_line(vec![at(10.8, 2.2), at(13.8, 5.2), at(5.5, 13.5), at(1.8, 14.2), at(2.5, 10.5)], st));
             p.line_segment([at(9.0, 4.0), at(12.0, 7.0)], st);
+        }
+        Glyph::Mic => {
+            p.rect_stroke(Rect::from_min_max(at(5.5, 1.5), at(10.5, 10.0)), 2.5 * s, st, egui::StrokeKind::Middle);
+            p.add(Shape::line(vec![at(3.0, 7.5), at(3.6, 10.0), at(5.5, 12.0), at(8.0, 12.8), at(10.5, 12.0), at(12.4, 10.0), at(13.0, 7.5)], st));
+            p.line_segment([at(8.0, 12.8), at(8.0, 15.0)], st);
         }
         Glyph::Speaker => {
             p.add(Shape::convex_polygon(
@@ -245,13 +267,14 @@ impl App {
                     files: c.allow_file_transfer,
                     whiteboard: c.allow_whiteboard,
                     audio: c.allow_audio,
+                    voice: c.allow_voice,
                     block_input: ctl.block_input,
                     privacy: ctl.privacy,
                     lock: ctl.lock,
                     restart: ctl.restart,
                 }
             })
-            .unwrap_or(Perms { input: false, clipboard: false, files: false, whiteboard: false, audio: false, block_input: false, privacy: false, lock: false, restart: false });
+            .unwrap_or(Perms { input: false, clipboard: false, files: false, whiteboard: false, audio: false, voice: false, block_input: false, privacy: false, lock: false, restart: false });
 
         // Tabs in arrival order: live sessions, then requests waiting for an answer.
         let mut entries: Vec<Entry> = sessions
@@ -281,6 +304,33 @@ impl App {
         }
 
         let mut st: CmState = ctx.data(|d| d.get_temp(state_id())).unwrap_or_default();
+        // Unanswered switch-sides invitations expire with their grant.
+        for e in &entries {
+            if let Kind::Session(s) = &e.kind {
+                let mut offer = s.link.switch_offer.lock().unwrap();
+                if offer.as_ref().is_some_and(|(_, _, at)| at.elapsed() > SWITCH_ANSWER) {
+                    *offer = None;
+                    let _ = s.link.cmd.send(HostCmd::SwitchFailed("timeout".into()));
+                }
+            }
+        }
+        // A chat message, call or invitation: show that session (its chat for a message) and
+        // flash the window, without taking focus from whatever the person is typing in.
+        let mut notify = false;
+        if let Some((a, at)) = &self.cm_attention
+            && st.attention.is_none_or(|t| *at > t)
+        {
+            st.attention = Some(*at);
+            if let Some(e) = entries.iter().find(|e| matches!(&e.kind, Kind::Session(s) if s.sid == a.sid)) {
+                if self.pending.is_empty() {
+                    st.selected = Some(e.key);
+                }
+                if let Kind::Session(s) = &e.kind {
+                    st.chat = s.link.chat && s.link.unread() > 0;
+                }
+            }
+            notify = true;
+        }
         // A new request: show its tab and bring the window forward, once.
         let mut announce = false;
         if let Some((_, at)) = self.pending.back()
@@ -325,6 +375,7 @@ impl App {
         }
 
         let mut selected = st.selected;
+        let (mut chat_page, mut drafts) = (st.chat, std::mem::take(&mut st.drafts));
         let action = ctx.show_viewport_immediate(cm_viewport(), builder, |ui, class| {
             if class == egui::ViewportClass::EmbeddedWindow {
                 // No native child windows here: use the modal from the next frame on.
@@ -336,6 +387,9 @@ impl App {
                 vctx.send_viewport_cmd(ViewportCommand::Minimized(false));
                 vctx.send_viewport_cmd(ViewportCommand::Focus);
                 vctx.send_viewport_cmd(ViewportCommand::RequestUserAttention(egui::UserAttentionType::Critical));
+            } else if notify {
+                vctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+                vctx.send_viewport_cmd(ViewportCommand::RequestUserAttention(egui::UserAttentionType::Informational));
             }
             // While a viewer blocks this machine's input, local clicks still reach this window
             // (macOS asks the input blocker; Windows hit-tests the window itself).
@@ -347,9 +401,11 @@ impl App {
                 vctx.send_viewport_cmd(ViewportCommand::CancelClose);
                 vctx.send_viewport_cmd(ViewportCommand::Minimized(true));
             }
-            cm_window(ui, &entries, &mut selected, perms)
+            cm_window(ui, &entries, &mut selected, perms, &mut chat_page, &mut drafts)
         });
         st.selected = selected;
+        st.chat = chat_page;
+        st.drafts = drafts;
         ctx.data_mut(|d| d.insert_temp(state_id(), st));
 
         match action {
@@ -359,6 +415,15 @@ impl App {
                 }
             }
             Some(CmAction::Disconnect(s)) => s.kill.notify_one(),
+            Some(CmAction::Host(link, cmd)) => {
+                let _ = link.cmd.send(cmd);
+            }
+            Some(CmAction::Switch(link, true)) => self.accept_switch(&ctx, link),
+            Some(CmAction::Switch(link, false)) => {
+                if link.switch_offer.lock().unwrap().take().is_some() {
+                    let _ = link.cmd.send(HostCmd::SwitchFailed("declined".into()));
+                }
+            }
             None => {}
         }
     }
@@ -436,6 +501,9 @@ impl App {
             if c.allow_audio {
                 p.push("เสียง");
             }
+            if c.allow_voice {
+                p.push("โทรคุย");
+            }
             p.join(" · ")
         });
         let mut answer = None;
@@ -511,7 +579,14 @@ fn allow_button(ui: &mut Ui) -> Response {
 }
 
 /// The connection-manager window: tab strip, the selected connection, its actions.
-fn cm_window(ui: &mut Ui, entries: &[Entry], selected: &mut Option<egui::Id>, perms: Perms) -> Option<CmAction> {
+fn cm_window(
+    ui: &mut Ui,
+    entries: &[Entry],
+    selected: &mut Option<egui::Id>,
+    perms: Perms,
+    chat_page: &mut bool,
+    drafts: &mut HashMap<String, String>,
+) -> Option<CmAction> {
     let pal = Palette::of(ui);
     egui::Panel::top("cm-tabs")
         .exact_size(TAB_HEIGHT)
@@ -540,6 +615,9 @@ fn cm_window(ui: &mut Ui, entries: &[Entry], selected: &mut Option<egui::Id>, pe
                 });
             }
             Kind::Session(s) => {
+                if let Some(a) = session_prompts(ui, s, &who_of(entry)) {
+                    action = Some(a);
+                }
                 let b = Button::new(RichText::new("ตัดการเชื่อมต่อ").font(semi(14.5)).color(Color32::WHITE))
                     .fill(pal.danger)
                     .stroke(Stroke::NONE)
@@ -551,10 +629,223 @@ fn cm_window(ui: &mut Ui, entries: &[Entry], selected: &mut Option<egui::Id>, pe
             }
         });
 
-    egui::CentralPanel::default().frame(Frame::new().fill(pal.bg).inner_margin(Margin { left: 18, right: 18, top: 16, bottom: 0 })).show(ui, |ui| {
-        egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt(entry.key).show(ui, |ui| details(ui, entry, perms));
+    let chat = match &entry.kind {
+        Kind::Session(s) if s.link.chat => Some(s),
+        _ => None,
+    };
+    if chat.is_none() {
+        *chat_page = false;
+    }
+    egui::CentralPanel::default().frame(Frame::new().fill(pal.bg).inner_margin(Margin { left: 18, right: 18, top: 12, bottom: 0 })).show(ui, |ui| {
+        if let Some(s) = chat {
+            page_switch(ui, chat_page, s.link.unread());
+            ui.add_space(8.0);
+        }
+        match chat {
+            Some(s) if *chat_page => {
+                s.link.mark_read();
+                let draft = drafts.entry(s.sid.clone()).or_default();
+                if let Some(text) = chat_view(ui, &s.link, draft, &who_of(entry)) {
+                    action = Some(CmAction::Host(s.link.clone(), HostCmd::Chat(text)));
+                }
+            }
+            _ => {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt(entry.key).show(ui, |ui| details(ui, entry, perms));
+            }
+        }
     });
+    drafts.retain(|sid, _| entries.iter().any(|e| matches!(&e.kind, Kind::Session(s) if &s.sid == sid)));
     action
+}
+
+fn who_of(e: &Entry) -> String {
+    if e.name.is_empty() { e.email.clone() } else { e.name.clone() }
+}
+
+/// "ข้อมูล | แชท" above a session that can chat; the chat side shows unread messages.
+fn page_switch(ui: &mut Ui, chat_page: &mut bool, unread: usize) {
+    let pal = Palette::of(ui);
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::hover());
+    ui.painter().rect_filled(rect, 8.0, pal.field);
+    let half = rect.width() / 2.0;
+    for (i, label) in ["ข้อมูล", "แชท"].into_iter().enumerate() {
+        let r = Rect::from_min_size(rect.min + vec2(half * i as f32, 0.0), vec2(half, rect.height())).shrink(3.0);
+        let on = *chat_page == (i == 1);
+        let resp = ui.interact(r, egui::Id::unique(("cm-page", i)), Sense::click());
+        if on {
+            ui.painter().rect_filled(r, 6.0, pal.bg);
+        }
+        let color = if on { pal.fg } else { pal.muted };
+        let font = if on { semi(13.0) } else { FontId::proportional(13.0) };
+        let galley = ui.painter().layout_no_wrap(label.to_owned(), font, color);
+        let mut x = r.center().x - galley.size().x / 2.0;
+        if i == 1 && unread > 0 {
+            x -= 10.0;
+            let badge = pos2(x + galley.size().x + 14.0, r.center().y);
+            ui.painter().circle_filled(badge, 8.0, pal.danger);
+            ui.painter().text(badge, Align2::CENTER_CENTER, unread.min(99).to_string(), semi(10.5), Color32::WHITE);
+        }
+        ui.painter().galley(pos2(x, r.center().y - galley.size().y / 2.0), galley, color);
+        if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+            *chat_page = i == 1;
+        }
+    }
+}
+
+/// Chat with the viewer of one session: messages, then a line to type in. Returns a message
+/// to send.
+fn chat_view(ui: &mut Ui, link: &SessionLink, draft: &mut String, who: &str) -> Option<String> {
+    let pal = Palette::of(ui);
+    let lines = link.lines.lock().unwrap().clone();
+    let input_h = 40.0;
+    let mut send = None;
+    let list_h = (ui.available_height() - input_h - 12.0).max(60.0);
+    egui::ScrollArea::vertical().id_salt("cm-chat").max_height(list_h).auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
+        if lines.is_empty() {
+            ui.add_space(24.0);
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new(format!("พิมพ์ข้อความถึง {who}")).size(13.0).color(pal.muted));
+                ui.label(RichText::new("ข้อความไม่ถูกเก็บไว้ที่เซิร์ฟเวอร์ และหายไปเมื่อจบการเชื่อมต่อ").size(11.5).color(pal.muted));
+            });
+        }
+        for l in &lines {
+            chat_bubble(ui, l.mine, &l.text, l.at);
+        }
+    });
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        let w = ui.available_width() - 44.0;
+        let edit = ui.add(
+            TextEdit::singleline(draft)
+                .hint_text("ข้อความ")
+                .desired_width(w)
+                .margin(Margin::symmetric(10, 8))
+                .char_limit(crate::proto::CHAT_MAX),
+        );
+        let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let b = Button::new(RichText::new("ส่ง").font(semi(13.0)).color(pal.on_accent)).fill(pal.accent).corner_radius(8).min_size(vec2(40.0, 34.0));
+        let clicked = ui.add_enabled(!draft.trim().is_empty(), b).clicked();
+        if (enter || clicked) && !draft.trim().is_empty() {
+            send = Some(std::mem::take(draft));
+            edit.request_focus();
+        }
+    });
+    send
+}
+
+/// One chat message: this side on the right in the accent color, the other on the left.
+pub(super) fn chat_bubble(ui: &mut Ui, mine: bool, text: &str, at: SystemTime) {
+    let pal = Palette::of(ui);
+    let max = (ui.available_width() * 0.8).max(120.0);
+    let (fill, fg) = if mine { (pal.accent, pal.on_accent) } else { (pal.field, pal.fg) };
+    let layout = if mine { Layout::right_to_left(Align::Min) } else { Layout::left_to_right(Align::Min) };
+    ui.with_layout(layout, |ui| {
+        ui.vertical(|ui| {
+            Frame::new().fill(fill).corner_radius(10).inner_margin(Margin::symmetric(10, 6)).show(ui, |ui| {
+                ui.set_max_width(max);
+                ui.add(egui::Label::new(RichText::new(text).size(13.5).color(fg)).wrap().selectable(true));
+            });
+            ui.label(RichText::new(ago(at)).size(10.5).color(pal.muted));
+        });
+    });
+    ui.add_space(2.0);
+}
+
+/// How long ago a chat message was sent ("ตอนนี้", "5 นาทีที่แล้ว").
+pub(super) fn ago(at: SystemTime) -> String {
+    match at.elapsed().map(|d| d.as_secs()).unwrap_or(0) {
+        0..60 => "ตอนนี้".into(),
+        s @ 60..3600 => format!("{} นาทีที่แล้ว", s / 60),
+        s => format!("{} ชม. ที่แล้ว", s / 3600),
+    }
+}
+
+/// Voice call and switch-sides prompts above the disconnect button.
+fn session_prompts(ui: &mut Ui, s: &SessionInfo, who: &str) -> Option<CmAction> {
+    let pal = Palette::of(ui);
+    let link = &s.link;
+    let mut action = None;
+    let card = |ui: &mut Ui, tint: Color32, body: &mut dyn FnMut(&mut Ui)| {
+        Frame::new().fill(tint.gamma_multiply(0.12)).corner_radius(10).inner_margin(Margin::symmetric(12, 10)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            body(ui);
+        });
+        ui.add_space(8.0);
+    };
+    if link.switch_offer.lock().unwrap().is_some() {
+        card(ui, pal.accent, &mut |ui| {
+            ui.label(RichText::new("สลับฝั่ง").font(semi(13.5)).color(pal.fg));
+            ui.label(RichText::new(format!("{who} เชิญให้คุณควบคุมเครื่องของเขา")).size(12.5).color(pal.muted));
+            ui.add_space(6.0);
+            ui.columns(2, |cols| {
+                if cols[0].vertical_centered(small_deny("ปฏิเสธ")).inner.clicked() {
+                    action = Some(CmAction::Switch(link.clone(), false));
+                }
+                if cols[1].vertical_centered(small_allow("ควบคุม")).inner.clicked() {
+                    action = Some(CmAction::Switch(link.clone(), true));
+                }
+            });
+        });
+    }
+    match link.call_state() {
+        CallState::Ringing(at) => {
+            let left = crate::session::RING_TIMEOUT.saturating_sub(at.elapsed()).as_secs();
+            card(ui, pal.ok, &mut |ui| {
+                ui.label(RichText::new("สายเรียกเข้า (เสียง)").font(semi(13.5)).color(pal.fg));
+                ui.label(RichText::new(format!("{who} ขอโทรคุย · ปฏิเสธอัตโนมัติใน {left} วินาที")).size(12.5).color(pal.muted));
+                ui.add_space(6.0);
+                ui.columns(2, |cols| {
+                    if cols[0].vertical_centered(small_deny("ปฏิเสธ")).inner.clicked() {
+                        action = Some(CmAction::Host(link.clone(), HostCmd::Answer(false)));
+                    }
+                    if cols[1].vertical_centered(small_allow("รับสาย")).inner.clicked() {
+                        action = Some(CmAction::Host(link.clone(), HostCmd::Answer(true)));
+                    }
+                });
+            });
+            ui.ctx().request_repaint_after(Duration::from_millis(500));
+        }
+        CallState::Active { since, muted, remote_muted } => {
+            card(ui, pal.ok, &mut |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        let t = since.elapsed().as_secs();
+                        ui.label(RichText::new(format!("กำลังโทร  {:02}:{:02}", t / 60, t % 60)).font(semi(13.5)).color(pal.fg));
+                        if remote_muted {
+                            ui.label(RichText::new("อีกฝ่ายปิดไมค์อยู่").size(12.0).color(pal.muted));
+                        }
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.add(Button::new(RichText::new("วางสาย").color(Color32::WHITE)).fill(pal.danger).corner_radius(8)).clicked() {
+                            action = Some(CmAction::Host(link.clone(), HostCmd::Hangup));
+                        }
+                        let label = if muted { "เปิดไมค์" } else { "ปิดไมค์" };
+                        if ui.add(Button::new(label).corner_radius(8)).clicked() {
+                            action = Some(CmAction::Host(link.clone(), HostCmd::Mute(!muted)));
+                        }
+                    });
+                });
+            });
+            ui.ctx().request_repaint_after(Duration::from_millis(500));
+        }
+        CallState::Idle => {}
+    }
+    action
+}
+
+fn small_deny(text: &'static str) -> impl FnOnce(&mut Ui) -> Response {
+    move |ui| {
+        let pal = Palette::of(ui);
+        ui.add(Button::new(RichText::new(text).font(semi(13.5)).color(pal.fg)).fill(pal.bg).stroke(Stroke::new(1.0, pal.line)).corner_radius(8).min_size(vec2(ui.available_width(), 34.0)))
+    }
+}
+
+fn small_allow(text: &'static str) -> impl FnOnce(&mut Ui) -> Response {
+    move |ui| {
+        let pal = Palette::of(ui);
+        ui.add(Button::new(RichText::new(text).font(semi(13.5)).color(pal.on_accent)).fill(pal.accent).stroke(Stroke::NONE).corner_radius(8).min_size(vec2(ui.available_width(), 34.0)))
+    }
 }
 
 fn tab_strip(ui: &mut Ui, entries: &[Entry], selected: &mut Option<egui::Id>) {
@@ -578,8 +869,22 @@ fn tab_strip(ui: &mut Ui, entries: &[Entry], selected: &mut Option<egui::Id>) {
                 let c = rect.left_center() + vec2(22.0, 0.0);
                 p.circle_filled(c, 11.0, tint(who));
                 p.text(c, Align2::CENTER_CENTER, initials(&e.name, &e.email), semi(11.5), Color32::WHITE);
-                if matches!(e.kind, Kind::Pending(..)) {
-                    // Waiting for an answer: an orange dot on the avatar.
+                let waiting = match &e.kind {
+                    Kind::Pending(..) => true,
+                    Kind::Session(s) => matches!(s.link.call_state(), CallState::Ringing(_)) || s.link.switch_offer.lock().unwrap().is_some(),
+                };
+                let unread = match &e.kind {
+                    Kind::Session(s) => s.link.unread(),
+                    Kind::Pending(..) => 0,
+                };
+                if unread > 0 {
+                    // Unread chat messages: a red count on the avatar.
+                    let b = c + vec2(9.0, -8.0);
+                    p.circle_filled(b, 7.5, pal.side);
+                    p.circle_filled(b, 6.5, pal.danger);
+                    p.text(b, Align2::CENTER_CENTER, unread.min(9).to_string(), semi(9.5), Color32::WHITE);
+                } else if waiting {
+                    // Waiting for an answer (approval, call, invitation): an orange dot.
                     p.circle_filled(c + vec2(8.0, -8.0), 4.5, pal.side);
                     p.circle_filled(c + vec2(8.0, -8.0), 3.2, pal.warn);
                 }
@@ -690,6 +995,9 @@ fn details(ui: &mut Ui, e: &Entry, perms: Perms) {
     ui.horizontal(|ui| {
         perm_tile(ui, Glyph::Lock, "ล็อกหน้าจอ", perms.lock, size);
         perm_tile(ui, Glyph::Power, "รีสตาร์ท", perms.restart, size);
+    });
+    ui.horizontal(|ui| {
+        perm_tile(ui, Glyph::Mic, "โทรคุย (ต้องรับสาย)", perms.voice, size);
     });
 }
 
