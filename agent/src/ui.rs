@@ -48,6 +48,8 @@ mod cm_ui;
 mod viewer_ui;
 #[path = "ui_overlay.rs"]
 mod overlay_ui;
+#[path = "ui_remote.rs"]
+mod remote_ui;
 
 pub use viewer_ui::ViewerWindow;
 
@@ -151,7 +153,9 @@ fn install_fonts(ctx: &egui::Context) {
     let regular = load(REGULAR);
     let semibold = load(SEMIBOLD);
     if let Some(r) = regular.clone() {
-        ctx.add_font(FontInsert::new("ui-regular", r, vec![fam(FontFamily::Proportional)]));
+        // Also the fallback for Thai in monospace text (terminal windows).
+        let mono_fallback = InsertFontFamily { family: FontFamily::Monospace, priority: FontPriority::Lowest };
+        ctx.add_font(FontInsert::new("ui-regular", r, vec![fam(FontFamily::Proportional), mono_fallback]));
     }
     if let Some(s) = semibold.or(regular) {
         ctx.add_font(FontInsert::new("ui-semibold", s, vec![fam(FontFamily::Name("semi".into()))]));
@@ -694,6 +698,8 @@ fn view_toggle(ui: &mut Ui, icon: Icon, on: bool, tip: &str) -> Response {
 /// What the user picked on a device card or row.
 enum PeerAction {
     Connect(String, String),
+    Terminal(String, String),
+    Tunnel(String, String),
     Star(String),
     CopyId(String),
     Forget(String),
@@ -841,6 +847,11 @@ pub struct App {
     lan_busy: bool,
     update: UpdateState,
     viewers: Vec<Arc<ViewerWindow>>,
+    /// Terminal windows (one per remote shell).
+    terminals: Vec<Arc<remote_ui::TerminalWindow>>,
+    /// TCP tunnels opened from this app, with a key for the list.
+    tunnels: Arc<Mutex<Vec<(u64, Arc<crate::tunnel::Tunnel>)>>>,
+    tunnel_form: Option<remote_ui::TunnelForm>,
     new_pw: String,
     new_pw2: String,
     autostart: bool,
@@ -902,6 +913,9 @@ impl App {
             lan_busy: false,
             update: UpdateState::default(),
             viewers: Vec::new(),
+            terminals: Vec::new(),
+            tunnels: Arc::default(),
+            tunnel_form: None,
             new_pw: String::new(),
             new_pw2: String::new(),
             autostart: service::is_installed(),
@@ -992,6 +1006,7 @@ impl App {
                 started: SystemTime::now() - Duration::from_secs(754),
                 kill: Default::default(),
                 recording: view == "home" && std::env::var_os("AEGIRON_UI_DEMO_RECORDING").is_some(),
+                purpose: String::new(),
             });
             if std::env::var_os("AEGIRON_UI_DEMO_WHITEBOARD").is_some() {
                 // A circled spot and an arrow pointing at it, as a viewer would draw them.
@@ -1054,7 +1069,7 @@ impl App {
         if view == "approval" {
             let (reply, _) = tokio::sync::oneshot::channel();
             self.pending.push_back((
-                ApprovalRequest { sid: String::new(), who: "สุดา รักงาน <suda@kgarden.co.th>".into(), ip: "10.1.20.45".into(), recording: std::env::var_os("AEGIRON_UI_DEMO_RECORDING").is_some(), reply },
+                ApprovalRequest { sid: String::new(), who: "สุดา รักงาน <suda@kgarden.co.th>".into(), ip: "10.1.20.45".into(), recording: std::env::var_os("AEGIRON_UI_DEMO_RECORDING").is_some(), purpose: String::new(), reply },
                 Instant::now() - Duration::from_secs(8),
             ));
         }
@@ -1629,6 +1644,11 @@ impl eframe::App for App {
             }
         }
         self.show_viewers(ui.ctx());
+        self.show_terminals(ui.ctx());
+        if self.agent.is_some() {
+            self.tunnel_dialog(ui);
+            self.tunnels_panel(ui);
+        }
         self.connection_manager(ui);
         self.whiteboard_overlay(ui.ctx());
         self.toast_view(ui);
@@ -2036,6 +2056,17 @@ impl App {
                 let ctx = ui.ctx().clone();
                 self.open_remote(&ctx, &id, &name);
             }
+            Some(PeerAction::Terminal(id, name)) => {
+                let ctx = ui.ctx().clone();
+                self.open_terminal(&ctx, &id, &name);
+            }
+            Some(PeerAction::Tunnel(id, name)) => {
+                if self.account().is_some() {
+                    self.tunnel_form = Some(remote_ui::TunnelForm::new(&id, &name));
+                } else {
+                    self.flash("เข้าสู่ระบบก่อน เพื่อเปิด TCP tunnel");
+                }
+            }
             Some(PeerAction::Star(id)) => {
                 self.local.toggle_favorite(&id);
                 self.mark_local();
@@ -2067,6 +2098,13 @@ impl App {
         if ui.add_enabled(!offline, Button::new("เชื่อมต่อ")).clicked() {
             *action = Some(PeerAction::Connect(r.id.clone(), r.title.clone()));
         }
+        if ui.add_enabled(!offline, Button::new("เปิดเทอร์มินัล")).clicked() {
+            *action = Some(PeerAction::Terminal(r.id.clone(), r.title.clone()));
+        }
+        if ui.add_enabled(!offline, Button::new("TCP tunnel…")).clicked() {
+            *action = Some(PeerAction::Tunnel(r.id.clone(), r.title.clone()));
+        }
+        ui.separator();
         let fav = if self.local.is_favorite(&r.id) { "เอาออกจากรายการโปรด" } else { "เพิ่มในรายการโปรด" };
         if ui.button(fav).clicked() {
             *action = Some(PeerAction::Star(r.id.clone()));

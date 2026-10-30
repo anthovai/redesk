@@ -157,6 +157,16 @@ pub struct Config {
     /// Outbound proxy for every connection to the server (signaling, relay, HTTPS API).
     #[serde(default)]
     pub proxy: Option<crate::net::ProxyConfig>,
+    /// Let viewers open TCP tunnels through this machine (port forwarding). Off by default.
+    #[serde(default)]
+    pub allow_tunnel: bool,
+    /// Tunnels may also reach private network addresses (RFC 1918, link-local, IPv6 ULA), not
+    /// only this machine. Never the public internet.
+    #[serde(default)]
+    pub allow_tunnel_lan: bool,
+    /// Let viewers open a shell on this machine (as this user). Off by default.
+    #[serde(default)]
+    pub allow_terminal: bool,
     /// Trusted-device tokens for 2FA sign-in, one per (server, email). Secrets: this file is
     /// owner-only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -204,6 +214,9 @@ impl Config {
             direct_enabled: true,
             direct_port: crate::direct::DEFAULT_PORT,
             proxy: None,
+            allow_tunnel: false,
+            allow_tunnel_lan: false,
+            allow_terminal: false,
             trusted_logins: Vec::new(),
         })
     }

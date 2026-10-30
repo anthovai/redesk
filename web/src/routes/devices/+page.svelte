@@ -92,6 +92,7 @@
 	function peerActions(d: Device): PeerAction[] {
 		return [
 			{ label: 'เชื่อมต่อ', icon: 'link', href: `/connect/${d.id}`, disabled: !canConnect(d) },
+			{ label: 'เทอร์มินัล', icon: 'terminal', href: `/terminal/${d.id}`, disabled: !canConnect(d) },
 			...(d.can_wake ? [{ label: 'ปลุกเครื่อง', icon: 'power', onclick: () => wake(d), disabled: waking === d.id } satisfies PeerAction] : []),
 			{ label: 'เพิ่มในสมุดที่อยู่', icon: 'book', onclick: () => addToBook(d) },
 			{ label: 'รายละเอียด', icon: 'edit', onclick: () => open(d), divider: true }

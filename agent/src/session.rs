@@ -24,6 +24,7 @@ use crate::files;
 use crate::input;
 use crate::proto::{self, ViewerMsg};
 use crate::recording::{RecordRequest, Recorder};
+use crate::remote::{Conn, SessionKind};
 use crate::signal::{Agent, Viewer};
 use crate::whiteboard::Board;
 use crate::status::{ApprovalRequest, SessionInfo};
@@ -39,7 +40,17 @@ struct Hello {
     epk: String,
 }
 
-pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer: Viewer, record: Option<RecordRequest>, direct: Option<crate::direct::Offer>) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+pub async fn run(
+    agent: Arc<Agent>,
+    sid: &str,
+    token: &str,
+    relay: &str,
+    viewer: Viewer,
+    record: Option<RecordRequest>,
+    direct: Option<crate::direct::Offer>,
+    kind: SessionKind,
+) -> Result<()> {
     let base = agent.config.lock().unwrap().ws_base()?;
     let url = format!("{base}{relay}?sid={sid}&token={token}");
 
@@ -59,6 +70,15 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
     tx.send(Message::Text(reply.to_string().into())).await?;
     let mut ch = hs.channel;
 
+    // Tunnels and terminals need the device's explicit permission (off by default): refuse
+    // before asking for a password.
+    if let Some(reason) = refuse_kind(&agent, &kind, record.is_some()).await {
+        tracing::warn!("session {sid}: refused {} session from {} ({reason})", kind.name(), viewer.email);
+        agent.report(sid, "denied", json!({"reason": reason, "session": kind.name(), "target": kind.target()}));
+        send_json(&mut tx, &mut ch, json!({"t": "auth_result", "ok": false, "reason": reason})).await?;
+        bail!("{reason}");
+    }
+
     // 3. Authentication inside the encrypted channel.
     let (verification, approve) = {
         let c = agent.config.lock().unwrap();
@@ -73,9 +93,15 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
     let mut viewer_features;
     let mut wants_audio;
     loop {
-        let Incoming::Msg(ViewerMsg::Auth { password, codecs, features, audio }) = read_viewer(&mut rx, &mut ch, Duration::from_secs(120)).await? else {
+        let Incoming::Msg(ViewerMsg::Auth { password, codecs, features, audio, session, target }) = read_viewer(&mut rx, &mut ch, Duration::from_secs(120)).await? else {
             bail!("expected auth message")
         };
+        // The viewer must want the session the server asked for (an old server would turn a
+        // terminal request into a screen session, and vice versa).
+        if session.as_deref().unwrap_or("screen") != kind.name() || target != kind.target() {
+            send_json(&mut tx, &mut ch, json!({"t": "auth_result", "ok": false, "reason": "session_mismatch"})).await?;
+            bail!("session type mismatch");
+        }
         attempts += 1;
         viewer_codecs = codecs;
         viewer_features = features;
@@ -102,7 +128,7 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
         }
         if need_click {
             send_json(&mut tx, &mut ch, json!({"t": "auth_pending"})).await?;
-            if !ask_local_user(&agent, &viewer, record.is_some()).await {
+            if !ask_local_user(&agent, &viewer, record.is_some(), &kind.purpose()).await {
                 agent.report(sid, "denied", json!({}));
                 send_json(&mut tx, &mut ch, json!({"t": "auth_result", "ok": false, "reason": "denied"})).await?;
                 bail!("denied by local user");
@@ -114,7 +140,7 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
     if need_password && verification != Verification::Permanent {
         agent.rotate_temp_password(); // one-time: the password just used is now dead
     }
-    tracing::info!("session {sid}: {} ({}) is now controlling this machine", viewer.email, viewer.ip);
+    tracing::info!("session {sid}: {} ({}) is now connected ({})", viewer.email, viewer.ip, kind.name());
 
     // Recording required by the organisation's policy: the session does not go ahead unrecorded.
     let mut recorder = RecordingGuard { agent: agent.clone(), rec: None };
@@ -148,11 +174,22 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
         started: std::time::SystemTime::now(),
         kill: kill.clone(),
         recording,
+        purpose: kind.purpose(),
     });
     agent.changed();
     let _registered = Registered { agent: agent.clone(), sid: sid.to_string() };
     agent.report(sid, "auth_ok", json!({"method": if need_password { "password" } else { "click" }, "approved_locally": need_click}));
     let _awake = crate::power::KeepAwake::new("Aegiron remote session");
+
+    // Tunnel and terminal sessions stream no screen.
+    if kind != SessionKind::Screen {
+        send_json(&mut tx, &mut ch, json!({"t": "auth_result", "ok": true})).await?;
+        let mut conn = Conn { tx, rx, ch };
+        return match &kind {
+            SessionKind::Tunnel { host, port } => crate::tunnel::serve(&agent, sid, &mut conn, kill, host, *port).await,
+            _ => crate::terminal::serve(&agent, sid, &mut conn, kill, &mut recorder.rec).await,
+        };
+    }
 
     // 4. Stream.
     let cfg = agent.config.lock().unwrap().clone();
@@ -531,14 +568,30 @@ fn record_failure(agent: &Agent) {
 /// Asks the person at the machine to accept the connection. Shows a desktop dialog
 /// (macOS osascript / Linux zenity) and, when attached to a terminal, a y/N prompt;
 /// whichever is answered first wins. No answer within 30s means deny.
-async fn ask_local_user(agent: &Agent, viewer: &Viewer, recorded: bool) -> bool {
+/// Why this device does not run a tunnel or terminal session, as `auth_result.reason`.
+async fn refuse_kind(agent: &Agent, kind: &SessionKind, recorded: bool) -> Option<&'static str> {
+    let (tunnel, lan, terminal) = {
+        let c = agent.config.lock().unwrap();
+        (c.allow_tunnel, c.allow_tunnel_lan, c.allow_terminal)
+    };
+    match kind {
+        SessionKind::Screen => None,
+        SessionKind::Terminal => (!terminal).then_some("terminal_disabled"),
+        SessionKind::Tunnel { .. } if !tunnel => Some("tunnel_disabled"),
+        // Tunnelled traffic cannot be recorded; a policy that requires recording forbids them.
+        SessionKind::Tunnel { .. } if recorded => Some("recording_required"),
+        SessionKind::Tunnel { host, port } => crate::remote::resolve_allowed(host, *port, lan).await.is_err().then_some("target_not_allowed"),
+    }
+}
+
+async fn ask_local_user(agent: &Agent, viewer: &Viewer, recorded: bool, purpose: &str) -> bool {
     let who = if viewer.name.is_empty() { viewer.email.clone() } else { format!("{} <{}>", viewer.name, viewer.email) };
 
     // Desktop app running: ask in its window instead of a separate dialog.
     let ui_tx = agent.ui.lock().unwrap().as_ref().map(|u| (u.approvals.clone(), u.repaint.clone()));
     if let Some((tx, repaint)) = ui_tx {
         let (reply, answer) = tokio::sync::oneshot::channel();
-        let req = ApprovalRequest { sid: String::new(), who: who.clone(), ip: viewer.ip.clone(), recording: recorded, reply };
+        let req = ApprovalRequest { sid: String::new(), who: who.clone(), ip: viewer.ip.clone(), recording: recorded, purpose: purpose.to_string(), reply };
         if tx.send(req).is_ok() {
             repaint();
             return matches!(tokio::time::timeout(Duration::from_secs(30), answer).await, Ok(Ok(true)));
@@ -546,7 +599,10 @@ async fn ask_local_user(agent: &Agent, viewer: &Viewer, recorded: bool) -> bool 
     }
 
     let note = if recorded { "\nเซสชันนี้จะถูกบันทึกตามนโยบายขององค์กร" } else { "" };
-    let question = format!("{who} ({}) ขอควบคุมเครื่องนี้ผ่าน Aegiron{note}\nอนุญาตหรือไม่?", viewer.ip);
+    let question = match purpose {
+        "" => format!("{who} ({}) ขอควบคุมเครื่องนี้ผ่าน Aegiron{note}\nอนุญาตหรือไม่?", viewer.ip),
+        p => format!("{who} ({}) ขอ{p}ผ่าน Aegiron{note}\nอนุญาตหรือไม่?", viewer.ip),
+    };
 
     let terminal = async {
         if !std::io::stdin().is_terminal() {
@@ -555,7 +611,11 @@ async fn ask_local_user(agent: &Agent, viewer: &Viewer, recorded: bool) -> bool 
         let mut lines = agent.stdin_lines.lock().await;
         while lines.try_recv().is_ok() {}
         let rec = if recorded { " The session will be recorded." } else { "" };
-        println!("\n  >>> Remote control requested by {who} from {}.{rec} Allow? [y/N] (30s)", viewer.ip);
+        let what = match purpose {
+            "" => "Remote control".to_string(),
+            p => format!("{p} —"),
+        };
+        println!("\n  >>> {what} requested by {who} from {}.{rec} Allow? [y/N] (30s)", viewer.ip);
         match lines.recv().await {
             Some(l) => matches!(l.trim().to_lowercase().as_str(), "y" | "yes"),
             None => std::future::pending::<bool>().await,

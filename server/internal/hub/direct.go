@@ -213,7 +213,7 @@ func (h *Hub) directStarted(ctx context.Context, a *agentConn, m agentMsg) {
 	}
 	_ = h.store.MarkSessionStarted(ctx, rl.sid)
 	uid := rl.userID
-	_ = h.store.AddAudit(ctx, &uid, rl.viewerIP, "session.start", rl.deviceID, map[string]any{"sid": rl.sid, "path": m.Path})
+	_ = h.store.AddAudit(ctx, &uid, rl.viewerIP, "session.start", rl.deviceID, rl.tagged(map[string]any{"sid": rl.sid, "path": m.Path}))
 	h.log.Info("session started", "sid", rl.sid, "device", rl.deviceID, "path", m.Path)
 }
 
@@ -237,10 +237,10 @@ func (h *Hub) directEnded(rl *relay, reason string, toViewer, toAgent int64) {
 		defer cancel()
 		_ = h.store.MarkSessionEnded(ctx, rl.sid, toViewer, toAgent, reason)
 		uid := rl.userID
-		_ = h.store.AddAudit(ctx, &uid, rl.viewerIP, "session.end", rl.deviceID, map[string]any{
+		_ = h.store.AddAudit(ctx, &uid, rl.viewerIP, "session.end", rl.deviceID, rl.tagged(map[string]any{
 			"sid": rl.sid, "path": d.pathName(), "reason": reason, "seconds": int(time.Since(d.startedAt).Seconds()),
 			"bytes_to_viewer": toViewer, "bytes_to_agent": toAgent,
-		})
+		}))
 		h.log.Info("session ended", "sid", rl.sid, "device", rl.deviceID, "path", d.pathName(), "reason", reason)
 	})
 }

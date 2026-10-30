@@ -539,7 +539,7 @@ impl Viewer {
 }
 
 /// Human-readable reason for a relay close code (same wording as the web viewer).
-fn explain_close(reason: &str) -> String {
+pub(crate) fn explain_close(reason: &str) -> String {
     if let Some(r) = reason.strip_prefix("agent_rejected:") {
         let r = r.trim();
         return if r.contains("denied") {

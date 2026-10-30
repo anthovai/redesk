@@ -6,7 +6,8 @@
 //
 // A payload is one plaintext message exactly as the agent streamed it inside the encrypted
 // channel (type byte first: 0x01 JSON, 0x02 JPEG rectangle, 0x04 video frame, 0x05 audio
-// packet). Recordings made before audio was recorded simply have no 0x05 records.
+// packet, 0x11 terminal output). Recordings made before audio was recorded simply have no 0x05
+// records; terminal sessions have only 0x11 output and 0x01 term_size records.
 package recording
 
 import (
@@ -27,6 +28,7 @@ const (
 	msgFrame  = 0x02
 	msgVideo  = 0x04
 	msgAudio  = 0x05
+	msgTerm   = 0x11
 	videoH264 = 1
 	videoAV1  = 2
 	audioOpus = 1
@@ -45,7 +47,7 @@ type Info struct {
 	Header       Header
 	DurationMS   int64
 	Frames       int
-	Codec        string // codecs seen, "+"-joined in the order h264, av1, jpeg ("h264+jpeg"), or "" (no video)
+	Codec        string // codecs seen, "+"-joined in the order h264, av1, jpeg ("h264+jpeg"); "terminal" for a terminal session; "" (no video)
 	Audio        string // "opus" or "" (no sound recorded)
 	AudioPackets int
 }
@@ -69,7 +71,7 @@ func Scan(r io.Reader) (*Info, error) {
 	if err := json.Unmarshal(hb, &info.Header); err != nil || info.Header.V != 1 {
 		return nil, errors.New("unsupported recording header")
 	}
-	var h264, av1, jpeg bool
+	var h264, av1, jpeg, term bool
 	var hdr [8]byte
 	var typ [1]byte
 	for i := 0; ; i++ {
@@ -108,6 +110,8 @@ func Scan(r io.Reader) (*Info, error) {
 			rest--
 			h264 = h264 || codec[0] == videoH264
 			av1 = av1 || codec[0] == videoAV1
+		case msgTerm:
+			term = true
 		case msgAudio:
 			// codec u8, sequence u32 BE, then at least one byte of Opus.
 			var codec [1]byte
@@ -135,6 +139,9 @@ func Scan(r io.Reader) (*Info, error) {
 		if c.seen {
 			codecs = append(codecs, c.name)
 		}
+	}
+	if len(codecs) == 0 && term {
+		codecs = append(codecs, "terminal")
 	}
 	info.Codec = strings.Join(codecs, "+")
 	return info, nil

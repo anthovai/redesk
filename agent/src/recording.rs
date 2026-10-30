@@ -73,14 +73,16 @@ fn private_dir(dir: &Path) -> std::io::Result<()> {
 
 /// Whether a streamed message belongs in the recording: video, audio and the pointer, not the
 /// clipboard, file chunks or other control traffic. Audio only reaches the recorder when the
-/// session streams it (the device allows audio and the viewer has not muted it).
+/// session streams it (the device allows audio and the viewer has not muted it). Terminal
+/// sessions record the shell's output and the terminal size, like `script(1)`; keystrokes are
+/// not recorded (passwords typed at a prompt are not echoed, so they stay out).
 fn wanted(plain: &[u8]) -> bool {
     match plain.first() {
-        Some(&proto::MSG_FRAME) | Some(&proto::MSG_VIDEO) => true,
+        Some(&proto::MSG_FRAME) | Some(&proto::MSG_VIDEO) | Some(&proto::MSG_TERM) => true,
         Some(&proto::MSG_AUDIO) => proto::parse_audio(plain).is_some(),
         Some(&proto::MSG_JSON) => {
             let head = &plain[1..plain.len().min(40)];
-            head.windows(12).any(|w| w == br#""t":"cursor""#)
+            head.windows(12).any(|w| w == br#""t":"cursor""#) || head.windows(15).any(|w| w == br#""t":"term_size""#)
         }
         _ => false,
     }
@@ -389,6 +391,25 @@ mod tests {
         recover(&root.join("agent.toml"));
         let salvaged = fs::read(dir.join("sid_2.aerec")).unwrap();
         assert_eq!(records(&salvaged).len(), 4);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn records_terminal_output_not_input() {
+        let root = std::env::temp_dir().join(format!("aegiron-rec-term-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let dir = dir_for(&root.join("agent.toml"));
+        let mut r = Recorder::start(&dir, "sid_t", "123456789", "tok").unwrap();
+        r.record(&proto::json(&serde_json::json!({"t": "term_size", "cols": 80, "rows": 24})));
+        r.record(&proto::term_data("$ echo สวัสดี\r\nสวัสดี\r\n".as_bytes()));
+        r.record(&proto::json(&serde_json::json!({"t": "term_started", "shell": "/bin/zsh"})));
+        r.record(&proto::tunnel_data(1, b"tunnelled"));
+        let bytes = fs::read(r.finish().unwrap()).unwrap();
+        let recs = records(&bytes);
+        let types: Vec<u8> = recs.iter().map(|(_, p)| p[0]).collect();
+        assert_eq!(types, vec![proto::MSG_JSON, proto::MSG_TERM, proto::MSG_JSON]);
+        assert!(String::from_utf8_lossy(&recs[0].1).contains("term_size"));
+        assert!(!bytes.windows(9).any(|w| w == b"tunnelled"));
         fs::remove_dir_all(&root).unwrap();
     }
 }
