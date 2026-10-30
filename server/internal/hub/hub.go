@@ -58,6 +58,7 @@ type Hub struct {
 	agents  map[string]*agentConn
 	relays  map[string]*relay
 	directs map[string]*relay // sessions offered a direct path, by sid
+	grants  switchGrants      // switch-sides grants (switch.go)
 }
 
 func New(s *store.Store, key ed25519.PrivateKey, log *slog.Logger, origins []string) *Hub {
@@ -149,6 +150,11 @@ type agentMsg struct {
 	Path          string   `json:"path,omitempty"`
 	BytesToViewer int64    `json:"bytes_to_viewer,omitempty"`
 	BytesToAgent  int64    `json:"bytes_to_agent,omitempty"`
+	// switch_connect (switch sides): the grant, a request number echoed in the reply, and
+	// whether the agent's viewer wants direct candidates.
+	Grant  string `json:"grant,omitempty"`
+	Req    int64  `json:"req,omitempty"`
+	Direct bool   `json:"direct,omitempty"`
 }
 
 // agentEvents are the session events an agent may report into the audit log.
@@ -244,6 +250,9 @@ func (h *Hub) HandleAgent(w http.ResponseWriter, r *http.Request) {
 			h.directStarted(ctx, a, m)
 		case "direct_ended":
 			h.handleDirectEnded(a, m)
+		case "switch_connect":
+			// StartSession may wait for a direct offer: keep reading signaling meanwhile.
+			go h.switchConnect(ctx, a, m)
 		}
 	}
 }

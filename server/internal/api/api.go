@@ -102,6 +102,7 @@ func (a *API) Handler() http.Handler {
 	user("DELETE /api/address-book/{id}", a.deleteAddressEntry)
 
 	user("POST /api/sessions", a.createSession)
+	user("POST /api/sessions/{sid}/switch", a.switchSides)
 	admin("GET /api/sessions", a.listSessions)
 	admin("GET /api/sessions/active", a.activeSessions)
 
