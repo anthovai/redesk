@@ -53,7 +53,7 @@ Every later message is binary ciphertext. A dropped, reordered, or replayed mess
 
 ## 4. Messages inside the encrypted channel
 
-Byte 0 is the type: `0x01` JSON, `0x02` video rectangle (`x, y, frame_w, frame_h` as u16 BE, followed by a JPEG), `0x03` file chunk (transfer id as u32 BE, followed by up to 64 KiB of data), `0x04` video frame (codec u8 `1` = H.264 or `2` = AV1, flags u8 with bit 0 = keyframe, `width, height` as u16 BE, followed by one access unit: Annex B for H.264, one temporal unit of low-overhead OBUs for AV1), `0x05` audio packet (see [Audio](#audio)), `0x06` message of an extra display stream (see [Displays, resolution and input modes](#displays-resolution-and-input-modes)).
+Byte 0 is the type: `0x01` JSON, `0x02` video rectangle (`x, y, frame_w, frame_h` as u16 BE, followed by a JPEG), `0x03` file chunk (transfer id as u32 BE, followed by up to 64 KiB of data), `0x04` video frame (codec u8 `1` = H.264 or `2` = AV1, flags u8 with bit 0 = keyframe, `width, height` as u16 BE, followed by one access unit: Annex B for H.264, one temporal unit of low-overhead OBUs for AV1), `0x05` audio packet (see [Audio](#audio)), `0x06` message of an extra display stream (see [Displays, resolution and input modes](#displays-resolution-and-input-modes)), `0x10` tunnel data and `0x11` terminal data (tunnel and terminal sessions only, see §11).
 
 | Direction | Message |
 |---|---|
@@ -296,3 +296,60 @@ The agent checks it during the HTTP upgrade, before any WebSocket frame: the sid
 - Links: `aegiron://connect/<id>` or `aegiron://<id>` (also `redesk://`), where `<id>` is 9 digits (spaces or `%20` allowed). Nothing else is accepted: no query string, no extra path, no password. The app always asks before connecting.
 - macOS delivers links as a `kAEGetURL` Apple Event, at launch and while the app runs. The app handles it with `NSAppleEventManager` (installed before the event loop starts and again after launch). Windows passes the link as the first argument.
 - One app instance per user and config file. The first instance holds an exclusive lock on `instance.lock` next to `agent.toml` and listens on a Unix socket `instance.sock` there (folder 0700, socket 0600) or, on Windows, on the named pipe `\\.\pipe\aegiron-<first 8 bytes of SHA-256(config path), hex>` (remote clients rejected; other users cannot write to it). A second launch sends one message, `aegiron-show` or `aegiron-open <9-digit id>` (at most 64 bytes, parsed strictly), and exits.
+
+## 11. TCP tunnels and remote terminals
+
+Two session types that stream no screen, like RustDesk's *TCP tunneling* and *terminal*. They use the same session request, relay or direct path, handshake (§3) and authentication (password and/or approval, lockout, one-time password rotation) as remote control; only what follows `auth_result {ok:true}` differs.
+
+**Negotiation (old peers refuse cleanly)**
+
+- Agents that run them add `"tunnel1"` and `"terminal1"` to `register.features`.
+- The viewer asks with `POST /api/sessions {device_id, type: "tunnel", target: "host:port"}` or `{device_id, type: "terminal"}` (absent `type` = `"screen"`). The target is `host:port` (`[v6]:port`) as seen from the controlled machine; the host name is lower-cased. A bad target or type is `400`. An online agent that did not advertise the feature gets nothing and the viewer gets `422 the device's Aegiron version does not support this session type`. Older servers reject the unknown fields with `400`.
+- The ticket always carries `type` (and `target`); viewers of tunnels and terminals refuse a ticket without the type they asked for. The agent's `session` request carries `"type"` and `"target"`; older agents never receive one.
+- The viewer repeats the type in `auth {…, session: "tunnel"|"terminal", target}`. If it differs from the server's request the agent answers `auth_result {ok:false, reason:"session_mismatch"}`. After authentication the agent sends `info {session, hostname, os, …}`; a viewer that gets an `info` without the expected `session` (an agent that started a screen session) closes.
+
+**Device permissions** (off by default; checked right after the handshake, before any password is used, refused with `auth_result {ok:false, reason}` and reported as `agent.denied {reason, session, target}`):
+
+| Setting (`agent.toml`, app Settings → ความปลอดภัย, `aegiron-agent set`) | Default | Refusal |
+|---|---|---|
+| `allow_tunnel` / `--allow-tunnel` | off | `tunnel_disabled` |
+| `allow_tunnel_lan` / `--allow-tunnel-lan`: tunnels may also reach private networks (10/8, 172.16/12, 192.168/16, 169.254/16, fc00::/7, fe80::/10) | off: loopback only | `target_not_allowed` |
+| `allow_terminal` / `--allow-terminal` | off | `terminal_disabled` |
+
+Tunnels never reach public addresses. The agent resolves the target itself; every address the name resolves to must be allowed, and only those addresses are connected to. The approval prompt says what is asked ("เปิด TCP tunnel ไปที่ localhost:3389", "เปิดเทอร์มินัล (shell) บนเครื่องนี้"), and the connection manager shows it for the whole session.
+
+**Recording.** Tunnelled traffic cannot be recorded: when the policy records a device (§7), `POST /api/sessions` refuses tunnels with `422` and audits `session.denied {reason: "recording_required"}` (an agent that still gets a recording token for a tunnel refuses with `recording_required`). Terminal sessions are recorded like `script(1)`: the agent records the `0x11` output it sends and `{"t":"term_size","cols","rows"}` at start and on every resize, never the keystrokes. The server stores such recordings with `codec = "terminal"`, and the console plays them in xterm.js with their timing.
+
+**Audit.** `session.request`, `session.start` and `session.end` (relay and direct) carry `type` and, for tunnels, `target`; so do the agent events of the session. Agent events: `tunnel_open {target}`, `tunnel_closed {target, connections, bytes_up, bytes_down}`, `terminal_open {shell, cols, rows}`, `terminal_closed {reason: "exited"|"viewer_left"|"local_user", code?}`. `GET /api/sessions` lists `type` and `target` (column `remote_sessions.kind`/`target`, migration `010_session_types.sql`).
+
+Both ends send `{"t":"ping"}` at least every 30 s while idle (ignored by the receiver) and give up after 120 s without any message.
+
+### Tunnels
+
+The viewer listens on `127.0.0.1:<local port>` (bound before the session starts, so a busy port fails at once) and turns every accepted connection into a stream; the agent connects each stream to the session's target. Up to 64 streams at a time.
+
+| Direction | Message |
+|---|---|
+| viewer→agent | `tcp_open {id}` (`id` u32, non-zero, chosen by the viewer) |
+| agent→viewer | `tcp_opened {id}`, or `tcp_error {id, message}` (connect failed or refused; the viewer closes the local connection) |
+| both | `0x10` data: stream id (u32 BE) followed by 1–32 KiB |
+| both | `tcp_ack {id, n}`: `n` bytes of that stream were written to the local socket |
+| both | `tcp_eof {id}`: the sender's socket reached end of file (half-close): the receiver shuts down the write side of its socket after the data before it, and may keep sending |
+| both | `tcp_close {id}`: the sender's socket failed; the receiver drops the stream |
+
+Flow control: a side never has more than 256 KiB of a stream unacknowledged, and acknowledges only what it has written to its socket, so a slow consumer slows its own stream and nothing else; a peer that exceeds the window gets `tcp_close`. A stream is gone once both directions sent `tcp_eof`, or after `tcp_close`. The info message carries `target`, `window` and `max_streams`.
+
+Clients: `aegiron-agent tunnel <id> <local>:<host>:<port>` (password prompted or `AEGIRON_REMOTE_PASSWORD`), and in the app the peer menu's *TCP tunnel…* (local port, host, port, presets RDP/SSH/VNC/HTTP; on Windows it can start `mstsc` on the local port once open). Open tunnels are listed at the bottom right with their connections and traffic until stopped.
+
+### Terminal
+
+After `info` the viewer sends `term_open {cols, rows}`; the agent then starts the user's shell (`$SHELL`, else the account's shell, else `/bin/sh`, as a login shell; on Windows PowerShell, else `%COMSPEC%`) in a pseudo-terminal (openpty, ConPTY on Windows) in the home folder, with `TERM=xterm-256color`, `LANG=en_US.UTF-8` when no locale is set, and answers `term_started {shell}`. It runs as the agent's user.
+
+| Direction | Message |
+|---|---|
+| agent→viewer | `0x11` + PTY output (raw bytes; UTF-8 can be split across messages) |
+| viewer→agent | `0x11` + keystrokes as a terminal sends them (Ctrl-C is byte `0x03`, which the PTY turns into SIGINT) |
+| viewer→agent | `term_resize {cols, rows}` (2–500 × 1–300) |
+| agent→viewer | `term_exit {code, message?}` when the shell exits (`message` when it could not start); the session then ends |
+
+Clients: the console's `/terminal/<id>` (xterm.js 5.5.0, menu *เทอร์มินัล* on a device), the app's terminal window (peer menu *เปิดเทอร์มินัล*; a VT100/xterm renderer with 256 colours, scrollback, paste, Thai through the system Thai font), and `aegiron-agent terminal <id> [--command CMD]` (raw mode on macOS/Linux; with `--command` it runs `CMD`, then `exit`, and returns the remote status).

@@ -447,6 +447,31 @@ impl App {
             });
         }
 
+        card_title(ui, "TCP tunnel และเทอร์มินัล");
+        let (mut tunnel, mut lan, mut term) = (c.allow_tunnel, c.allow_tunnel_lan, c.allow_terminal);
+        let changed = card(ui, |ui| {
+            let mut changed = check_row(ui, "อนุญาต TCP tunnel", "ผู้เชื่อมต่อส่งต่อพอร์ตจากเครื่องของเขามายังพอร์ตบนเครื่องนี้ (เช่น RDP, SSH, ฐานข้อมูล)", &mut tunnel);
+            if tunnel {
+                sep(ui);
+                changed |= check_row(
+                    ui,
+                    "ให้ tunnel ไปเครื่องอื่นในเครือข่ายภายในได้",
+                    "ถ้าปิด tunnel ไปได้เฉพาะเครื่องนี้ (localhost) ไม่ว่าจะเปิดหรือปิด ก็ไม่ไปอินเทอร์เน็ต",
+                    &mut lan,
+                );
+            }
+            sep(ui);
+            changed |= check_row(ui, "อนุญาตเทอร์มินัล", "ผู้เชื่อมต่อเปิด shell บนเครื่องนี้ได้ ทำงานด้วยสิทธิ์ของผู้ใช้ที่เปิด Aegiron", &mut term);
+            changed
+        });
+        if changed {
+            self.save_config(|c| {
+                c.allow_tunnel = tunnel;
+                c.allow_tunnel_lan = lan;
+                c.allow_terminal = term;
+            });
+        }
+
         card_title(ui, "การยอมรับการเชื่อมต่อ");
         let picked = card(ui, |ui| {
             let mut picked = None;

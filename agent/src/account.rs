@@ -206,6 +206,10 @@ pub struct Ticket {
     /// Direct/P2P candidates, when requested and the agent offered them.
     #[serde(default)]
     pub direct: Option<crate::direct::Ticket>,
+    /// Session type the server started ("screen", "tunnel", "terminal"); absent on servers
+    /// that predate tunnel and terminal sessions.
+    #[serde(default, rename = "type")]
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -229,19 +233,33 @@ pub struct SessionTicket {
 /// Asks the server to wake the remote agent and returns this viewer's relay ticket.
 /// `direct` also asks for direct/P2P candidates (a query flag, which older servers ignore).
 pub fn start_session(server: &str, token: &str, device_id: &str, direct: bool) -> Result<SessionTicket, String> {
+    start_session_of(server, token, device_id, direct, "screen", None)
+}
+
+/// Like [`start_session`] for any session type: `kind` "screen", "tunnel" (with `target`
+/// `host:port`) or "terminal".
+pub fn start_session_of(server: &str, token: &str, device_id: &str, direct: bool, kind: &str, target: Option<&str>) -> Result<SessionTicket, String> {
     let q = if direct { "?direct=1" } else { "" };
+    let mut body = json!({"device_id": device_id});
+    if kind != "screen" {
+        body["type"] = json!(kind);
+        body["target"] = json!(target);
+    }
     call::<SessionTicket>(
         agent()
             .post(&format!("{server}/api/sessions{q}"))
             .header("X-Aegiron", "1")
             .header("Authorization", &format!("Bearer {token}"))
-            .send_json(&json!({"device_id": device_id})),
+            .send_json(&body),
     )
     .map_err(|(status, msg)| match status {
         401 => "การเข้าสู่ระบบหมดอายุ กรุณาเข้าสู่ระบบใหม่".into(),
-        403 => "คุณไม่มีสิทธิ์เชื่อมต่อเครื่องนี้".into(),
+        403 if kind == "screen" => "คุณไม่มีสิทธิ์เชื่อมต่อเครื่องนี้".into(),
         404 => "ไม่พบ ID นี้ในระบบ".into(),
         409 => "เครื่องปลายทางออฟไลน์อยู่".into(),
+        422 if msg.contains("does not support") => "Aegiron บนเครื่องปลายทางยังไม่รองรับเซสชันประเภทนี้ (ต้องอัปเดตเครื่องนั้น)".into(),
+        422 if msg.contains("recorded") => "องค์กรกำหนดให้บันทึกเซสชัน จึงเปิด TCP tunnel ไปเครื่องนี้ไม่ได้ (tunnel บันทึกไม่ได้)".into(),
+        400 if msg.contains("target") => "ปลายทางของ tunnel ต้องเป็น host:port".into(),
         503 => "เครื่องปลายทางไม่ว่าง ลองใหม่อีกครั้ง".into(),
         _ => msg,
     })

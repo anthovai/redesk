@@ -11,6 +11,9 @@
 //!         frame) followed by one Opus packet. Only sent to viewers that asked for audio.
 //!   0x06  extra display stream: display (u8) followed by a complete 0x01/0x02/0x04 message for
 //!         that display (feature "multidisp", only after `cfg {streams}`).
+//!   0x10  TCP tunnel data (tunnel sessions): stream id (u32 BE) followed by up to 32 KiB
+//!   0x11  terminal data (terminal sessions): raw bytes, PTY output to the viewer and keyboard
+//!         input to the agent
 
 use serde::Deserialize;
 
@@ -34,6 +37,8 @@ pub fn stream(display: u8, msg: &[u8]) -> Vec<u8> {
     out.extend_from_slice(msg);
     out
 }
+pub const MSG_TUNNEL: u8 = 0x10;
+pub const MSG_TERM: u8 = 0x11;
 
 pub const AUDIO_OPUS: u8 = 1;
 
@@ -43,6 +48,21 @@ pub fn file_chunk(id: u32, data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(5 + data.len());
     out.push(MSG_FILE);
     out.extend_from_slice(&id.to_be_bytes());
+    out.extend_from_slice(data);
+    out
+}
+
+pub fn tunnel_data(id: u32, data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(5 + data.len());
+    out.push(MSG_TUNNEL);
+    out.extend_from_slice(&id.to_be_bytes());
+    out.extend_from_slice(data);
+    out
+}
+
+pub fn term_data(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + data.len());
+    out.push(MSG_TERM);
     out.extend_from_slice(data);
     out
 }
@@ -103,6 +123,13 @@ pub enum ViewerMsg {
         /// Audio codecs the viewer can play, e.g. ["opus"]; absent = no audio is sent.
         #[serde(default)]
         audio: Vec<String>,
+        /// Session type the viewer asked the server for ("tunnel", "terminal"); absent = screen.
+        /// Must match the type in the server's session request.
+        #[serde(default)]
+        session: Option<String>,
+        /// Tunnel target (`host:port`); must match the server's session request.
+        #[serde(default)]
+        target: Option<String>,
     },
     /// Viewer muted (`on: false`) or unmuted its speaker; the agent stops/resumes 0x05 packets.
     #[serde(rename = "audio")]

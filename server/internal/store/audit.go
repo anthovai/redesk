@@ -69,10 +69,19 @@ type RemoteSession struct {
 	EndpointID    *int64     `json:"endpoint_id"`
 	EndpointName  *string    `json:"endpoint_name"`
 	Provider      *string    `json:"provider"`
+	// Kind is "screen", "tunnel" or "terminal"; Target is a tunnel's host:port.
+	Kind   string `json:"type"`
+	Target string `json:"target"`
 }
 
 func (s *Store) CreateRemoteSession(ctx context.Context, id, deviceID string, userID int64, viewerIP string) error {
-	_, err := s.DB.Exec(ctx, `INSERT INTO remote_sessions(id, device_id, user_id, viewer_ip) VALUES ($1,$2,$3,$4)`, id, deviceID, userID, viewerIP)
+	return s.CreateRemoteSessionOf(ctx, id, deviceID, userID, viewerIP, "screen", "")
+}
+
+// CreateRemoteSessionOf records a new session of any type (tunnel target in `target`).
+func (s *Store) CreateRemoteSessionOf(ctx context.Context, id, deviceID string, userID int64, viewerIP, kind, target string) error {
+	_, err := s.DB.Exec(ctx, `INSERT INTO remote_sessions(id, device_id, user_id, viewer_ip, kind, target) VALUES ($1,$2,$3,$4,$5,$6)`,
+		id, deviceID, userID, viewerIP, kind, target)
 	return err
 }
 
@@ -89,7 +98,7 @@ func (s *Store) MarkSessionEnded(ctx context.Context, id string, toViewer, toAge
 
 func (s *Store) ListRemoteSessions(ctx context.Context, limit int) ([]*RemoteSession, error) {
 	rows, err := s.DB.Query(ctx, `SELECT r.id, COALESCE(r.device_id, ''), r.user_id, u.email, r.viewer_ip, r.created_at, r.started_at, r.ended_at,
-		r.bytes_to_viewer, r.bytes_to_agent, r.end_reason, r.endpoint_id, e.name, e.provider
+		r.bytes_to_viewer, r.bytes_to_agent, r.end_reason, r.endpoint_id, e.name, e.provider, r.kind, r.target
 		FROM remote_sessions r LEFT JOIN users u ON u.id=r.user_id LEFT JOIN endpoints e ON e.id=r.endpoint_id
 		ORDER BY r.created_at DESC LIMIT $1`, limit)
 	if err != nil {
@@ -100,7 +109,7 @@ func (s *Store) ListRemoteSessions(ctx context.Context, limit int) ([]*RemoteSes
 	for rows.Next() {
 		var r RemoteSession
 		if err := rows.Scan(&r.ID, &r.DeviceID, &r.UserID, &r.UserEmail, &r.ViewerIP, &r.CreatedAt, &r.StartedAt, &r.EndedAt,
-			&r.BytesToViewer, &r.BytesToAgent, &r.EndReason, &r.EndpointID, &r.EndpointName, &r.Provider); err != nil {
+			&r.BytesToViewer, &r.BytesToAgent, &r.EndReason, &r.EndpointID, &r.EndpointName, &r.Provider, &r.Kind, &r.Target); err != nil {
 			return nil, err
 		}
 		out = append(out, &r)

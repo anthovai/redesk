@@ -3,6 +3,7 @@
 pub mod account;
 pub mod audio;
 pub mod capture;
+pub mod client;
 pub mod codec;
 pub mod config;
 pub mod crypto;
@@ -17,11 +18,14 @@ pub mod permissions;
 pub mod power;
 pub mod proto;
 pub mod recording;
+pub mod remote;
 pub mod resolution;
 pub mod service;
 pub mod session;
 pub mod signal;
 pub mod status;
+pub mod terminal;
+pub mod tunnel;
 pub mod ui;
 pub mod updater;
 #[cfg(target_os = "macos")]
