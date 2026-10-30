@@ -1,5 +1,6 @@
 //! One remote-control session: relay connect, E2E handshake, authentication, streaming.
 
+use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,18 +20,25 @@ use crate::audio;
 use crate::capture::{self, Params};
 use crate::codec::{self, Codec};
 use crate::config::{ApproveMode, EncoderPref, Verification};
+use crate::controls;
 use crate::crypto::{self, Channel};
 use crate::files;
 use crate::input;
 use crate::proto::{self, ViewerMsg};
 use crate::recording::{RecordRequest, Recorder};
+use crate::remote::{Conn, SessionKind};
 use crate::signal::{Agent, Viewer};
 use crate::whiteboard::Board;
-use crate::status::{ApprovalRequest, SessionInfo};
+use crate::status::{ApprovalRequest, Attention, CallState, HostCmd, SessionInfo, SessionLink};
+use crate::voice::Call;
 
 const MAX_ATTEMPTS: u32 = 3;
 const LOCKOUT_AFTER: u32 = 5;
 const LOCKOUT: Duration = Duration::from_secs(60);
+/// A voice call not answered here within this time is declined.
+pub const RING_TIMEOUT: Duration = Duration::from_secs(30);
+/// Viewers send a keepalive every 10 s while they block the machine.
+const VIEWER_SILENT: Duration = Duration::from_secs(30);
 
 #[derive(Deserialize)]
 struct Hello {
@@ -39,7 +47,20 @@ struct Hello {
     epk: String,
 }
 
-pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer: Viewer, record: Option<RecordRequest>, direct: Option<crate::direct::Offer>) -> Result<()> {
+/// `switching`: the server marked this session as switch sides (see switch.rs); it is accepted
+/// only with a secret this app handed out, never with a password.
+#[allow(clippy::too_many_arguments)]
+pub async fn run(
+    agent: Arc<Agent>,
+    sid: &str,
+    token: &str,
+    relay: &str,
+    viewer: Viewer,
+    record: Option<RecordRequest>,
+    direct: Option<crate::direct::Offer>,
+    kind: SessionKind,
+    switching: bool,
+) -> Result<()> {
     let base = agent.config.lock().unwrap().ws_base()?;
     let url = format!("{base}{relay}?sid={sid}&token={token}");
 
@@ -59,29 +80,72 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
     tx.send(Message::Text(reply.to_string().into())).await?;
     let mut ch = hs.channel;
 
+    // Tunnels and terminals need the device's explicit permission (off by default): refuse
+    // before asking for a password.
+    if let Some(reason) = refuse_kind(&agent, &kind, record.is_some()).await {
+        tracing::warn!("session {sid}: refused {} session from {} ({reason})", kind.name(), viewer.email);
+        agent.report(sid, "denied", json!({"reason": reason, "session": kind.name(), "target": kind.target()}));
+        send_json(&mut tx, &mut ch, json!({"t": "auth_result", "ok": false, "reason": reason})).await?;
+        bail!("{reason}");
+    }
+    // Switch sides only ever hands over the screen.
+    if switching && kind != SessionKind::Screen {
+        send_json(&mut tx, &mut ch, json!({"t": "auth_result", "ok": false, "reason": "denied"})).await?;
+        bail!("switch sides is for screen sessions only");
+    }
+
     // 3. Authentication inside the encrypted channel.
     let (verification, approve) = {
         let c = agent.config.lock().unwrap();
         (c.verification, c.approve_mode)
     };
-    let need_password = approve != ApproveMode::Click;
-    let need_click = approve != ApproveMode::Password;
-    send_json(&mut tx, &mut ch, json!({"t": "auth_required", "password": need_password, "click": need_click})).await?;
+    // A switched session was approved by the person here when they offered it.
+    let need_password = !switching && approve != ApproveMode::Click;
+    let need_click = !switching && approve != ApproveMode::Password;
+    send_json(&mut tx, &mut ch, json!({"t": "auth_required", "password": need_password, "click": need_click, "switch": switching})).await?;
 
     let mut attempts = 0;
     let mut viewer_codecs;
     let mut viewer_features;
     let mut wants_audio;
+    let mut switched = None;
+    let mut resumed = false;
     loop {
-        let Incoming::Msg(ViewerMsg::Auth { password, codecs, features, audio }) = read_viewer(&mut rx, &mut ch, Duration::from_secs(120)).await? else {
+        let Incoming::Msg(ViewerMsg::Auth { password, codecs, features, audio, session, target, resume, switch }) = read_viewer(&mut rx, &mut ch, Duration::from_secs(120)).await? else {
             bail!("expected auth message")
         };
+        // The viewer must want the session the server asked for (an old server would turn a
+        // terminal request into a screen session, and vice versa).
+        if session.as_deref().unwrap_or("screen") != kind.name() || target != kind.target() {
+            send_json(&mut tx, &mut ch, json!({"t": "auth_result", "ok": false, "reason": "session_mismatch"})).await?;
+            bail!("session type mismatch");
+        }
         attempts += 1;
         viewer_codecs = codecs;
         viewer_features = features;
         // Viewers that do not list an audio codec never get 0x05 packets.
         wants_audio = audio.iter().any(|c| c == "opus");
 
+        if switching {
+            switched = switch.as_deref().and_then(crate::switch::redeem);
+            if switched.is_none() {
+                tracing::warn!("session {sid}: switch sides without a valid secret from {}", viewer.ip);
+                agent.report(sid, "denied", json!({"switch": true}));
+                send_json(&mut tx, &mut ch, json!({"t": "auth_result", "ok": false, "reason": "denied"})).await?;
+                bail!("switch sides: no valid invitation");
+            }
+            break;
+        }
+
+        // Back after a restart this viewer asked for: its one-time token replaces the password
+        // and the click (an unknown or expired token falls through to the usual checks). Only
+        // for remote control, the session the restart was asked from.
+        if let Some(t) = resume.as_deref().filter(|_| kind == SessionKind::Screen)
+            && controls::take_resume(&agent.config_path, Some(&viewer.email), t)
+        {
+            resumed = true;
+            break;
+        }
         if need_password {
             if let Some(wait) = locked_for(&agent) {
                 agent.report(sid, "locked", json!({"retry_after": wait.as_secs()}));
@@ -102,7 +166,7 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
         }
         if need_click {
             send_json(&mut tx, &mut ch, json!({"t": "auth_pending"})).await?;
-            if !ask_local_user(&agent, &viewer, record.is_some()).await {
+            if !ask_local_user(&agent, &viewer, record.is_some(), &kind.purpose()).await {
                 agent.report(sid, "denied", json!({}));
                 send_json(&mut tx, &mut ch, json!({"t": "auth_result", "ok": false, "reason": "denied"})).await?;
                 bail!("denied by local user");
@@ -110,11 +174,15 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
         }
         break;
     }
-    agent.failures.lock().unwrap().0 = 0;
-    if need_password && verification != Verification::Permanent {
+    if let Some(started) = switched {
+        started(); // the window controlling the other machine closes: the sides are switched
+    } else {
+        agent.failures.lock().unwrap().0 = 0;
+    }
+    if need_password && !resumed && verification != Verification::Permanent {
         agent.rotate_temp_password(); // one-time: the password just used is now dead
     }
-    tracing::info!("session {sid}: {} ({}) is now controlling this machine", viewer.email, viewer.ip);
+    tracing::info!("session {sid}: {} ({}) is now connected ({})", viewer.email, viewer.ip, kind.name());
 
     // Recording required by the organisation's policy: the session does not go ahead unrecorded.
     let mut recorder = RecordingGuard { agent: agent.clone(), rec: None };
@@ -139,6 +207,53 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
     }
     let recording = recorder.rec.is_some();
 
+    // In-session communication needs the desktop app's connection manager; the headless agent
+    // never offers it (except to tests, see `test_cm`).
+    let cfg = agent.config.lock().unwrap().clone();
+    // Tunnel and terminal sessions have no chat, calls or switch sides.
+    let screen = kind == SessionKind::Screen;
+    let has_app = screen && agent.ui.lock().unwrap().is_some();
+    let test_cm = screen && test_cm();
+    let has_ui = has_app || test_cm;
+    let offers_voice = has_ui && cfg.allow_voice && audio::voice_supported();
+    let viewer_has = |f: &str| viewer_features.iter().any(|v| v == f);
+    let (link, mut host_rx) = SessionLink::new(
+        has_ui && viewer_has(proto::FEATURE_CHAT),
+        offers_voice && viewer_has(proto::FEATURE_VOICE),
+        has_app && viewer_has(proto::FEATURE_SWITCH),
+    );
+    let mut features: Vec<&str> = files::FEATURES.iter().chain(&proto::DISPLAY_FEATURES).copied().collect();
+    if has_ui {
+        features.push(proto::FEATURE_CHAT);
+    }
+    if has_app {
+        features.push(proto::FEATURE_SWITCH);
+    }
+    if offers_voice {
+        features.push(proto::FEATURE_VOICE);
+    }
+    let who = if viewer.name.is_empty() { viewer.email.clone() } else { viewer.name.clone() };
+    // Session controls (view-only, block input, privacy, lock, restart). Dropped when the
+    // session ends however it ends: input is unblocked and the screen given back.
+    let ui_attached = agent.ui.lock().unwrap().is_some();
+    let platform = controls::platform();
+    // Tunnels and terminals stream no screen and take no input: they offer no controls.
+    let perms = match kind {
+        SessionKind::Screen => controls::Perms::new(&agent.config.lock().unwrap(), platform.supports(ui_attached)),
+        _ => controls::Perms::default(),
+    };
+    let report: Arc<dyn Fn(&str, serde_json::Value) + Send + Sync> = {
+        let (agent, sid) = (agent.clone(), sid.to_string());
+        Arc::new(move |kind, detail| {
+            agent.report(&sid, kind, detail);
+            agent.changed();
+        })
+    };
+    let mut ctl = controls::SessionCtl::new(perms, platform, report, &agent.config_path, &viewer.email, None);
+    // This machine's own "lock after session" (Settings, CLI or the organisation's strategy).
+    ctl.host_lock_after = agent.config.lock().unwrap().lock_after_session;
+    let mut escapes = controls::escape_signal();
+
     let kill = Arc::new(tokio::sync::Notify::new());
     agent.status.lock().unwrap().sessions.push(SessionInfo {
         sid: sid.to_string(),
@@ -148,11 +263,25 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
         started: std::time::SystemTime::now(),
         kill: kill.clone(),
         recording,
+        link: link.clone(),
+        controls: ctl.flags.clone(),
+        purpose: kind.purpose(),
     });
     agent.changed();
     let _registered = Registered { agent: agent.clone(), sid: sid.to_string() };
-    agent.report(sid, "auth_ok", json!({"method": if need_password { "password" } else { "click" }, "approved_locally": need_click}));
+    let method = if switching { "switch" } else if resumed { "resume" } else if need_password { "password" } else { "click" };
+    agent.report(sid, "auth_ok", json!({"method": method, "approved_locally": need_click && !resumed}));
     let _awake = crate::power::KeepAwake::new("Aegiron remote session");
+
+    // Tunnel and terminal sessions stream no screen.
+    if kind != SessionKind::Screen {
+        send_json(&mut tx, &mut ch, json!({"t": "auth_result", "ok": true})).await?;
+        let mut conn = Conn { tx, rx, ch };
+        return match &kind {
+            SessionKind::Tunnel { host, port } => crate::tunnel::serve(&agent, sid, &mut conn, kill, host, *port).await,
+            _ => crate::terminal::serve(&agent, sid, &mut conn, kill, &mut recorder.rec).await,
+        };
+    }
 
     // 4. Stream.
     let cfg = agent.config.lock().unwrap().clone();
@@ -188,7 +317,9 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
     let allow_input = cfg.allow_input && portal.as_ref().is_none_or(|p| p.has_input());
     #[cfg(not(target_os = "linux"))]
     let allow_input = cfg.allow_input;
-    let displays = capture::displays();
+    let mut displays = capture::displays();
+    // Resolution changes, restored when `resolution` is dropped at the end of the session.
+    let mut resolution = cfg.allow_resolution.then(crate::resolution::backend).flatten().map(crate::resolution::Changer::new);
     // Annotations need the desktop app's overlay window; the headless agent ignores them.
     let whiteboard = cfg.allow_whiteboard && agent.ui.lock().unwrap().is_some();
     if whiteboard {
@@ -239,16 +370,18 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
         "codecs": switchable.iter().map(|c| c.name()).collect::<Vec<_>>(),
         "recording": recording,
         "whiteboard": whiteboard,
-        "features": files::FEATURES,
+        "features": features.iter().copied().chain(ctl.perms.features()).collect::<Vec<_>>(),
+        "resolution": resolution.is_some(),
         "encoder": encoder,
         "audio": audio_on,
         "audio_codec": if audio_on { Some("opus") } else { None },
     }))
     .await?;
 
-    let params = Params { display: 0, fps: cfg.max_fps, quality: cfg.jpeg_quality, max_width: cfg.max_width, codec };
+    let params = Params { display: 0, all: false, fps: cfg.max_fps, quality: cfg.jpeg_quality, max_width: cfg.max_width, codec };
     let (params_tx, params_rx) = watch::channel(params);
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(2);
+    ctl.set_out(out_tx.clone());
     let stop = Arc::new(AtomicBool::new(false));
     let force_full = Arc::new(AtomicBool::new(true));
     let _stop_guard = StopOnDrop(stop.clone());
@@ -278,13 +411,97 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
     }
     let mut files = files::Files::new();
     let input_tx = allow_input.then(|| input::spawn(capture::geometry(0).unwrap_or_default()));
+    // Voice call: this machine's microphone as 0x07 packets (never recorded), and the viewer's
+    // voice played here. The person here has 30 s to accept a call.
+    let (voice_tx, mut voice_rx) = mpsc::channel::<Vec<u8>>(16);
+    let mut call: Option<Call> = None;
+    // Voice packets received in this call and their loudest block (reported to tests).
+    let mut heard = (0usize, 0f32);
+    let mut ring_until: Option<tokio::time::Instant> = None;
+    let attention = |text: &str| {
+        agent.status.lock().unwrap().notify(Attention { sid: sid.to_string(), who: who.clone(), text: text.to_string() });
+        agent.changed();
+    };
+    let set_call = |s: CallState| {
+        *link.call.lock().unwrap() = s;
+        agent.changed();
+    };
+    // While the machine is blocked, a viewer that went silent (no keepalive) ends the session.
+    let mut last_seen = Instant::now();
+    let mut watchdog = tokio::time::interval(Duration::from_secs(5));
+    // Extra display streams (`cfg {streams}`), by display index.
+    let mut streams: HashMap<usize, Stream> = HashMap::new();
 
     loop {
         tokio::select! {
+            Some(plain) = voice_rx.recv() => tx.send(Message::Binary(ch.seal(&plain)?.into())).await?,
+            _ = tokio::time::sleep_until(ring_until.unwrap_or_else(tokio::time::Instant::now)), if ring_until.is_some() => {
+                ring_until = None;
+                set_call(CallState::Idle);
+                send_json(&mut tx, &mut ch, json!({"t": "voice", "op": "decline", "reason": "timeout"})).await?;
+            }
+            cmd = host_rx.recv() => match cmd {
+                Some(HostCmd::Chat(text)) if link.chat => {
+                    link.push(true, text.clone());
+                    agent.changed();
+                    send_json(&mut tx, &mut ch, json!({"t": "chat", "text": text})).await?;
+                }
+                Some(HostCmd::Answer(yes)) if matches!(link.call_state(), CallState::Ringing(_)) => {
+                    ring_until = None;
+                    let started = if yes { Some(tokio::task::block_in_place(|| Call::start(voice_tx.clone()))) } else { None };
+                    match started {
+                        Some(Ok(c)) => {
+                            call = Some(c);
+                            set_call(CallState::Active { since: Instant::now(), muted: false, remote_muted: false });
+                            agent.report(sid, "voice_call", json!({}));
+                            send_json(&mut tx, &mut ch, json!({"t": "voice", "op": "accept"})).await?;
+                        }
+                        Some(Err(e)) => {
+                            tracing::warn!("session {sid}: cannot start the voice call: {e:#}");
+                            set_call(CallState::Idle);
+                            attention(&format!("รับสายไม่ได้: เปิดไมโครโฟนไม่สำเร็จ ({e})"));
+                            send_json(&mut tx, &mut ch, json!({"t": "voice", "op": "decline", "reason": "unavailable"})).await?;
+                        }
+                        None => {
+                            set_call(CallState::Idle);
+                            send_json(&mut tx, &mut ch, json!({"t": "voice", "op": "decline", "reason": "declined"})).await?;
+                        }
+                    }
+                }
+                Some(HostCmd::Hangup) if call.is_some() => {
+                    call = None;
+                    set_call(CallState::Idle);
+                    send_json(&mut tx, &mut ch, json!({"t": "voice", "op": "hangup"})).await?;
+                }
+                Some(HostCmd::Mute(muted)) => {
+                    if let (Some(c), CallState::Active { since, remote_muted, .. }) = (&call, link.call_state()) {
+                        c.set_muted(muted);
+                        set_call(CallState::Active { since, muted, remote_muted });
+                        send_json(&mut tx, &mut ch, json!({"t": "voice", "op": "mute", "muted": muted})).await?;
+                    }
+                }
+                Some(HostCmd::SwitchFailed(reason)) => {
+                    send_json(&mut tx, &mut ch, json!({"t": "switch_result", "ok": false, "reason": reason})).await?;
+                }
+                _ => {}
+            },
             _ = kill.notified() => {
                 tracing::info!("session {sid}: disconnected by the local user");
                 agent.report(sid, "denied", json!({"stage": "during_session"}));
                 return Ok(());
+            }
+            Ok(()) = escapes.changed() => {
+                if ctl.blocking() {
+                    tracing::info!("session {sid}: ended with {} at this machine", controls::ESCAPE_HINT);
+                    agent.report(sid, "denied", json!({"stage": "local_escape"}));
+                    return Ok(());
+                }
+            }
+            _ = watchdog.tick() => {
+                if ctl.blocking() && last_seen.elapsed() > VIEWER_SILENT {
+                    tracing::warn!("session {sid}: viewer silent while the machine is blocked; ending the session");
+                    return Ok(());
+                }
             }
             pkt = audio_rx.recv(), if audio_open => match pkt {
                 Some(plain) => {
@@ -297,14 +514,29 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
             },
             out = out_rx.recv() => {
                 let Some(plain) = out else { bail!("capture stopped") };
-                if let Some(r) = recorder.rec.as_mut() {
+                // Recordings show the main stream only.
+                if let Some(r) = recorder.rec.as_mut().filter(|_| plain.first() != Some(&proto::MSG_STREAM)) {
                     r.record(&plain);
                 }
                 tx.send(Message::Binary(ch.seal(&plain)?.into())).await?;
             }
             msg = read_viewer(&mut rx, &mut ch, Duration::from_secs(300)) => {
+                last_seen = Instant::now();
                 let msg = match msg {
                     Ok(Incoming::Msg(m)) => m,
+                    Ok(Incoming::Voice(data)) => {
+                        if let Some(c) = call.as_mut() {
+                            // The first packet opens the output device, which can take a moment.
+                            if c.needs_output() {
+                                tokio::task::block_in_place(|| c.receive(&data));
+                            } else {
+                                c.receive(&data);
+                            }
+                            heard.0 += 1;
+                            heard.1 = heard.1.max(c.take_level().unwrap_or(0.0));
+                        }
+                        continue;
+                    }
                     Ok(Incoming::FileChunk(id, data)) => {
                         if cfg.allow_file_transfer {
                             if let Some(e) = files.chunk(id, &data) {
@@ -316,10 +548,24 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
                     Err(e) if e.to_string() == "relay closed" => return Ok(()),
                     Err(e) => return Err(e),
                 };
-                let send_input = |ev| if let Some(t) = &input_tx { let _ = t.send(ev); };
+                if matches!(msg, ViewerMsg::BlockInput { on: true } | ViewerMsg::Privacy { on: true }) {
+                    escapes.borrow_and_update(); // an earlier escape does not end this block
+                }
+                if let Some(reply) = ctl.handle(&msg) {
+                    send_json(&mut tx, &mut ch, reply).await?;
+                    continue;
+                }
+                let live_input = input_tx.as_ref().filter(|_| ctl.input_allowed());
+                let send_input = |ev| if let Some(t) = live_input { let _ = t.send(ev); };
+                // Input on an extra display stream is normalised to that display.
+                let on = |d: Option<usize>| d.and_then(|d| streams.get(&d)).map(|s| s.geo);
                 match msg {
-                    ViewerMsg::MouseMove { x, y } => send_input(input::Event::Move { x, y }),
-                    ViewerMsg::MouseButton { b, down, x, y } => send_input(input::Event::Button { b, down, x, y }),
+                    ViewerMsg::MouseMove { x, y, d } => send_input(input::Event::Move { x, y, on: on(d) }),
+                    ViewerMsg::MouseButton { b, down, x, y, d } => send_input(input::Event::Button { b, down, at: x.zip(y), on: on(d) }),
+                    ViewerMsg::MouseRel { dx, dy } => {
+                        let px = |v: f64| if v.is_finite() { v.round().clamp(-2000.0, 2000.0) as i32 } else { 0 };
+                        send_input(input::Event::Rel { dx: px(dx), dy: px(dy) });
+                    }
                     ViewerMsg::Wheel { dx, dy } => send_input(input::Event::Wheel { dx: dx.clamp(-20, 20), dy: dy.clamp(-20, 20) }),
                     ViewerMsg::Key { code, key, down } => send_input(input::Event::Key { code, key, down }),
                     ViewerMsg::Text { s } => send_input(input::Event::Text(s.chars().take(4096).collect())),
@@ -331,25 +577,49 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
                             }
                         });
                     }
-                    ViewerMsg::Config { fps, quality, max_width, display, codec } => {
+                    ViewerMsg::Config { fps, quality, max_width, display, codec, display_all, streams: wanted, keyboard } => {
+                        let mut moved = false;
                         params_tx.send_modify(|p| {
                             if let Some(c) = codec.as_deref().and_then(Codec::from_name).filter(|c| switchable.contains(c)) { p.codec = c; }
                             if let Some(f) = fps { p.fps = f.clamp(1, cfg.max_fps.max(1)); }
                             if let Some(q) = quality { p.quality = q.clamp(10, 95); }
                             if let Some(w) = max_width { p.max_width = w.clamp(320, 3840); }
                             if let Some(d) = display.filter(|d| *d < displays.len()) {
-                                p.display = d;
-                                if let Some(g) = capture::geometry(d) { send_input(input::Event::Geometry(g)); }
-                                if whiteboard {
-                                    // Strokes belong to the display they were drawn on.
-                                    let area = capture::logical_area(d).unwrap_or_default();
-                                    if let Some(b) = agent.status.lock().unwrap().boards.iter_mut().find(|b| b.sid == sid) {
-                                        *b = Board::new(sid, area);
-                                    }
-                                    agent.changed();
-                                }
+                                (p.display, p.all) = (d, false);
+                                moved = true;
+                            }
+                            if let Some(all) = display_all.filter(|a| *a != p.all) {
+                                p.all = all;
+                                moved = true;
                             }
                         });
+                        let p = *params_tx.borrow();
+                        if moved {
+                            if let Some(g) = capture::geometry_of(&p) { send_input(input::Event::Geometry(g)); }
+                            if whiteboard {
+                                // Strokes belong to the display they were drawn on.
+                                let area = if p.all { capture::logical_area_all() } else { capture::logical_area(p.display) };
+                                if let Some(b) = agent.status.lock().unwrap().boards.iter_mut().find(|b| b.sid == sid) {
+                                    *b = Board::new(sid, area.unwrap_or_default());
+                                }
+                                agent.changed();
+                            }
+                        }
+                        if let Some(k) = keyboard {
+                            send_input(input::Event::MapKeys(k == "map"));
+                        }
+                        if let Some(list) = wanted {
+                            let list: Vec<usize> = list.into_iter().filter(|d| *d < displays.len()).take(proto::MAX_STREAMS).collect();
+                            streams.retain(|d, _| list.contains(d));
+                            for d in list {
+                                streams.entry(d).or_insert_with(|| Stream::start(d, p, out_tx.clone(), encoder, h264));
+                            }
+                        }
+                        // Quality, fps and codec apply to every stream.
+                        for s in streams.values() {
+                            s.params.send_modify(|q| (q.fps, q.quality, q.max_width, q.codec) = (p.fps, p.quality, p.max_width, p.codec));
+                            s.force_full.store(true, Ordering::Relaxed);
+                        }
                         force_full.store(true, Ordering::Relaxed);
                     }
                     ViewerMsg::List { path } if cfg.allow_file_transfer => {
@@ -432,7 +702,88 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
                             agent.changed();
                         }
                     }
-                    ViewerMsg::Refresh => force_full.store(true, Ordering::Relaxed),
+                    ViewerMsg::Chat { text } if link.chat => {
+                        let text: String = text.chars().take(proto::CHAT_MAX).collect();
+                        if !text.trim().is_empty() {
+                            link.push(false, text.clone());
+                            attention(&text);
+                            if test_cm {
+                                let _ = link.cmd.send(HostCmd::Chat(format!("echo: {text}")));
+                            }
+                        }
+                    }
+                    ViewerMsg::Voice { op, muted } => match op.as_str() {
+                        "call" if !link.voice => {
+                            send_json(&mut tx, &mut ch, json!({"t": "voice", "op": "decline", "reason": "unavailable"})).await?;
+                        }
+                        "call" if link.call_state() == CallState::Idle => {
+                            ring_until = Some(tokio::time::Instant::now() + RING_TIMEOUT);
+                            set_call(CallState::Ringing(Instant::now()));
+                            attention("ขอโทรคุยด้วยเสียง");
+                            if test_cm {
+                                let _ = link.cmd.send(HostCmd::Answer(true));
+                            }
+                        }
+                        "hangup" => {
+                            if test_cm && call.is_some() {
+                                // Tells the test what arrived from the viewer's microphone.
+                                let report = format!("test: received {} voice packets, peak rms {:.3}", heard.0, heard.1);
+                                let _ = link.cmd.send(HostCmd::Chat(report));
+                            }
+                            heard = (0, 0.0);
+                            let was_on = call.take().is_some();
+                            if was_on || ring_until.take().is_some() {
+                                set_call(CallState::Idle);
+                                attention(if was_on { "วางสายแล้ว" } else { "ยกเลิกการโทร" });
+                            }
+                        }
+                        "mute" => {
+                            if let CallState::Active { since, muted: m, .. } = link.call_state() {
+                                set_call(CallState::Active { since, muted: m, remote_muted: muted });
+                            }
+                        }
+                        _ => {}
+                    },
+                    ViewerMsg::SwitchSides { grant, secret } if link.switch => {
+                        *link.switch_offer.lock().unwrap() = Some((grant, secret, Instant::now()));
+                        attention("เชิญให้คุณควบคุมเครื่องของเขา (สลับฝั่ง)");
+                    }
+                    ViewerMsg::SwitchSides { .. } => {
+                        send_json(&mut tx, &mut ch, json!({"t": "switch_result", "ok": false, "reason": "unavailable"})).await?;
+                    }
+                    ViewerMsg::Refresh => {
+                        force_full.store(true, Ordering::Relaxed);
+                        streams.values().for_each(|s| s.force_full.store(true, Ordering::Relaxed));
+                    }
+                    ViewerMsg::ResList { display } => {
+                        let reply = match &resolution {
+                            Some(r) => blocking(|| r.list(display)),
+                            None => json!({"t": "res_error", "display": display, "message": "changing the resolution is not allowed on this device"}),
+                        };
+                        send_json(&mut tx, &mut ch, reply).await?;
+                    }
+                    ViewerMsg::ResSet { display, w, h, hz } => {
+                        let res = match resolution.as_mut() {
+                            Some(r) => blocking(|| r.set(display, w, h, hz)).map(Some),
+                            None => Err(anyhow!("changing the resolution is not allowed on this device")),
+                        };
+                        let reply = resolution_reply(&agent, sid, display, res, false);
+                        send_json(&mut tx, &mut ch, reply).await?;
+                        displays = after_resolution_change(&agent, sid, whiteboard, &params_tx, input_tx.as_ref(), &mut streams);
+                        send_json(&mut tx, &mut ch, json!({"t": "displays", "displays": displays})).await?;
+                        force_full.store(true, Ordering::Relaxed);
+                    }
+                    ViewerMsg::ResRestore { display } => {
+                        let res = match resolution.as_mut() {
+                            Some(r) => blocking(|| r.restore(display)),
+                            None => Err(anyhow!("changing the resolution is not allowed on this device")),
+                        };
+                        let reply = resolution_reply(&agent, sid, display, res, true);
+                        send_json(&mut tx, &mut ch, reply).await?;
+                        displays = after_resolution_change(&agent, sid, whiteboard, &params_tx, input_tx.as_ref(), &mut streams);
+                        send_json(&mut tx, &mut ch, json!({"t": "displays", "displays": displays})).await?;
+                        force_full.store(true, Ordering::Relaxed);
+                    }
                     ViewerMsg::Audio { on } => audio_enabled.store(on, Ordering::Relaxed),
                     ViewerMsg::Bye => return Ok(()),
                     _ => {}
@@ -440,6 +791,95 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
             }
         }
     }
+}
+
+/// An extra display stream (`cfg {streams}`): its own capture thread, tagged with `0x06`.
+struct Stream {
+    params: watch::Sender<Params>,
+    stop: Arc<AtomicBool>,
+    force_full: Arc<AtomicBool>,
+    /// Input geometry of the display (pointer events with `d`).
+    geo: capture::Geometry,
+}
+
+impl Stream {
+    fn start(display: usize, main: Params, out: mpsc::Sender<Vec<u8>>, encoder: &'static str, h264: &'static str) -> Self {
+        let p = Params { display, all: false, ..main };
+        let (params, params_rx) = watch::channel(p);
+        let stop = Arc::new(AtomicBool::new(false));
+        let force_full = Arc::new(AtomicBool::new(true));
+        let (stream_tx, mut stream_rx) = mpsc::channel::<Vec<u8>>(2);
+        {
+            let (stop, force_full) = (stop.clone(), force_full.clone());
+            std::thread::spawn(move || capture::run(params_rx, stream_tx, stop, force_full, encoder, h264));
+        }
+        // Ends when the capture thread stops (its sender is dropped) or the session is gone.
+        tokio::spawn(async move {
+            while let Some(msg) = stream_rx.recv().await {
+                if out.send(proto::stream(display as u8, &msg)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let n = display;
+        tracing::debug!("extra stream for display {n} started");
+        Stream { params, stop, force_full, geo: capture::geometry(display).unwrap_or_default() }
+    }
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Runs a short blocking call (display configuration) without stalling other tasks on this
+/// worker when the runtime allows it.
+fn blocking<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::current().runtime_flavor() {
+        tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(f),
+        _ => f(),
+    }
+}
+
+/// `res_ok` / `res_error` for a resolution change (None: nothing changed, e.g. restoring a
+/// display this session never changed).
+fn resolution_reply(agent: &Agent, sid: &str, display: usize, res: Result<Option<crate::resolution::Mode>>, restored: bool) -> serde_json::Value {
+    match res {
+        Ok(Some(m)) => {
+            agent.report(sid, "resolution_change", json!({"display": display, "w": m.w, "h": m.h, "restored": restored}));
+            json!({"t": "res_ok", "display": display, "w": m.w, "h": m.h, "hz": m.hz})
+        }
+        Ok(None) => json!({"t": "res_ok", "display": display}),
+        Err(e) => json!({"t": "res_error", "display": display, "message": format!("{e:#}")}),
+    }
+}
+
+/// Display sizes changed: point input, extra streams and annotations at the new geometry and
+/// return the new display list for the viewer.
+fn after_resolution_change(
+    agent: &Agent,
+    sid: &str,
+    whiteboard: bool,
+    params: &watch::Sender<Params>,
+    input: Option<&std::sync::mpsc::Sender<input::Event>>,
+    streams: &mut HashMap<usize, Stream>,
+) -> Vec<capture::DisplayInfo> {
+    let p = *params.borrow();
+    if let (Some(t), Some(g)) = (input, capture::geometry_of(&p)) {
+        let _ = t.send(input::Event::Geometry(g));
+    }
+    for (d, s) in streams.iter_mut() {
+        s.geo = capture::geometry(*d).unwrap_or_default();
+    }
+    if whiteboard {
+        let area = if p.all { capture::logical_area_all() } else { capture::logical_area(p.display) };
+        if let Some(b) = agent.status.lock().unwrap().boards.iter_mut().find(|b| b.sid == sid) {
+            *b = Board::new(sid, area.unwrap_or_default());
+        }
+        agent.changed();
+    }
+    capture::displays()
 }
 
 type WsError = tokio_tungstenite::tungstenite::Error;
@@ -495,6 +935,8 @@ impl Drop for StopOnDrop {
 enum Incoming {
     Msg(ViewerMsg),
     FileChunk(u32, Vec<u8>),
+    /// A 0x07 voice packet (whole message).
+    Voice(Vec<u8>),
 }
 
 async fn read_viewer<S>(rx: &mut S, ch: &mut Channel, idle: Duration) -> Result<Incoming>
@@ -516,6 +958,7 @@ where
                 plain.drain(..5);
                 return Ok(Incoming::FileChunk(id, plain));
             }
+            Some(&proto::MSG_VOICE) => return Ok(Incoming::Voice(plain)),
             Some(&proto::MSG_JSON) => {}
             _ => continue,
         }
@@ -524,6 +967,15 @@ where
             Err(e) => tracing::debug!("ignoring viewer message: {e}"),
         }
     }
+}
+
+/// `AEGIRON_TEST_CM=auto` together with `AEGIRON_TEST_AUDIO=tone`: a headless agent offers
+/// chat and voice calls as if someone sat at the connection manager, answers every call (its
+/// "microphone" is the test tone), echoes chat messages and, when the viewer hangs up, reports in
+/// the chat how many voice packets arrived. End-to-end tests only; never set by the app or the
+/// installers, and without the test tone it does nothing, so it can never open a microphone.
+fn test_cm() -> bool {
+    std::env::var("AEGIRON_TEST_CM").is_ok_and(|v| v == "auto") && audio::test_audio()
 }
 
 fn check_password(agent: &Agent, mode: Verification, pw: &str) -> bool {
@@ -563,14 +1015,30 @@ fn record_failure(agent: &Agent) {
 /// Asks the person at the machine to accept the connection. Shows a desktop dialog
 /// (macOS osascript / Linux zenity) and, when attached to a terminal, a y/N prompt;
 /// whichever is answered first wins. No answer within 30s means deny.
-async fn ask_local_user(agent: &Agent, viewer: &Viewer, recorded: bool) -> bool {
+/// Why this device does not run a tunnel or terminal session, as `auth_result.reason`.
+async fn refuse_kind(agent: &Agent, kind: &SessionKind, recorded: bool) -> Option<&'static str> {
+    let (tunnel, lan, terminal) = {
+        let c = agent.config.lock().unwrap();
+        (c.allow_tunnel, c.allow_tunnel_lan, c.allow_terminal)
+    };
+    match kind {
+        SessionKind::Screen => None,
+        SessionKind::Terminal => (!terminal).then_some("terminal_disabled"),
+        SessionKind::Tunnel { .. } if !tunnel => Some("tunnel_disabled"),
+        // Tunnelled traffic cannot be recorded; a policy that requires recording forbids them.
+        SessionKind::Tunnel { .. } if recorded => Some("recording_required"),
+        SessionKind::Tunnel { host, port } => crate::remote::resolve_allowed(host, *port, lan).await.is_err().then_some("target_not_allowed"),
+    }
+}
+
+async fn ask_local_user(agent: &Agent, viewer: &Viewer, recorded: bool, purpose: &str) -> bool {
     let who = if viewer.name.is_empty() { viewer.email.clone() } else { format!("{} <{}>", viewer.name, viewer.email) };
 
     // Desktop app running: ask in its window instead of a separate dialog.
     let ui_tx = agent.ui.lock().unwrap().as_ref().map(|u| (u.approvals.clone(), u.repaint.clone()));
     if let Some((tx, repaint)) = ui_tx {
         let (reply, answer) = tokio::sync::oneshot::channel();
-        let req = ApprovalRequest { sid: String::new(), who: who.clone(), ip: viewer.ip.clone(), recording: recorded, reply };
+        let req = ApprovalRequest { sid: String::new(), who: who.clone(), ip: viewer.ip.clone(), recording: recorded, purpose: purpose.to_string(), reply };
         if tx.send(req).is_ok() {
             repaint();
             return matches!(tokio::time::timeout(Duration::from_secs(30), answer).await, Ok(Ok(true)));
@@ -578,7 +1046,10 @@ async fn ask_local_user(agent: &Agent, viewer: &Viewer, recorded: bool) -> bool 
     }
 
     let note = if recorded { "\nเซสชันนี้จะถูกบันทึกตามนโยบายขององค์กร" } else { "" };
-    let question = format!("{who} ({}) ขอควบคุมเครื่องนี้ผ่าน Aegiron{note}\nอนุญาตหรือไม่?", viewer.ip);
+    let question = match purpose {
+        "" => format!("{who} ({}) ขอควบคุมเครื่องนี้ผ่าน Aegiron{note}\nอนุญาตหรือไม่?", viewer.ip),
+        p => format!("{who} ({}) ขอ{p}ผ่าน Aegiron{note}\nอนุญาตหรือไม่?", viewer.ip),
+    };
 
     let terminal = async {
         if !std::io::stdin().is_terminal() {
@@ -587,7 +1058,11 @@ async fn ask_local_user(agent: &Agent, viewer: &Viewer, recorded: bool) -> bool 
         let mut lines = agent.stdin_lines.lock().await;
         while lines.try_recv().is_ok() {}
         let rec = if recorded { " The session will be recorded." } else { "" };
-        println!("\n  >>> Remote control requested by {who} from {}.{rec} Allow? [y/N] (30s)", viewer.ip);
+        let what = match purpose {
+            "" => "Remote control".to_string(),
+            p => format!("{p} —"),
+        };
+        println!("\n  >>> {what} requested by {who} from {}.{rec} Allow? [y/N] (30s)", viewer.ip);
         match lines.recv().await {
             Some(l) => matches!(l.trim().to_lowercase().as_str(), "y" | "yes"),
             None => std::future::pending::<bool>().await,

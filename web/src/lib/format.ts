@@ -45,6 +45,8 @@ export function duration(from: string | null, to: string | null): string {
 
 /** "123456789" -> "123 456 789" */
 export function formatId(id: string): string {
+	// Custom IDs set by an admin (letters) are shown as they are.
+	if (!/^\d+$/.test(id)) return id;
 	return id.replace(/(\d{3})(?=\d)/g, '$1 ');
 }
 

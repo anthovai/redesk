@@ -154,7 +154,7 @@ cat > "$APP/Contents/Info.plist" <<EOF
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Aegiron ใช้ไมโครโฟนเพื่อส่งเสียงระหว่างการควบคุมระยะไกล / Aegiron uses the microphone to send audio during remote sessions.</string>
+	<string>Aegiron ใช้ไมโครโฟนเมื่อคุณโทรคุยหรือรับสายระหว่างการควบคุมระยะไกล / Aegiron uses the microphone for voice calls you make or accept during remote sessions.</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>Aegiron</string>
 </dict>

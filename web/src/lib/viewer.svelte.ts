@@ -4,10 +4,12 @@ import { api, ApiError, type SessionTicket } from './api';
 import { b64decode, b64encode, completeHandshake, newViewerKeys, type Channel, type ViewerKeys } from './crypto';
 import { fingerprint } from './format';
 import { sanitizeRel, ZIP_LIMIT, ZipWriter, type LocalTree } from './filetree';
-import { RemoteAudio, supportedAudioCodecs } from './audio';
+import { Microphone, RemoteAudio, supportedAudioCodecs, VOICE_CONFIG, voiceSupported } from './audio';
 import { decodableCodecs, decoderConfig, type VideoCodec } from './videocodec';
+import { applyCtl, hasControl, KEEPALIVE_MS, noControls, RECONNECT_FOR_MS, reconnectDelay, type ControlFeature } from './controls';
 
-export type Phase = 'requesting' | 'waiting' | 'handshake' | 'auth' | 'approval' | 'connected' | 'closed';
+/** `reconnecting`: the remote machine restarts at our request; we come back when it is online. */
+export type Phase = 'requesting' | 'waiting' | 'handshake' | 'auth' | 'approval' | 'connected' | 'reconnecting' | 'closed';
 
 export interface DisplayInfo {
 	index: number;
@@ -15,7 +17,27 @@ export interface DisplayInfo {
 	width: number;
 	height: number;
 	primary: boolean;
+	/** Position in the same units as width/height (agents from 0.6). */
+	x?: number;
+	y?: number;
 }
+
+/** A display mode for `res_list` / `res_set` (feature "resolution"). */
+export interface DisplayMode {
+	w: number;
+	h: number;
+	/** Refresh rate, 0 when unknown. */
+	hz: number;
+}
+
+export interface ModeList {
+	display: number;
+	current: DisplayMode;
+	original: DisplayMode;
+	modes: DisplayMode[];
+}
+
+export type KeyboardMode = 'translate' | 'map';
 
 export interface AgentInfo {
 	hostname: string;
@@ -40,7 +62,21 @@ export interface AgentInfo {
 	/** The agent streams its audio to this viewer (0x05 Opus packets). */
 	audio?: boolean;
 	audio_codec?: string | null;
+	/** The remote resolution can be changed from here (feature "resolution", host allows it). */
+	resolution?: boolean;
 }
+
+/** One chat message of this session (kept in the page only; never stored by the server). */
+export interface ChatMessage {
+	mine: boolean;
+	text: string;
+	at: number;
+}
+
+export type CallState = 'idle' | 'calling' | 'active';
+
+/** Longest chat message in characters (same as the agent). */
+export const CHAT_MAX = 4000;
 
 /** A whiteboard stroke, normalised to the remote screen. */
 export interface Stroke {
@@ -93,6 +129,7 @@ const MSG_FRAME = 0x02;
 const MSG_FILE = 0x03;
 const MSG_VIDEO = 0x04;
 const MSG_AUDIO = 0x05;
+const MSG_VOICE = 0x07;
 const AUDIO_OPUS = 1;
 const CODEC_KEY = 'aegiron.viewer.codec';
 
@@ -159,6 +196,31 @@ export class RemoteViewer {
 	wantCodec = $state<VideoCodec>(storedCodec());
 	/** Codecs this browser decodes with WebCodecs. */
 	decodable = $state<VideoCodec[]>([]);
+	/** Chat with the person at the remote machine (feature "chat"). */
+	chat = $state<ChatMessage[]>([]);
+	/** Messages from the remote side not seen yet (the page resets it while the chat is open). */
+	chatUnread = $state(0);
+	/** Voice call (feature "voice"). */
+	call = $state<CallState>('idle');
+	callSince = $state(0);
+	micMuted = $state(false);
+	remoteMuted = $state(false);
+	/** This browser can take part in voice calls. */
+	canVoice = $state(false);
+	/** Streaming every display as one picture (feature "alldisp"). */
+	displayAll = $state(false);
+	/** Display modes of the display asked for with `listModes` (feature "resolution"). */
+	modes = $state<ModeList | null>(null);
+	/** How keys reach the remote machine (feature "keymode"); this session only. */
+	keyboard = $state<KeyboardMode>('translate');
+	/** A message for the page to show once (resolution changes, session controls); `n` changes every time. */
+	notice = $state<{ text: string; n: number } | null>(null);
+	/** This viewer sends no input (agents that know `view_only` show it at the machine). */
+	viewOnly = $state(false);
+	/** Session controls the agent confirmed (block input, privacy, lock after the session). */
+	controls = $state(noControls());
+	/** Waiting for a restarted machine: attempt number and when the next one starts (ms). */
+	reconnect = $state<{ attempt: number; next: number } | null>(null);
 
 	private ws: WebSocket | null = null;
 	private ch: Channel | null = null;
@@ -169,6 +231,8 @@ export class RemoteViewer {
 	private canvas: HTMLCanvasElement | null = null;
 	private ctx: CanvasRenderingContext2D | null = null;
 	private pendingMove: [number, number] | null = null;
+	private pendingRel: [number, number] = [0, 0];
+	private relScheduled = false;
 	private moveScheduled = false;
 	private frames = 0;
 	private bytesIn = 0;
@@ -177,6 +241,9 @@ export class RemoteViewer {
 	private codecs: Promise<VideoCodec[]> = decodableCodecs().then((c) => (this.decodable = c));
 	private audioCodecs: Promise<string[]> = supportedAudioCodecs();
 	private audio = new RemoteAudio();
+	private voiceCheck: Promise<boolean> = voiceSupported().then((v) => (this.canVoice = v));
+	private mic: Microphone | null = null;
+	private voiceOut: RemoteAudio | null = null;
 	private decoder: VideoDecoder | null = null;
 	/** WebCodecs codec string the decoder is configured for (codec, and level for AV1). */
 	private decoderCodec = '';
@@ -194,6 +261,11 @@ export class RemoteViewer {
 	private quiet = new Set<number>();
 	/** File operations started from the panel (rm / mv / mkdir). */
 	private ops = new Set<number>();
+	/** One-time token for reconnecting after the restart we asked for. */
+	private resume: string | null = null;
+	private reconnectSince = 0;
+	private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+	private keepalive: ReturnType<typeof setInterval> | null = null;
 
 	constructor(public deviceId: string) {}
 
@@ -204,6 +276,8 @@ export class RemoteViewer {
 
 	async start() {
 		try {
+			this.ch = null;
+			this.keys = null;
 			const t = await api.post<SessionTicket>('/api/sessions', { device_id: this.deviceId });
 			this.device = t.device;
 			this.sid = t.ticket.sid;
@@ -213,17 +287,20 @@ export class RemoteViewer {
 			const ws = new WebSocket(`${proto}//${location.host}${t.ticket.relay_path}?${q}`);
 			ws.binaryType = 'arraybuffer';
 			this.ws = ws;
-			this.phase = 'waiting';
+			if (!this.resume) this.phase = 'waiting';
 			ws.onmessage = (ev) => {
+				if (this.ws !== ws) return;
 				if (typeof ev.data !== 'string') this.bytesIn += (ev.data as ArrayBuffer).byteLength;
 				this.recvChain = this.recvChain.then(() => this.onMessage(ev.data)).catch((e) => this.fail(e));
 			};
 			ws.onclose = (ev) => {
+				if (this.ws !== ws) return; // an earlier connection (before a restart)
+				this.stopStats();
+				if (this.phase !== 'closed' && this.scheduleReconnect()) return;
 				if (this.phase !== 'closed') {
 					this.phase = 'closed';
 					this.error ??= explainClose(ev.reason);
 				}
-				this.stopStats();
 			};
 			ws.onerror = () => {
 				this.error ??= 'เชื่อมต่อ relay ไม่สำเร็จ';
@@ -234,17 +311,44 @@ export class RemoteViewer {
 	}
 
 	private fail(e: unknown) {
+		const ws = this.ws;
+		this.ws = null;
+		ws?.close();
+		this.stopStats();
+		// Waiting for a restarted machine: offline or not ready yet, try again later.
+		if (this.phase !== 'closed' && this.scheduleReconnect()) return;
 		this.error = e instanceof ApiError || e instanceof Error ? e.message : String(e);
 		this.phase = 'closed';
-		this.ws?.close();
-		this.stopStats();
+	}
+
+	/** After a restart we asked for: the next attempt to come back (false = not restarting). */
+	private scheduleReconnect(): boolean {
+		if (!this.resume) return false;
+		if (!this.reconnectSince) this.reconnectSince = Date.now();
+		if (Date.now() - this.reconnectSince > RECONNECT_FOR_MS) {
+			this.resume = null;
+			this.reconnect = null;
+			this.phase = 'closed';
+			this.error = 'เครื่องปลายทางยังไม่กลับมาออนไลน์หลังรีสตาร์ท';
+			return true;
+		}
+		const attempt = (this.reconnect?.attempt ?? 0) + 1;
+		const wait = reconnectDelay(attempt);
+		this.reconnect = { attempt, next: Date.now() + wait };
+		this.phase = 'reconnecting';
+		this.error = null;
+		this.reconnectTimer = setTimeout(() => {
+			this.reconnectTimer = null;
+			if (this.resume) this.start();
+		}, wait);
+		return true;
 	}
 
 	private async onMessage(data: string | ArrayBuffer) {
 		if (typeof data === 'string') {
 			const m = JSON.parse(data);
 			if (m.t === 'paired') {
-				this.phase = 'handshake';
+				if (!this.resume) this.phase = 'handshake';
 				this.keys = await newViewerKeys();
 				this.ws?.send(JSON.stringify({ t: 'hello', v: 1, epk: b64encode(this.keys.epk) }));
 			} else if (m.t === 'hello' && this.keys && this.device) {
@@ -260,12 +364,20 @@ export class RemoteViewer {
 		else if (plain[0] === MSG_FILE) this.onFileChunk(plain);
 		else if (plain[0] === MSG_AUDIO && plain.length > 6 && plain[1] === AUDIO_OPUS) {
 			this.audio.push(new DataView(plain.buffer, plain.byteOffset).getUint32(2), plain.subarray(6));
+		} else if (plain[0] === MSG_VOICE && plain.length > 6 && plain[1] === AUDIO_OPUS && this.call === 'active') {
+			this.voiceOut?.push(new DataView(plain.buffer, plain.byteOffset).getUint32(2), plain.subarray(6));
 		}
 	}
 
 	private onControl(m: any) {
 		switch (m.t) {
 			case 'auth_required':
+				if (this.resume) {
+					// Back after the restart: the agent's one-time token replaces the password.
+					const resume = this.resume;
+					this.authMessage(null).then((m) => this.send({ ...m, resume }));
+					break;
+				}
 				this.needPassword = m.password;
 				if (m.password) {
 					this.phase = 'auth';
@@ -282,7 +394,18 @@ export class RemoteViewer {
 				if (m.ok) {
 					this.phase = 'connected';
 					this.error = null;
+					this.resume = null;
+					this.reconnect = null;
+					this.reconnectSince = 0;
 					this.startStats();
+				} else if (this.resume) {
+					// The token was not accepted (expired, device reset): ask for the password.
+					this.resume = null;
+					this.reconnect = null;
+					this.reconnectSince = 0;
+					this.needPassword = true;
+					this.phase = 'auth';
+					this.error = 'เครื่องปลายทางรีสตาร์ทแล้ว ใส่รหัสผ่านเพื่อเชื่อมต่ออีกครั้ง';
 				} else if (m.reason === 'wrong_password') {
 					this.attemptsLeft = m.attempts_left;
 					this.error = m.attempts_left > 0 ? `รหัสผ่านไม่ถูกต้อง (เหลือ ${m.attempts_left} ครั้ง)` : 'รหัสผ่านไม่ถูกต้อง';
@@ -300,7 +423,16 @@ export class RemoteViewer {
 				break;
 			case 'info':
 				this.info = m;
+				this.controls = noControls();
+				if (this.viewOnly && this.hasControl('view_only')) this.send({ t: 'view_only', on: true });
 				break;
+			case 'ctl': {
+				const r = applyCtl(this.controls, m);
+				this.controls = r.state;
+				if (r.notice) this.say(r.notice);
+				if (r.resume !== undefined) this.resume = r.resume;
+				break;
+			}
 			case 'encoder':
 				// The agent switched encoders mid-session (e.g. hardware -> OpenH264 -> JPEG).
 				if (this.info) this.info = { ...this.info, encoder: m.encoder, codec: m.codec ?? this.info.codec };
@@ -350,12 +482,36 @@ export class RemoteViewer {
 				if (this.folderDownloads.has(m.id)) this.finishFolderDownload(m.id);
 				else this.finishDownload(m.id);
 				break;
+			case 'res_list':
+				this.modes = { display: m.display, current: m.current, original: m.original, modes: m.modes ?? [] };
+				break;
+			case 'res_ok':
+				if (this.modes && this.modes.display === m.display) this.modes = { ...this.modes, current: { w: m.w, h: m.h, hz: m.hz ?? 0 } };
+				this.say(`เปลี่ยนความละเอียดเป็น ${m.w}×${m.h} แล้ว`);
+				break;
+			case 'res_error':
+				this.say(`เปลี่ยนความละเอียดไม่สำเร็จ: ${m.message ?? ''}`);
+				break;
+			case 'displays':
+				if (this.info && Array.isArray(m.displays)) this.info = { ...this.info, displays: m.displays };
+				break;
 			case 'cursor':
 				this.cursor = m.visible ? { x: m.x, y: m.y } : null;
 				break;
 			case 'clip':
 				this.remoteClipboard = m.s;
 				navigator.clipboard?.writeText(m.s).catch(() => {});
+				break;
+			case 'chat': {
+				const text = String(m.text ?? '').slice(0, CHAT_MAX);
+				if (text.trim()) {
+					this.chat = [...this.chat, { mine: false, text, at: Date.now() }];
+					this.chatUnread++;
+				}
+				break;
+			}
+			case 'voice':
+				this.onVoice(m);
 				break;
 		}
 	}
@@ -431,11 +587,19 @@ export class RemoteViewer {
 			this.frames = 0;
 			this.bytesIn = 0;
 		}, 1000);
+		// Only while the machine is blocked; older agents ignore it anyway.
+		if (this.keepalive) clearInterval(this.keepalive);
+		this.keepalive = setInterval(() => {
+			if (this.controls.block_input || this.controls.privacy) this.send({ t: 'ka' });
+		}, KEEPALIVE_MS);
 	}
 
 	private stopStats() {
+		this.endCall();
 		if (this.statsTimer) clearInterval(this.statsTimer);
 		this.statsTimer = null;
+		if (this.keepalive) clearInterval(this.keepalive);
+		this.keepalive = null;
 		// Stats stop exactly when the session ends; release the hardware decoder with them.
 		if (this.decoder && this.decoder.state !== 'closed') this.decoder.close();
 		this.decoder = null;
@@ -753,7 +917,113 @@ export class RemoteViewer {
 		const order: VideoCodec[] = this.wantCodec === 'av1' ? ['av1', 'h264'] : ['h264', 'av1'];
 		const decodable = await this.codecs;
 		const codecs = [...order.filter((c) => decodable.includes(c)), 'jpeg'];
-		return { t: 'auth', password, codecs, audio: await this.audioCodecs };
+		// Chat always; voice calls when this browser has Opus encode/decode and getUserMedia.
+		const features = (await this.voiceCheck) ? ['chat', 'voice'] : ['chat'];
+		return { t: 'auth', password, codecs, features, audio: await this.audioCodecs };
+	}
+
+	// --- chat and voice calls (agent features "chat" / "voice") ---
+
+	get canChat(): boolean {
+		return !!this.info?.features?.includes('chat');
+	}
+
+	/** The remote machine allows calls and this browser can make them. */
+	get canCall(): boolean {
+		return this.canVoice && !!this.info?.features?.includes('voice');
+	}
+
+	sendChat(text: string) {
+		const t = text.trim().slice(0, CHAT_MAX);
+		if (!t || !this.canChat) return;
+		this.chat = [...this.chat, { mine: true, text: t, at: Date.now() }];
+		this.send({ t: 'chat', text: t });
+	}
+
+	/** Asks for a voice call; call from a click (the microphone prompt and audio playback need one). */
+	async startCall() {
+		if (this.call !== 'idle' || !this.canCall) return;
+		this.call = 'calling';
+		this.voiceOut = new RemoteAudio(VOICE_CONFIG);
+		this.voiceOut.unlock();
+		const mic = new Microphone();
+		this.mic = mic;
+		try {
+			await mic.open();
+		} catch (e) {
+			this.endCall();
+			this.say(e instanceof DOMException && e.name === 'NotAllowedError' ? 'เบราว์เซอร์ไม่อนุญาตให้ใช้ไมโครโฟน' : 'เปิดไมโครโฟนไม่สำเร็จ');
+			return;
+		}
+		if (this.mic !== mic) return; // hung up while asking
+		this.send({ t: 'voice', op: 'call' });
+	}
+
+	hangup() {
+		if (this.call === 'idle') return;
+		this.send({ t: 'voice', op: 'hangup' });
+		this.endCall();
+	}
+
+	setMicMuted(muted: boolean) {
+		if (this.call !== 'active' || !this.mic) return;
+		this.micMuted = muted;
+		this.mic.muted = muted;
+		this.send({ t: 'voice', op: 'mute', muted });
+	}
+
+	private onVoice(m: any) {
+		switch (m.op) {
+			case 'accept':
+				if (this.call !== 'calling' || !this.mic) return;
+				try {
+					this.mic.start((seq, data) => {
+						const plain = new Uint8Array(6 + data.length);
+						plain[0] = MSG_VOICE;
+						plain[1] = AUDIO_OPUS;
+						new DataView(plain.buffer).setUint32(2, seq);
+						plain.set(data, 6);
+						this.enqueue(plain);
+					});
+				} catch (e) {
+					console.warn('voice: cannot start the microphone', e);
+					this.hangup();
+					this.say('เปิดไมโครโฟนไม่สำเร็จ');
+					return;
+				}
+				this.call = 'active';
+				this.callSince = Date.now();
+				break;
+			case 'decline':
+				if (this.call === 'idle') return;
+				this.endCall();
+				this.say(
+					m.reason === 'timeout'
+						? 'ปลายทางไม่รับสาย'
+						: m.reason === 'unavailable'
+							? 'ปลายทางรับสายไม่ได้ (ไม่อนุญาตการโทร หรือไม่มีไมโครโฟน)'
+							: 'ปลายทางปฏิเสธการโทร'
+				);
+				break;
+			case 'hangup':
+				if (this.call === 'idle') return;
+				this.endCall();
+				this.say('ปลายทางวางสายแล้ว');
+				break;
+			case 'mute':
+				this.remoteMuted = !!m.muted;
+				break;
+		}
+	}
+
+	private endCall() {
+		this.mic?.close();
+		this.mic = null;
+		this.voiceOut?.close();
+		this.voiceOut = null;
+		this.call = 'idle';
+		this.micMuted = false;
+		this.remoteMuted = false;
 	}
 
 	/** Lets audio play after a user gesture (browsers block autoplay until one). */
@@ -768,9 +1038,27 @@ export class RemoteViewer {
 		this.send({ t: 'audio', on: !muted });
 	}
 
+	// --- session controls (only those the agent lists in info.features) ---
+
+	hasControl(f: ControlFeature): boolean {
+		return hasControl(this.info?.features, f);
+	}
+
+	/** View-only: no input leaves this browser; agents that know it show it at the machine. */
+	setViewOnly(on: boolean) {
+		this.viewOnly = on;
+		if (this.hasControl('view_only')) this.send({ t: 'view_only', on });
+	}
+
+	/** `block_input`, `privacy` or `lock_after` with `on`; `lock` and `restart` ignore it. */
+	sessionControl(op: 'block_input' | 'privacy' | 'lock_after' | 'lock' | 'restart', on = true) {
+		this.send(op === 'lock' || op === 'restart' ? { t: op } : { t: op, on });
+	}
+
 	// --- input (coordinates normalised to the displayed frame) ---
 
 	mouseMove(x: number, y: number) {
+		if (this.viewOnly) return;
 		this.pendingMove = [x, y];
 		if (this.moveScheduled) return;
 		this.moveScheduled = true;
@@ -782,19 +1070,46 @@ export class RemoteViewer {
 	}
 
 	mouseButton(b: number, down: boolean, x: number, y: number) {
+		if (this.viewOnly) return;
 		this.pendingMove = null;
 		this.send({ t: 'mb', b, down, x, y });
 	}
 
+	/** Relative pointer motion in the remote's input units (feature "relmouse"), one message per frame. */
+	relativeMove(dx: number, dy: number) {
+		if (this.viewOnly) return;
+		this.pendingRel[0] += dx;
+		this.pendingRel[1] += dy;
+		if (this.relScheduled) return;
+		this.relScheduled = true;
+		requestAnimationFrame(() => {
+			this.relScheduled = false;
+			const clamp = (v: number) => Math.max(-2000, Math.min(2000, Math.round(v)));
+			const [dx, dy] = [clamp(this.pendingRel[0]), clamp(this.pendingRel[1])];
+			// Keep the fraction that did not make a whole unit for the next frame.
+			this.pendingRel = this.pendingRel.map((v) => v - Math.round(v)) as [number, number];
+			if (dx || dy) this.send({ t: 'mr', dx, dy });
+		});
+	}
+
+	/** Button press/release where the remote pointer is (relative mode). */
+	relativeButton(b: number, down: boolean) {
+		if (this.viewOnly) return;
+		this.send({ t: 'mb', b, down });
+	}
+
 	wheel(dx: number, dy: number) {
+		if (this.viewOnly) return;
 		this.send({ t: 'wh', dx, dy });
 	}
 
 	key(code: string, key: string, down: boolean) {
+		if (this.viewOnly) return;
 		this.send({ t: 'key', code, key, down });
 	}
 
 	typeText(s: string) {
+		if (this.viewOnly) return;
 		this.send({ t: 'text', s });
 	}
 
@@ -804,7 +1119,54 @@ export class RemoteViewer {
 
 	configure(cfg: { fps?: number; quality?: number; max_width?: number; display?: number }) {
 		this.send({ t: 'cfg', ...cfg });
-		if (cfg.display !== undefined && this.info) this.info.display = cfg.display;
+		if (cfg.display !== undefined) {
+			this.displayAll = false;
+			if (this.info) this.info.display = cfg.display;
+		}
+	}
+
+	/** Optional capability of the agent (`info.features`). */
+	has(feature: string): boolean {
+		return !!this.info?.features?.includes(feature);
+	}
+
+	/** Every display as one picture (feature "alldisp"); `configure({display})` goes back to one. */
+	showAllDisplays() {
+		if (!this.has('alldisp')) return;
+		this.displayAll = true;
+		this.send({ t: 'cfg', display_all: true });
+	}
+
+	/** Whether the remote resolution can be changed (feature "resolution", allowed by the host). */
+	get canResize(): boolean {
+		return this.has('resolution') && !!this.info?.resolution;
+	}
+
+	listModes(display: number) {
+		if (!this.canResize) return;
+		if (this.modes?.display !== display) this.modes = null;
+		this.send({ t: 'res_list', display });
+	}
+
+	setResolution(display: number, mode: DisplayMode) {
+		if (!this.canResize) return;
+		this.send({ t: 'res_set', display, w: mode.w, h: mode.h, ...(mode.hz ? { hz: mode.hz } : {}) });
+	}
+
+	restoreResolution(display: number) {
+		if (!this.canResize) return;
+		this.send({ t: 'res_restore', display });
+	}
+
+	/** Map (physical key positions) or translate (characters); feature "keymode". */
+	setKeyboard(mode: KeyboardMode) {
+		if (!this.has('keymode')) return;
+		this.keyboard = mode;
+		this.send({ t: 'cfg', keyboard: mode });
+	}
+
+	private say(text: string) {
+		this.notice = { text, n: (this.notice?.n ?? 0) + 1 };
 	}
 
 	refresh() {
@@ -869,6 +1231,10 @@ export class RemoteViewer {
 	}
 
 	close() {
+		this.resume = null; // closed by the user: no reconnect
+		this.reconnect = null;
+		if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+		this.reconnectTimer = null;
 		if (this.phase === 'closed') return;
 		this.send({ t: 'bye' });
 		this.sendChain.then(() => this.ws?.close(1000, 'viewer_closed'));

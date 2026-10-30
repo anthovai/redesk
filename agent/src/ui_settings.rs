@@ -4,6 +4,7 @@
 use std::sync::Mutex;
 
 use super::*;
+use crate::config::{MANAGED_TEXT, Managed};
 
 const NAV_WIDTH: f32 = 200.0;
 const CONTENT_MAX: f32 = 680.0;
@@ -175,12 +176,24 @@ fn control_row(ui: &mut Ui, title: &str, desc: &str, enabled: bool, paint: impl 
 
 /// RustDesk-style checkbox row.
 fn check_row(ui: &mut Ui, title: &str, desc: &str, value: &mut bool) -> bool {
+    check_row_enabled(ui, title, desc, value, true)
+}
+
+/// Description of a row the organisation's strategy manages (shown greyed out and locked).
+fn managed_desc(desc: &str, managed: bool) -> String {
+    if managed { format!("{desc} · {MANAGED_TEXT}") } else { desc.to_string() }
+}
+
+/// RustDesk-style checkbox row; `enabled` false (a setting the organisation manages) shows it
+/// faded and not clickable.
+fn check_row_enabled(ui: &mut Ui, title: &str, desc: &str, value: &mut bool, enabled: bool) -> bool {
     let pal = Palette::of(ui);
     let on = *value;
-    let resp = control_row(ui, title, desc, true, |ui, r, hovered| {
+    let resp = control_row(ui, title, desc, enabled, |ui, r, hovered| {
         let p = ui.painter();
+        let fade = |c: Color32| if enabled { c } else { c.gamma_multiply(0.45) };
         if on {
-            p.rect_filled(r, 4.0, pal.accent);
+            p.rect_filled(r, 4.0, fade(pal.accent));
             let at = |x: f32, y: f32| r.min + vec2(x, y) * (r.width() / 18.0);
             p.add(Shape::line(vec![at(4.5, 9.3), at(7.6, 12.3), at(13.6, 5.9)], Stroke::new(2.0, pal.on_accent)));
         } else {
@@ -189,7 +202,7 @@ fn check_row(ui: &mut Ui, title: &str, desc: &str, value: &mut bool) -> bool {
             p.rect_stroke(r.shrink(0.75), 4.0, Stroke::new(1.5, border), egui::StrokeKind::Middle);
         }
     });
-    if resp.clicked() {
+    if enabled && resp.clicked() {
         *value = !*value;
         true
     } else {
@@ -199,9 +212,14 @@ fn check_row(ui: &mut Ui, title: &str, desc: &str, value: &mut bool) -> bool {
 
 /// Feature on/off: title + description on the left, a switch on the right.
 fn switch_row(ui: &mut Ui, title: &str, desc: &str, value: &mut bool) -> bool {
+    switch_row_enabled(ui, title, desc, value, true)
+}
+
+/// Switch row that can be locked (`enabled` false: the switch does not react).
+fn switch_row_enabled(ui: &mut Ui, title: &str, desc: &str, value: &mut bool, enabled: bool) -> bool {
     let pal = Palette::of(ui);
     let mut changed = false;
-    ui.horizontal(|ui| {
+    ui.add_enabled_ui(enabled, |ui| ui.horizontal(|ui| {
         ui.set_min_height(54.0);
         ui.vertical(|ui| {
             ui.add_space(9.0);
@@ -210,10 +228,26 @@ fn switch_row(ui: &mut Ui, title: &str, desc: &str, value: &mut bool) -> bool {
             ui.label(RichText::new(desc).size(12.5).color(pal.muted));
         });
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            changed = toggle(ui, value).changed();
+            let mut v = *value;
+            changed = toggle(ui, &mut v).changed() && enabled;
+            if changed {
+                *value = v;
+            }
         });
-    });
+    }));
     changed
+}
+
+/// "This device follows your organisation's strategy" note at the top of a settings page.
+fn managed_banner(ui: &mut Ui, c: &Config) {
+    let Some(p) = &c.managed else { return };
+    let pal = Palette::of(ui);
+    ui.add_space(10.0);
+    Frame::new().fill(pal.side).corner_radius(10).inner_margin(Margin::symmetric(14, 10)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(RichText::new(format!("{MANAGED_TEXT}: นโยบาย \"{}\"", p.name)).font(semi(13.5)).color(pal.fg));
+        hint(ui, "การตั้งค่าที่จางลงถูกกำหนดโดยผู้ดูแลระบบ และเปลี่ยนที่เครื่องนี้ไม่ได้");
+    });
 }
 
 /// RustDesk-style radio row; returns true when it was picked (and was not already selected).
@@ -391,6 +425,16 @@ impl App {
             self.save_config(|c| c.viewer_codec = pref);
         }
 
+        card_title(ui, "หน้าต่างควบคุมเครื่องอื่น");
+        let mut tabs = self.local.viewer_tabs;
+        let changed = card(ui, |ui| {
+            check_row(ui, "เปิดเป็นแท็บในหน้าต่างเดียว", "แต่ละการเชื่อมต่อเป็นแท็บหนึ่ง คลิกขวาที่แท็บเพื่อแยกเป็นหน้าต่างใหม่ (ถ้าปิด จะเปิดหน้าต่างละเครื่อง)", &mut tabs)
+        });
+        if changed {
+            self.local.viewer_tabs = tabs;
+            self.mark_local();
+        }
+
         if cfg!(target_os = "macos") {
             permissions_ui::permissions_card(ui);
         }
@@ -398,24 +442,48 @@ impl App {
 
     fn page_security(&mut self, ui: &mut Ui, c: &Config) {
         let pal = Palette::of(ui);
+        managed_banner(ui, c);
+        let free = |m: Managed| !c.is_managed(m);
+        let row = |ui: &mut Ui, title: &str, desc: &str, v: &mut bool, m: Managed| {
+            check_row_enabled(ui, title, &managed_desc(desc, !free(m)), v, free(m))
+        };
 
         card_title(ui, "สิทธิ์ของผู้ควบคุม");
-        let (mut input, mut clip, mut files, mut board, mut sound) = (c.allow_input, c.allow_clipboard, c.allow_file_transfer, c.allow_whiteboard, c.allow_audio);
+        let (mut input, mut clip, mut files, mut board, mut sound, mut voice) =
+            (c.allow_input, c.allow_clipboard, c.allow_file_transfer, c.allow_whiteboard, c.allow_audio, c.allow_voice);
+        let mut lock = c.lock_after_session;
+        let mut res = c.allow_resolution;
         let changed = card(ui, |ui| {
-            let mut changed = check_row(ui, "ควบคุมเมาส์และคีย์บอร์ด", "ถ้าปิด ผู้เชื่อมต่อจะดูหน้าจอได้อย่างเดียว", &mut input);
+            let mut changed = row(ui, "ควบคุมเมาส์และคีย์บอร์ด", "ถ้าปิด ผู้เชื่อมต่อจะดูหน้าจอได้อย่างเดียว", &mut input, Managed::AllowInput);
             sep(ui);
-            changed |= check_row(ui, "คลิปบอร์ด", "คัดลอกและวางข้อความระหว่างสองเครื่อง", &mut clip);
+            changed |= row(ui, "คลิปบอร์ด", "คัดลอกและวางข้อความระหว่างสองเครื่อง", &mut clip, Managed::AllowClipboard);
             sep(ui);
-            changed |= check_row(ui, "รับ-ส่งไฟล์", "ไฟล์ที่ได้รับจะอยู่ในโฟลเดอร์ Downloads/Aegiron", &mut files);
+            changed |= row(ui, "รับ-ส่งไฟล์", "ไฟล์ที่ได้รับจะอยู่ในโฟลเดอร์ Downloads/Aegiron", &mut files, Managed::AllowFileTransfer);
             sep(ui);
-            changed |= check_row(ui, "วาดบนหน้าจอ", "ผู้ควบคุมขีดเขียนชี้จุดบนหน้าจอนี้ได้ (คลิกทะลุ ไม่บังหน้าจอ หายไปเมื่อจบเซสชัน)", &mut board);
+            changed |= row(ui, "วาดบนหน้าจอ", "ผู้ควบคุมขีดเขียนชี้จุดบนหน้าจอนี้ได้ (คลิกทะลุ ไม่บังหน้าจอ หายไปเมื่อจบเซสชัน)", &mut board, Managed::AllowWhiteboard);
             sep(ui);
             let hint = if crate::audio::capture_supported() {
                 "ส่งเสียงที่เครื่องนี้กำลังเล่นไปให้ผู้ควบคุม"
             } else {
                 "ส่งเสียงที่เครื่องนี้กำลังเล่นไปให้ผู้ควบคุม (ต้องใช้ macOS 13 ขึ้นไป หรือ Windows)"
             };
-            changed |= check_row(ui, "อนุญาตเสียง", hint, &mut sound);
+            changed |= row(ui, "อนุญาตเสียง", hint, &mut sound, Managed::AllowAudio);
+            sep(ui);
+            let hint = if crate::audio::voice_supported() {
+                "ผู้ควบคุมขอโทรคุยได้ ต้องกดรับสายที่เครื่องนี้ทุกครั้ง (ใช้ไมโครโฟนของเครื่องนี้)"
+            } else {
+                "ผู้ควบคุมขอโทรคุยได้ ต้องกดรับสายที่เครื่องนี้ทุกครั้ง (ไม่พบไมโครโฟนหรือลำโพง)"
+            };
+            changed |= row(ui, "อนุญาตการโทรคุย", hint, &mut voice, Managed::AllowVoice);
+            sep(ui);
+            let hint = if crate::resolution::supported() {
+                "ผู้ควบคุมเปลี่ยนความละเอียดของหน้าจอนี้ได้ และคืนค่าเดิมเมื่อจบเซสชัน"
+            } else {
+                "ผู้ควบคุมเปลี่ยนความละเอียดของหน้าจอนี้ได้ (macOS และ Windows เท่านั้น)"
+            };
+            changed |= row(ui, "อนุญาตให้เปลี่ยนความละเอียด", hint, &mut res, Managed::AllowResolution);
+            sep(ui);
+            changed |= row(ui, "ล็อกหน้าจอเมื่อจบเซสชัน", "ล็อกเครื่องนี้ทุกครั้งที่จบการเชื่อมต่อ", &mut lock, Managed::LockAfterSession);
             changed
         });
         if changed {
@@ -425,10 +493,78 @@ impl App {
                 c.allow_file_transfer = files;
                 c.allow_whiteboard = board;
                 c.allow_audio = sound;
+                c.allow_voice = voice;
+                c.lock_after_session = lock;
+                c.allow_resolution = res;
+            });
+        }
+
+        card_title(ui, "TCP tunnel และเทอร์มินัล");
+        let (mut tunnel, mut lan, mut term) = (c.allow_tunnel, c.allow_tunnel_lan, c.allow_terminal);
+        let changed = card(ui, |ui| {
+            let mut changed = row(ui, "อนุญาต TCP tunnel", "ผู้เชื่อมต่อส่งต่อพอร์ตจากเครื่องของเขามายังพอร์ตบนเครื่องนี้ (เช่น RDP, SSH, ฐานข้อมูล)", &mut tunnel, Managed::AllowTunnel);
+            if tunnel {
+                sep(ui);
+                changed |= row(
+                    ui,
+                    "ให้ tunnel ไปเครื่องอื่นในเครือข่ายภายในได้",
+                    "ถ้าปิด tunnel ไปได้เฉพาะเครื่องนี้ (localhost) ไม่ว่าจะเปิดหรือปิด ก็ไม่ไปอินเทอร์เน็ต",
+                    &mut lan,
+                    Managed::AllowTunnelLan,
+                );
+            }
+            sep(ui);
+            changed |= row(ui, "อนุญาตเทอร์มินัล", "ผู้เชื่อมต่อเปิด shell บนเครื่องนี้ได้ ทำงานด้วยสิทธิ์ของผู้ใช้ที่เปิด Aegiron", &mut term, Managed::AllowTerminal);
+            changed
+        });
+        if changed {
+            self.save_config(|c| {
+                c.allow_tunnel = tunnel;
+                c.allow_tunnel_lan = lan;
+                c.allow_terminal = term;
+            });
+        }
+
+        card_title(ui, "การควบคุมเครื่องนี้จากระยะไกล");
+        let (mut block, mut privacy, mut lock, mut restart) = (c.allow_block_input, c.allow_privacy_mode, c.allow_lock, c.allow_restart);
+        let supports = crate::controls::platform().supports(true);
+        let changed = card(ui, |ui| {
+            let needs_input = if c.allow_input { "" } else { " (ต้องเปิด \"ควบคุมเมาส์และคีย์บอร์ด\" ด้วย)" };
+            let mut changed = row(
+                ui,
+                "บล็อกเมาส์และคีย์บอร์ดของเครื่องนี้",
+                &format!("ผู้ควบคุมสั่งให้คนที่อยู่หน้าเครื่องใช้เมาส์/คีย์บอร์ดไม่ได้ระหว่างเชื่อมต่อ กด {} เพื่อยกเลิกได้เสมอ{needs_input}", crate::controls::ESCAPE_HINT),
+                &mut block,
+                Managed::AllowBlockInput,
+            );
+            sep(ui);
+            let hint = if supports[1] {
+                format!("ผู้ควบคุมทำให้จอของเครื่องนี้เป็นสีดำ (แต่ตัวเองยังเห็นภาพ) และบล็อกเมาส์/คีย์บอร์ด{needs_input}")
+            } else {
+                "ต้องใช้ Windows 10 (2004) ขึ้นไป หรือแอป Aegiron บน macOS".to_string()
+            };
+            changed |= row(ui, "โหมดความเป็นส่วนตัว", &hint, &mut privacy, Managed::AllowPrivacyMode);
+            sep(ui);
+            changed |= row(ui, "ล็อกหน้าจอ", "ผู้ควบคุมล็อกเครื่องนี้ได้ทันที หรือให้ล็อกเมื่อจบการเชื่อมต่อ", &mut lock, Managed::AllowLock);
+            sep(ui);
+            let hint = if supports[3] { "ผู้ควบคุมรีสตาร์ทเครื่องนี้ได้ แล้วเชื่อมต่อกลับเองเมื่อเครื่องเปิดขึ้นมา (ต้องตั้งให้ Aegiron เริ่มอัตโนมัติ)" } else { "รองรับเฉพาะ macOS และ Windows" };
+            changed |= row(ui, "รีสตาร์ทเครื่อง", hint, &mut restart, Managed::AllowRestart);
+            changed
+        });
+        if changed {
+            self.save_config(|c| {
+                c.allow_block_input = block;
+                c.allow_privacy_mode = privacy;
+                c.allow_lock = lock;
+                c.allow_restart = restart;
             });
         }
 
         card_title(ui, "การยอมรับการเชื่อมต่อ");
+        let approve_free = free(Managed::ApproveMode);
+        if !approve_free {
+            hint(ui, MANAGED_TEXT);
+        }
         let picked = card(ui, |ui| {
             let mut picked = None;
             let opts = [
@@ -440,7 +576,7 @@ impl App {
                 if i > 0 {
                     sep(ui);
                 }
-                if radio_row(ui, c.approve_mode == mode, true, title, desc) {
+                if radio_row(ui, c.approve_mode == mode, approve_free, title, desc) {
                     picked = Some(mode);
                 }
             }
@@ -451,6 +587,17 @@ impl App {
         }
 
         card_title(ui, "รหัสผ่าน");
+        if !free(Managed::PermanentPassword) {
+            // One-time passwords only: nothing on this card can change.
+            card(ui, |ui| {
+                ui.add_space(8.0);
+                ui.label(RichText::new("รหัสผ่านใช้ครั้งเดียวเท่านั้น").font(semi(14.0)).color(pal.fg));
+                hint(ui, &format!("องค์กรของคุณไม่อนุญาตรหัสผ่านถาวรบนเครื่องนี้ · {MANAGED_TEXT}"));
+                ui.add_space(8.0);
+            });
+            self.pin_card(ui, c);
+            return;
+        }
         let has_perm = c.permanent_password.is_some();
         let (pw1, pw2) = (&mut self.new_pw, &mut self.new_pw2);
         let (verification, save_pw) = card(ui, |ui| {
@@ -570,6 +717,7 @@ impl App {
 
     fn page_network(&mut self, ui: &mut Ui, agent: &Agent, c: &Config) {
         let pal = Palette::of(ui);
+        managed_banner(ui, c);
         card_title(ui, "เซิร์ฟเวอร์");
         let server_fp = B64.decode(&c.server_key).map(|k| fingerprint(&k)).unwrap_or_default();
         let state = agent.status.lock().unwrap().server.clone();
@@ -610,8 +758,10 @@ impl App {
 
         card_title(ui, "เครือข่ายท้องถิ่น (LAN)");
         let mut lan_on = c.lan_discovery;
+        let lan_free = !c.is_managed(Managed::LanDiscovery);
         let lan_changed = card(ui, |ui| {
-            switch_row(ui, "ให้เครื่องอื่นในเครือข่ายค้นพบ", "ตอบ ID และชื่อเครื่องแก่เครื่องในวงแลนเดียวกัน (UDP 21120)", &mut lan_on)
+            let desc = managed_desc("ตอบ ID และชื่อเครื่องแก่เครื่องในวงแลนเดียวกัน (UDP 21120)", !lan_free);
+            switch_row_enabled(ui, "ให้เครื่องอื่นในเครือข่ายค้นพบ", &desc, &mut lan_on, lan_free)
         });
         if lan_changed {
             self.save_config(|c| c.lan_discovery = lan_on);
@@ -619,13 +769,13 @@ impl App {
 
         card_title(ui, "การเชื่อมต่อโดยตรง (P2P)");
         let mut direct_on = c.direct_enabled;
+        let direct_free = !c.is_managed(Managed::DirectEnabled);
         let direct_changed = card(ui, |ui| {
-            let changed = switch_row(
-                ui,
-                "อนุญาตการเชื่อมต่อโดยตรง",
+            let desc = managed_desc(
                 "เชื่อมต่อตรงในวงแลน หรือ P2P ผ่าน UDP hole punching แทนการส่งผ่าน relay ของเซิร์ฟเวอร์ ข้อมูลยังเข้ารหัสต้นทาง-ปลายทางเหมือนเดิม ปิดเพื่อบังคับใช้ relay เสมอ (นโยบายองค์กร)",
-                &mut direct_on,
+                !direct_free,
             );
+            let changed = switch_row_enabled(ui, "อนุญาตการเชื่อมต่อโดยตรง", &desc, &mut direct_on, direct_free);
             sep(ui);
             info_row(ui, "พอร์ตเชื่อมต่อตรง", &format!("TCP {}", c.direct_port), false);
             let nat = crate::direct::nat_type().map(|n| n.label()).unwrap_or("ยังไม่ได้ตรวจ");

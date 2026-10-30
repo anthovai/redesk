@@ -45,12 +45,16 @@ pub struct LocalState {
     /// Device list as rows instead of cards.
     #[serde(default)]
     pub peer_list: bool,
+    /// Remote sessions as tabs of one window (RustDesk style) instead of one window each.
+    #[serde(default)]
+    pub viewer_tabs: bool,
 }
 
-/// A device ID as typed or linked: exactly nine digits once spaces are removed.
+/// A device ID as typed or linked: nine (up to 16) digits once spaces are removed, or a
+/// custom ID set by an administrator (see `valid_device_id`; letters are lowercased).
 pub fn normalize_id(s: &str) -> Option<String> {
-    let id: String = s.chars().filter(|c| *c != ' ').collect();
-    (id.len() == 9 && id.bytes().all(|b| b.is_ascii_digit())).then_some(id)
+    let id: String = s.chars().filter(|c| *c != ' ').collect::<String>().to_ascii_lowercase();
+    crate::valid_device_id(&id).then_some(id)
 }
 
 /// `aegiron://connect/<id>` or `aegiron://<id>` (one trailing slash allowed, URL-encoded spaces
@@ -65,6 +69,8 @@ pub fn parse_link(url: &str) -> Option<String> {
     let rest = rest.strip_suffix('/').unwrap_or(rest);
     let rest = match rest.get(..8) {
         Some(p) if p.eq_ignore_ascii_case("connect/") => &rest[8..],
+        // "aegiron://connect/" with no ID is not a link to a device called "connect".
+        _ if rest.eq_ignore_ascii_case("connect") => return None,
         _ => rest,
     };
     normalize_id(&rest.replace("%20", " "))
@@ -197,9 +203,11 @@ mod tests {
         assert_eq!(parse_link("Aegiron://Connect/123 456 789").as_deref(), Some("123456789"));
         assert_eq!(parse_link("aegiron://connect/123%20456%20789").as_deref(), Some("123456789"));
         assert_eq!(parse_link(" aegiron://123456789 ").as_deref(), Some("123456789"));
+        // Custom IDs set by an administrator.
+        assert_eq!(parse_link("aegiron://connect/Front-Desk").as_deref(), Some("front-desk"));
         for bad in [
             "aegiron://12345678",
-            "aegiron://1234567890",
+            "aegiron://12345678901234567",
             "aegiron://12345678a",
             "aegiron://connect/123456789?pw=x",
             "aegiron://connect/123456789/extra",

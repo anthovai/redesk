@@ -11,6 +11,11 @@
 | Wayland | ผ่าน XDG desktop portal: ScreenCast (ภาพจาก PipeWire) + RemoteDesktop (เมาส์/คีย์บอร์ด) ครั้งแรกระบบจะถามผู้ใช้ที่เครื่องว่าจะแชร์จอไหม แล้วจำการอนุญาตไว้ (restore token) จนกว่าจะเพิกถอนในการตั้งค่าของเดสก์ท็อป เคอร์เซอร์อยู่ในภาพวิดีโอ |
 | เสียง | ส่งเสียงที่เครื่องเล่นอยู่ (monitor ของลำโพงหลัก) ผ่าน PulseAudio หรือ PipeWire (pipewire-pulse) และเล่นเสียงจากเครื่องปลายทางผ่าน ALSA |
 | คลิปบอร์ด | ข้อความและรายชื่อไฟล์ ทั้ง X11 และ Wayland (data-control: KDE, wlroots; GNOME ใช้ผ่าน Xwayland) |
+| โทรคุย (voice call) | ไมโครโฟนหลักและลำโพงผ่าน ALSA (ซึ่ง PulseAudio/PipeWire รับต่อ) ต้องเปิดแอป `aegiron` อยู่ |
+| ความละเอียดจอ | X11 ผ่านคำสั่ง `xrandr` (แพ็กเกจ x11-xserver-utils) คืนค่าเดิมเมื่อจบเซสชัน; Wayland ไม่รองรับ (ไม่มีโปรโตคอลกลาง) |
+| ล็อก / รีสตาร์ท | `loginctl lock-session` / `systemctl reboot` ผ่าน logind (polkit อาจไม่ยอมถ้ามีผู้ใช้อื่นล็อกอินอยู่) |
+| เทอร์มินัล, tunnel | เทอร์มินัลใน pseudo-terminal (shell ของผู้ใช้) และ TCP tunnel ทำงานเหมือน macOS |
+| ยังไม่รองรับ | บล็อกเมาส์/คีย์บอร์ดของเครื่องปลายทาง และ privacy mode (การ grab ของ X11 จะบล็อก input ที่ agent ส่งผ่าน XTEST ไปด้วย) |
 | Tray | StatusNotifierItem (KDE, Xfce, Cinnamon, Budgie, GNOME ที่ติดตั้ง extension AppIndicator) ถ้าไม่มี tray ปิดหน้าต่างแล้วโปรแกรมจะออก และ `--background` จะเปิดหน้าต่างแทน |
 
 **Wayland ต้องมี** `xdg-desktop-portal` กับ backend ของเดสก์ท็อป (`xdg-desktop-portal-gnome`, `-kde` หรือ `-wlr`) และ PipeWire ถ้าไม่มีหรือผู้ใช้กดไม่อนุญาต ผู้ควบคุมจะเห็นข้อความ "เครื่องปลายทางแชร์หน้าจอไม่ได้" พร้อมเหตุผล (`auth_result` reason `screen_unavailable`) และใน log ของ agent; backend `-wlr` (Sway, Hyprland) มีแต่ ScreenCast จึงดูได้อย่างเดียว ไม่มีเมาส์/คีย์บอร์ด ตั้ง `AEGIRON_CAPTURE=x11` เพื่อบังคับใช้ X11 (Xwayland เห็นเฉพาะหน้าต่าง X11) หรือ `AEGIRON_CAPTURE=portal` เพื่อใช้ portal บน X11

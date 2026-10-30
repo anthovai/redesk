@@ -10,30 +10,51 @@ Windows code is at least compiled from a Mac: `cd agent && cargo check --target 
 
 Linux (x86_64 and aarch64, Ubuntu 24.04) runs in CI and locally in the container of `deploy/linux/Dockerfile`: `deploy/linux/test-x11.sh` starts Xvfb and a PulseAudio null sink and runs `cargo test` with the ignored tests: real X11 capture checked by color through JPEG and H.264 (`agent/tests/linux_x11.rs`), XTEST pointer moves read back, clipboard round trips with `xclip`, audio playback through cpal/ALSA heard by the monitor capture. `deploy/linux/smoke-test.sh` installs the built `.deb`/`.rpm`/`.tar.gz` in clean Ubuntu, Debian and Fedora containers. From a Mac: `docker build -t aegiron-linux-build deploy/linux` then run the script in it with the repository mounted (see `deploy/linux/README.md`). Wayland (the desktop portal) is not covered: there is no portal session in CI.
 
+Database-backed server tests run when `AEGIRON_TEST_DATABASE_URL` points at a scratch database (e.g. `postgres:///aegiron_test?host=/tmp`); without it they are skipped. Mail tests use an in-process SMTP server with STARTTLS (`server/internal/mail/mailtest`).
+
+### LDAP / Active Directory
+
+`deploy/test/ldap-test.sh` starts a directory (glauth, container `aegiron-admintest-ldap`, `127.0.0.1:13893` StartTLS and `13894` LDAPS) with a throwaway CA and the users in `deploy/test/ldap/glauth.cfg`, runs the LDAP tests and removes it. They cover both transports, wrong passwords, unknown and wildcard user names, groups through `memberOf` and a group search, an unknown CA, a server that refuses StartTLS (no plaintext fallback) and, with `AEGIRON_TEST_DATABASE_URL` set, web and desktop-app sign-in, role mapping, allowed groups, demotion and local-account protection. Not tested against a real Active Directory.
+
 ## End to end on one machine (`make e2e`)
 
 `scripts/e2e.sh` builds everything and runs the real programs against each other on this machine, isolated from anything already installed:
 
 - a server on `127.0.0.1:21200` with its own database (`aegiron_e2e`, dropped and recreated), data folder and a random admin password
-- an agent with a scratch config (`--config` in a temporary folder): audio allowed, remote input, clipboard, LAN discovery and direct connections off, so tests never move the mouse or touch the network beyond the server
-- Google Chrome, headless, driven by `puppeteer-core` (a web dev dependency; `CHROME_PATH` if Chrome is not in `/Applications`)
+- an agent with a scratch config (`--config` in a temporary folder): audio allowed, remote input, clipboard, LAN discovery and direct connections off, so tests never move the mouse or touch the network beyond the server; with the test tone it also runs with `AEGIRON_TEST_CM=auto` (chat and voice calls answered automatically, see [PROTOCOL.md §12](PROTOCOL.md#12-chat-voice-calls-and-switch-sides))
+- Google Chrome, headless, driven by `puppeteer-core` (a web dev dependency; `CHROME_PATH` if Chrome is not in `/Applications`), with Chrome's fake microphone for voice calls
 
-Everything is stopped, the database dropped and the folder removed at the end. Requirements: PostgreSQL 16 running locally (`make dev-db`; `PG_BIN` for the folder with `psql`/`createdb`/`dropdb` if they are not on `PATH`), Go, Rust, Bun, Chrome, and **Screen Recording permission** for the terminal (the agent captures the real screen). Options: `E2E_NO_BUILD=1`, `E2E_KEEP=1` (leave it running), `E2E_PORT`, `E2E_DB`, `E2E_REAL_AUDIO=1`.
+Everything is stopped, the database dropped and the folder removed at the end. Requirements: PostgreSQL 16 running locally (`make dev-db`; `PG_BIN` for the folder with `psql`/`createdb`/`dropdb` if they are not on `PATH`), Go, Rust, Bun, Chrome, and **Screen Recording permission** for the terminal (the agent captures the real screen). Options: `E2E_NO_BUILD=1`, `E2E_KEEP=1` (leave it running), `E2E_PORT`, `E2E_DB`, `E2E_REAL_AUDIO=1`, `E2E_STEPS` (e.g. `remote auth`: only those steps of `protocol native media auth remote`). The agent allows tunnels (to itself only) and terminals.
 
 The server limits sign-ins to 20 per address per 10 minutes, and one run uses most of that; `make e2e` starts a fresh server each time, so this only matters when running the scripts below by hand against one server.
 
 | Step | Script | What it checks |
 |---|---|---|
-| Protocol | `web/scripts/e2e-viewer.ts <id> <password> [dir]` | Relay, handshake with the browser's crypto, wrong then right password; a viewer offering `av1,h264,jpeg` gets `h264` from an agent without an AV1 encoder and `info.codecs` without `av1`; `cfg {codec: av1}` is ignored, `cfg {codec: jpeg}` and back switch with `encoder` messages; Opus `0x05` every 20 ms without sequence gaps; `audio {on}` stops and resumes it; optional file round trip |
+| Protocol | `web/scripts/e2e-viewer.ts <id> <password> [dir]` | Relay, handshake with the browser's crypto, wrong then right password; a viewer offering `av1,h264,jpeg` gets `h264` from an agent without an AV1 encoder and `info.codecs` without `av1`; `cfg {codec: av1}` is ignored, `cfg {codec: jpeg}` and back switch with `encoder` messages; Opus `0x05` every 20 ms without sequence gaps; `audio {on}` stops and resumes it; `info.features` has `chat` and `voice`; a chat message comes back; a voice call is accepted, `0x07` Opus packets arrive every 20 ms without gaps, the agent hears them sent back and stops after `hangup`; optional file round trip |
 | Native viewer | `agent/examples/media_probe.rs` | The desktop app's viewer code (`AEGIRON_CODEC=av1`) gets H.264, decodes frames and audio (`AEGIRON_AUDIO_OUT=0` decodes without playing) |
-| Browser media | `web/scripts/e2e-media.ts <id> <password>` | Live viewer with AV1 remembered: decoder configured for H.264, quality monitor shows H264 and Opus, the menu shows AV1 disabled ("ปลายทางไม่รองรับ") with H.264 marked, `AudioDecoder` output, mute/unmute; recording policy "all": the session is uploaded with `codec h264`, `audio opus` and plays with sound; synthetic AV1 + Opus recordings (below): what is drawn and heard at each moment, audio within 60 ms of video, seeking forward, back, across a muted stretch and while paused, AV1 → H.264 switch, 2× with sound, 4× silent |
+| Browser media | `web/scripts/e2e-media.ts <id> <password>` | Live viewer with AV1 remembered: decoder configured for H.264, quality monitor shows H264 and Opus, the menu shows AV1 disabled ("ปลายทางไม่รองรับ") with H.264 marked, `AudioDecoder` output, mute/unmute; chat panel round trip; voice call from the toolbar with the fake microphone (the agent's voice decodes as mono Opus, the agent reports the browser's packets), back to idle after hanging up; recording policy "all": the session is uploaded with `codec h264`, `audio opus` and plays with sound; synthetic AV1 + Opus recordings (below): what is drawn and heard at each moment, audio within 60 ms of video, seeking forward, back, across a muted stretch and while paused, AV1 → H.264 switch, 2× with sound, 4× silent |
+| Tunnels and terminals | `web/scripts/e2e-remote.ts <id>` | `aegiron-agent tunnel` to a local HTTP server (one page, 8 parallel 3 MiB downloads) and to a server that answers only after the client half-closed; a private-network target refused before the password is used; `aegiron-agent terminal --command` with Thai output and the remote exit status; the terminal protocol with the browser's crypto (start size, resize, Ctrl-C interrupts `sleep`, exit status); the console's xterm.js page in Chrome; recording policy "all": tunnels refused (422), a terminal session recorded and played back; audit entries with type and target |
+| Session controls | `web/scripts/e2e-controls.ts <id> <password>` | `info.features` lists `view_only`, `lock`, `restart` but not `block_input`/`privacy` (the test agent has input off); view-only, refusals, lock, lock after the session, restart answers with a reconnect token and runs the restart command (logged, see below), the token replaces the password once and only once; the `agent.*` audit entries |
 | Sign-in | `web/scripts/e2e-auth.ts` | 2FA user in Chrome: TOTP with "จดจำอุปกรณ์นี้ 30 วัน", cookie attributes and lifetime, account page, password-only sign-in, wrong password still fails, admin revokes from the Users page, TOTP required again and the cookie cleared; `aegiron-agent login --remember-device`, second login without a code, admin revoke, code required and the token forgotten; every audit entry |
 
-Each script prints `PASS`/`FAIL` lines and exits non-zero on a failure. They take `AEGIRON_URL` and `AEGIRON_PASSWORD` (admin) and can run against any test server; see the header of each file for its other variables.
+Each script prints `PASS`/`FAIL` lines and exits non-zero on a failure. With `AEGIRON_E2E_COOKIE=<file>` (set by `make e2e`), the scripts that only need an admin session share one sign-in. They take `AEGIRON_URL` and `AEGIRON_PASSWORD` (admin) and can run against any test server; see the header of each file for its other variables.
 
 ### Test audio
 
-Live audio is captured with ScreenCaptureKit on macOS and needs the Screen Recording permission. For repeatable tests the agent can send a generated tone instead: `AEGIRON_TEST_AUDIO=tone` (440 Hz, 0.5 s on / 0.5 s off). It is read from the environment only; the app, the installers and the login service never set it. `make e2e` uses it unless `E2E_REAL_AUDIO=1`. Real capture can be checked by hand: run the agent without it, play a sound and run `media_probe`, which prints the decoded level every second.
+Live audio is captured with ScreenCaptureKit on macOS and needs the Screen Recording permission. For repeatable tests the agent can send a generated tone instead: `AEGIRON_TEST_AUDIO=tone` (440 Hz, 0.5 s on / 0.5 s off). It is read from the environment only; the app, the installers and the login service never set it. `make e2e` uses it unless `E2E_REAL_AUDIO=1`. The same variable replaces the microphone in voice calls with a 660 Hz tone (agent and desktop viewer); `cargo test` runs two calls back to back with it (`voice::tests`). Real capture can be checked by hand: run the agent without it, play a sound and run `media_probe`, which prints the decoded level every second.
+
+### Test display resolution
+
+`AEGIRON_TEST_RESOLUTION=fake` on the agent replaces the CoreGraphics / `ChangeDisplaySettingsEx` backend with an in-memory list of modes (1920×1080, 1600×900, 1280×720, 1024×768), so `res_list` / `res_set` / `res_restore` can be exercised without touching the real screen. Like the test audio it is read from the environment only. The unit tests (`cargo test resolution`) use the same fake and check that the original mode comes back when a session ends.
+### Session controls without touching the machine
+
+`AEGIRON_TEST_CONTROLS=<file>` in the agent's environment replaces every effect of the session controls (block input, privacy windows, lock, restart) with a line appended to that file (`block_input on`, `privacy off`, `lock`, `restart: <command>`), and offers all of them regardless of platform. Like `AEGIRON_TEST_AUDIO`, it is read from the environment only and never set by the app, the installers or the login service. `make e2e` uses it, so a run never locks, blacks out or restarts the Mac it runs on. The logic around them (permissions, reports, cleanup when the session ends, reconnect tokens, the platform's restart commands) is covered by `cargo test` (`controls`, `block_input`, `privacy`) with a fake platform.
+
+The macOS capture that leaves the privacy windows out is checked against the real screen with `cargo test -- --ignored capture_without` (Screen Recording permission). The real input blocker, the black windows and the lock/restart calls need a person at a test machine:
+
+- Block input: from another machine, turn on บล็อกเมาส์และคีย์บอร์ดปลายทาง; local typing and clicks do nothing, the viewer's input works, clicks on the connection manager work, Ctrl+Alt+Shift+Esc ends the session; killing the agent (`kill -9`) gives input back at once.
+- Privacy mode: the local screens turn black with the escape hint, the viewer still sees the desktop; turning it off or disconnecting removes the black windows.
+- Lock and restart: the machine locks; restart asks for confirmation, the viewer shows *เครื่องปลายทางกำลังรีสตาร์ท* and reconnects without a password once the agent is back (it must start at login).
 
 ### Synthetic recordings
 
@@ -56,7 +77,17 @@ The running app logs `request from another launch: Open("<id>")` and asks before
 
 To check that new migrations apply to a database in use: create a database, apply the migrations up to the previous release with `psql -f` (recording each name in `schema_migrations` as `migrations/<file>`), add some rows, then start the new server against it and check `schema_migrations` and the new columns.
 
+### Chat, voice calls and switch sides by hand
+
+Automated: protocol and browser (above), unit tests for the grant rules (`server/internal/hub/switch_test.go`), the one-time secret (`switch::tests`) and the messages (`proto::tests`). By hand, with two Macs (or a Mac and a Windows PC) running the desktop app, both signed in:
+
+1. Connect from A to B. Chat both ways: unread counts on B's connection-manager tab and on A's chat button, a notification on B (macOS).
+2. Call from A's toolbar; B answers in the connection manager (and macOS asks B for the microphone the first time). Talk, mute either side, hang up from either side; let a call ring 30 s to see it declined.
+3. A: การทำงาน → สลับฝั่ง → confirm. B: ควบคุม in the connection manager. A's window closes and B now controls A without a password; A's connection manager shows B. Decline once to see "ปลายทางปฏิเสธการสลับฝั่ง" on A.
+
 ## Not covered on a Mac
 
 - AV1 from a live session (needs a Windows machine with a hardware AV1 encoder; rav1d decoding in the app is covered by `cargo test`)
 - Windows audio capture (WASAPI loopback), Media Foundation encoders
+- Voice calls with a real microphone (the automated tests use the test tone and Chrome's fake microphone) and switch sides between two desktop apps (needs two machines: see above)
+- Windows session controls: input hooks, privacy windows with `WDA_EXCLUDEFROMCAPTURE`, `LockWorkStation`, `shutdown /r` (compiled with `cargo check --target x86_64-pc-windows-gnu`, not yet run)

@@ -253,7 +253,8 @@ impl Portal {
         (0..self.streams.len())
             .map(|i| {
                 let (width, height) = self.size(i);
-                DisplayInfo { index: i, name: format!("Screen {}", i + 1), width, height, primary: i == 0 }
+                let s = &self.streams[i];
+                DisplayInfo { index: i, name: format!("Screen {}", i + 1), x: s.x, y: s.y, width, height, primary: i == 0 }
             })
             .collect()
     }
@@ -286,12 +287,36 @@ impl Portal {
         HashMap::new()
     }
 
-    /// Moves the pointer to a position normalised to the display (0..1).
-    pub fn pointer_to(&self, display: usize, x: f64, y: f64) -> Result<()> {
-        let (i, s) = self.stream(display);
+    /// Moves the pointer to a position normalised to `g`: one display, or the bounding box of
+    /// all of them (`capture::ALL_DISPLAYS`), where the stream under the point receives it.
+    pub fn pointer_to(&self, g: Geometry, x: f64, y: f64) -> Result<()> {
+        let (x, y) = (x.clamp(0.0, 1.0), y.clamp(0.0, 1.0));
+        let (i, x, y) = if g.display == crate::capture::ALL_DISPLAYS {
+            let (ax, ay) = (g.x as f64 + x * g.width as f64, g.y as f64 + y * g.height as f64);
+            let hit = (0..self.streams.len()).map(|i| (i, self.geometry(i))).find(|(_, s)| {
+                (s.x as f64..(s.x + s.width as i32) as f64).contains(&ax) && (s.y as f64..(s.y + s.height as i32) as f64).contains(&ay)
+            });
+            match hit {
+                Some((i, s)) => (i, (ax - s.x as f64) / s.width.max(1) as f64, (ay - s.y as f64) / s.height.max(1) as f64),
+                None => return Ok(()), // between displays: nowhere to move
+            }
+        } else {
+            (g.display, x, y)
+        };
+        let (i, s) = self.stream(i);
         let (w, h) = self.size(i);
         let (px, py) = (x.clamp(0.0, 1.0) * w.saturating_sub(1) as f64, y.clamp(0.0, 1.0) * h.saturating_sub(1) as f64);
         self.notify("NotifyPointerMotionAbsolute", &(self.session.clone(), Self::no_opts(), s.node, px, py))
+    }
+
+    /// Relative pointer motion.
+    pub fn pointer_by(&self, dx: f64, dy: f64) -> Result<()> {
+        self.notify("NotifyPointerMotion", &(self.session.clone(), Self::no_opts(), dx, dy))
+    }
+
+    /// Linux evdev key code (physical key, for keyboard "map" mode).
+    pub fn keycode(&self, code: u32, down: bool) -> Result<()> {
+        self.notify("NotifyKeyboardKeycode", &(self.session.clone(), Self::no_opts(), code as i32, down as u32))
     }
 
     /// Linux evdev button code (BTN_LEFT 0x110, BTN_RIGHT 0x111, BTN_MIDDLE 0x112).

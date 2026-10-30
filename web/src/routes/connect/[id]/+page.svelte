@@ -1,12 +1,14 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, untrack } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { formatId } from '#lib/format.js';
+	import ChatPanel from '#lib/ChatPanel.svelte';
 	import FilePanel from '#lib/FilePanel.svelte';
 	import { walkEntry } from '#lib/filetree.js';
 	import Icon from '#lib/Icon.svelte';
 	import { PEN_WIDTH, RemoteViewer } from '#lib/viewer.svelte.js';
+	import { layout, overflows, panFromPointer, panToCursor, screenshotName, type ScaleMode } from '#lib/viewscale.js';
 
 	const viewer = new RemoteViewer(page.params.id ?? '');
 	let canvas = $state<HTMLCanvasElement>();
@@ -17,7 +19,37 @@
 	let focused = $state(false);
 	let toast = $state('');
 	let showFiles = $state(false);
+	let showChat = $state(false);
 	let dragging = $state(false);
+	let confirmRestart = $state(false);
+	// Seconds until the next reconnect attempt after a restart (ticks while waiting).
+	let now = $state(Date.now());
+	$effect(() => {
+		if (viewer.phase !== 'reconnecting') return;
+		const t = setInterval(() => (now = Date.now()), 500);
+		return () => clearInterval(t);
+	});
+	const reconnectIn = $derived(viewer.reconnect ? Math.max(0, Math.ceil((viewer.reconnect.next - now) / 1000)) : 0);
+	// Call timer (mm:ss), ticking while a call is on (shares `now` with the reconnect countdown).
+	$effect(() => {
+		if (viewer.call !== 'active') return;
+		const t = setInterval(() => (now = Date.now()), 1000);
+		return () => clearInterval(t);
+	});
+	const callTime = $derived.by(() => {
+		const s = Math.max(0, Math.floor((now - viewer.callSince) / 1000));
+		return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+	});
+	// A message while the chat is closed: a toast and a count on the chat button.
+	let chatSeen = 0;
+	$effect(() => {
+		const n = viewer.chat.length;
+		if (n > chatSeen) {
+			const last = viewer.chat[n - 1];
+			if (!showChat && !last.mine) flash(`ข้อความจาก ${peerName}: ${last.text.slice(0, 80)}`);
+			chatSeen = n;
+		}
+	});
 	const held = new Map<string, string>(); // code -> key, for releasing on blur
 
 	// Floating toolbar (RustDesk-style): pinned stays open, unpinned collapses to a handle.
@@ -38,7 +70,7 @@
 	}
 	let pinned = $state(pref('aegiron.viewer.pinned', true));
 	let barShown = $state(false);
-	let menu = $state<'' | 'actions' | 'display' | 'pen'>('');
+	let menu = $state<'' | 'actions' | 'display' | 'keyboard' | 'pen'>('');
 	// Whiteboard: while the pen is on, the mouse draws on the remote screen instead of controlling it.
 	const penColors = [
 		['#ff3b30', 'แดง'],
@@ -48,7 +80,8 @@
 	] as const;
 	let pen = $state(false);
 	let penColor = $state<string>(penColors[0][0]);
-	const drawing = $derived(pen && viewer.phase === 'connected' && !!viewer.info?.whiteboard);
+	// Annotations belong to one display, so the pen is off while every display is shown.
+	const drawing = $derived(pen && viewer.phase === 'connected' && !!viewer.info?.whiteboard && !viewer.displayAll);
 	let showMonitor = $state(pref('aegiron.viewer.monitor', false));
 	let isFullscreen = $state(false);
 	let toolbar = $state<HTMLElement>();
@@ -75,8 +108,10 @@
 		clearTimeout(hideTimer);
 		if (!pinned) hideTimer = setTimeout(() => (barShown = false), 700);
 	}
-	function toggleMenu(m: 'actions' | 'display' | 'pen') {
+	function toggleMenu(m: 'actions' | 'display' | 'keyboard' | 'pen') {
 		menu = menu === m ? '' : m;
+		// Fresh list of display modes each time the display menu opens.
+		if (menu === 'display' && viewer.canResize && !viewer.displayAll && viewer.info) viewer.listModes(viewer.info.display);
 	}
 	/** Run a toolbar action, close the menu and give the keyboard back to the remote screen. */
 	function act(fn: () => unknown) {
@@ -89,23 +124,110 @@
 		setPref('aegiron.viewer.monitor', showMonitor);
 	}
 
-	// Scale the remote screen to fill the stage while keeping its aspect ratio.
+	// Scaling (RustDesk's view styles): stretch fits the stage up and down keeping the aspect
+	// ratio (default), shrink only ever makes it smaller, original is 1:1 and pans when larger.
+	const scaleLabels: [ScaleMode, string, string][] = [
+		['stretch', 'พอดีหน้าต่าง', 'ขยาย/ย่อ'],
+		['shrink', 'ย่อให้พอดี', 'ไม่ขยาย'],
+		['original', 'ขนาดจริง', '1:1']
+	];
+	function storedScale(): ScaleMode {
+		try {
+			const v = localStorage.getItem('aegiron.viewer.scale');
+			return v === 'original' || v === 'shrink' ? v : 'stretch';
+		} catch {
+			return 'stretch';
+		}
+	}
+	let scaleMode = $state<ScaleMode>(storedScale());
+	function setScale(m: ScaleMode) {
+		scaleMode = m;
+		try {
+			localStorage.setItem('aegiron.viewer.scale', m);
+		} catch {
+			// ignore
+		}
+	}
+	// Pan the 1:1 view to keep the remote pointer in sight instead of following ours.
+	let followCursor = $state(pref('aegiron.viewer.follow', false));
+	function toggleFollow() {
+		followCursor = !followCursor;
+		setPref('aegiron.viewer.follow', followCursor);
+	}
 	let stageW = $state(0);
 	let stageH = $state(0);
-	const fit = $derived.by(() => {
-		const { w, h } = viewer.frame;
-		if (!w || !h || !stageW || !stageH) return '';
-		const k = Math.min(stageW / w, stageH / h);
-		return `width: ${Math.floor(w * k)}px; height: ${Math.floor(h * k)}px;`;
+	let dpr = $state(window.devicePixelRatio || 1);
+	let pan = $state({ x: 0.5, y: 0.5 });
+	// Where the remote screen is drawn inside the stage (CSS pixels): canvas, annotations, pointer.
+	const stageSize = $derived({ w: stageW, h: stageH });
+	const shown = $derived(layout(scaleMode, viewer.frame, stageSize, dpr, pan));
+	const fit = $derived(shown.w ? `left: ${shown.x}px; top: ${shown.y}px; width: ${shown.w}px; height: ${shown.h}px;` : '');
+	const pannable = $derived(overflows(shown, stageSize));
+
+	$effect(() => {
+		if (!followCursor || !viewer.cursor || !pannable) return;
+		const cur = untrack(() => pan);
+		const next = panToCursor(cur, viewer.cursor, untrack(() => shown), stageSize);
+		if (next.x !== cur.x || next.y !== cur.y) pan = next;
 	});
-	// Where the remote screen is drawn inside the stage (the canvas is centered), for annotations.
-	const shown = $derived.by(() => {
-		const { w, h } = viewer.frame;
-		if (!w || !h || !stageW || !stageH) return { x: 0, y: 0, w: 0, h: 0 };
-		const k = Math.min(stageW / w, stageH / h);
-		const [sw, sh] = [Math.floor(w * k), Math.floor(h * k)];
-		return { x: (stageW - sw) / 2, y: (stageH - sh) / 2, w: sw, h: sh };
+
+	function onStagePointerMove(ev: PointerEvent) {
+		if (followCursor || relative || !pannable || !stage) return;
+		const r = stage.getBoundingClientRect();
+		pan = panFromPointer(ev.clientX - r.left, ev.clientY - r.top, stageSize);
+	}
+
+	// Relative mouse (games, 3D apps): pointer lock, motion sent as `mr` deltas.
+	let relative = $state(false);
+	const canRelative = $derived(!!viewer.info?.input && viewer.has('relmouse'));
+	function toggleRelative() {
+		if (!canvas) return;
+		if (document.pointerLockElement === canvas) {
+			document.exitPointerLock();
+			return;
+		}
+		canvas.focus();
+		Promise.resolve(canvas.requestPointerLock()).catch(() => flash('เบราว์เซอร์ไม่อนุญาตให้ล็อกเมาส์'));
+	}
+	$effect(() => {
+		const sync = () => {
+			const locked = !!canvas && document.pointerLockElement === canvas;
+			if (locked !== relative) flash(locked ? 'เมาส์แบบสัมพัทธ์ · กด Ctrl+Alt+M หรือ Esc เพื่อออก' : 'ออกจากเมาส์แบบสัมพัทธ์แล้ว');
+			relative = locked;
+		};
+		document.addEventListener('pointerlockchange', sync);
+		return () => document.removeEventListener('pointerlockchange', sync);
 	});
+	$effect(() => {
+		if (viewer.phase !== 'connected' && document.pointerLockElement) document.exitPointerLock();
+	});
+	/** Remote input units per CSS pixel of the drawn picture, so locked motion feels 1:1. */
+	function relativeScale(): number {
+		const d = viewer.displayAll ? undefined : currentDisplay;
+		const units = d?.width || viewer.frame.w;
+		return shown.w ? units / shown.w : 1;
+	}
+
+	function saveScreenshot() {
+		if (!canvas || !viewer.frame.w) return flash('ยังไม่มีภาพหน้าจอ');
+		const name = screenshotName(peerName, new Date());
+		canvas.toBlob((blob) => {
+			if (!blob) return flash('บันทึกภาพหน้าจอไม่สำเร็จ');
+			const url = URL.createObjectURL(blob);
+			const a = document.createElement('a');
+			a.href = url;
+			a.download = name;
+			a.click();
+			setTimeout(() => URL.revokeObjectURL(url), 10_000);
+			flash(`บันทึกภาพหน้าจอแล้ว: ${name}`);
+		}, 'image/png');
+	}
+
+	const currentDisplay = $derived(viewer.info?.displays.find((d) => d.index === viewer.info?.display));
+	type Mode = { w: number; h: number; hz: number };
+	const modeLabel = (m: Mode) => `${m.w} × ${m.h}${m.hz ? ` · ${Math.round(m.hz)} Hz` : ''}`;
+	const sameMode = (a: Mode | undefined, b: Mode | undefined) =>
+		!!a && !!b && a.w === b.w && a.h === b.h && (!a.hz || !b.hz || Math.round(a.hz) === Math.round(b.hz));
 	const peerName = $derived(viewer.device?.alias || viewer.info?.hostname || viewer.device?.hostname || formatId(viewer.deviceId));
 	const codecLabel = $derived((viewer.info?.codec ?? 'jpeg').toUpperCase());
 	const webCodecs = $derived(viewer.info?.codec === 'h264' || viewer.info?.codec === 'av1');
@@ -162,9 +284,14 @@
 		return [(ev.clientX - r.left) / r.width, (ev.clientY - r.top) / r.height];
 	}
 
-	const live = $derived(viewer.phase === 'connected' && viewer.info?.input !== false);
+	const live = $derived(viewer.phase === 'connected' && viewer.info?.input !== false && !viewer.viewOnly);
 
 	function onPointerMove(ev: PointerEvent) {
+		if (relative) {
+			const k = relativeScale();
+			viewer.relativeMove(ev.movementX * k, ev.movementY * k);
+			return;
+		}
 		if (drawing) {
 			if (ev.buttons & 1) viewer.extendStroke(...norm(ev));
 			return;
@@ -183,6 +310,10 @@
 		}
 		if (!live) return;
 		ev.preventDefault();
+		if (relative) {
+			viewer.relativeButton(ev.button, down);
+			return;
+		}
 		if (down) {
 			canvas?.focus();
 			viewer.unlockAudio(); // first click on the screen also lets remote audio play
@@ -205,6 +336,12 @@
 	});
 
 	function onKey(ev: KeyboardEvent, down: boolean) {
+		// Ctrl+Alt+M toggles relative mouse here; it never reaches the remote machine.
+		if (ev.code === 'KeyM' && ev.ctrlKey && ev.altKey && canRelative && live) {
+			ev.preventDefault();
+			if (down && !ev.repeat) toggleRelative();
+			return;
+		}
 		if (down && ev.key === 'Escape' && menu) {
 			menu = '';
 			return;
@@ -299,13 +436,40 @@
 		if (viewer.remoteClipboard) flash('ได้รับคลิปบอร์ดจากเครื่องปลายทาง');
 	});
 
+	$effect(() => {
+		if (viewer.notice) flash(viewer.notice.text);
+	});
+
+	function toggleViewOnly() {
+		viewer.setViewOnly(!viewer.viewOnly);
+		releaseAll();
+		flash(viewer.viewOnly ? 'โหมดดูอย่างเดียว: ไม่ส่งเมาส์และคีย์บอร์ด' : 'กลับมาควบคุมได้แล้ว');
+	}
+
+	// Lock: the agent locks the machine itself when it can; older agents get the lock shortcut.
+	function lockRemote() {
+		if (viewer.hasControl('lock')) return viewer.sessionControl('lock');
+		const mac = viewer.info?.os === 'macos';
+		const mods = mac ? [['ControlLeft', 'Control'], ['MetaLeft', 'Meta']] : [['MetaLeft', 'Meta']];
+		const key = mac ? ['KeyQ', 'q'] : ['KeyL', 'l'];
+		for (const [c, k] of [...mods, key]) viewer.key(c, k, true);
+		for (const [c, k] of [key, ...mods.reverse()]) viewer.key(c, k, false);
+		flash('ส่งคำสั่งล็อกหน้าจอแล้ว');
+	}
+
 	const tb = (active = false) =>
 		`grid size-8 shrink-0 place-items-center rounded-md transition-colors ${active ? 'bg-accent-soft text-accent' : 'text-fg/75 hover:bg-raised hover:text-fg'}`;
 	const mi = 'flex w-full items-center gap-2.5 px-3 py-1.5 text-left text-sm transition-colors hover:bg-accent hover:text-accent-fg';
 </script>
 
 <svelte:head><title>{peerName} · Aegiron</title></svelte:head>
-<svelte:window onkeydown={(e) => onKey(e, true)} onkeyup={(e) => onKey(e, false)} onblur={releaseAll} onpointerdown={onWindowPointerDown} />
+<svelte:window
+	onkeydown={(e) => onKey(e, true)}
+	onkeyup={(e) => onKey(e, false)}
+	onblur={releaseAll}
+	onpointerdown={onWindowPointerDown}
+	onresize={() => (dpr = window.devicePixelRatio || 1)}
+/>
 
 <div class="flex h-screen bg-stage">
 	<div
@@ -324,11 +488,12 @@
 			if (e.currentTarget === e.target) dragging = false;
 		}}
 		ondrop={onDrop}
+		onpointermove={onStagePointerMove}
 	>
 		<canvas
 			bind:this={canvas}
 			tabindex="0"
-			class="outline-none {viewer.phase === 'connected' && viewer.frame.w ? '' : 'opacity-0'} {drawing ? 'cursor-crosshair' : live ? 'cursor-default' : ''}"
+			class="absolute outline-none {viewer.phase === 'connected' && viewer.frame.w ? '' : 'opacity-0'} {drawing ? 'cursor-crosshair' : live ? 'cursor-default' : ''}"
 			style="image-rendering: auto; {fit}"
 			onpointermove={onPointerMove}
 			onpointerenter={() => (pointerOver = true)}
@@ -376,11 +541,44 @@
 			</div>
 		{/if}
 
-		{#if viewer.cursor && canvas && !pointerOver}
+		{#if viewer.phase === 'connected' && (viewer.viewOnly || viewer.controls.block_input || viewer.controls.privacy || viewer.controls.lock_after)}
+			<!-- Controls in effect on the remote machine. -->
+			<div class="pointer-events-none absolute bottom-3 left-3 flex flex-wrap gap-1.5" role="status">
+				{#each [[viewer.viewOnly, 'ดูอย่างเดียว'], [viewer.controls.privacy, 'จอปลายทางถูกซ่อน'], [viewer.controls.block_input && !viewer.controls.privacy, 'บล็อกเมาส์/คีย์บอร์ดปลายทาง'], [viewer.controls.lock_after, 'ล็อกเมื่อจบ']] as [on, label] (label)}
+					{#if on}<span class="rounded-full bg-black/65 px-3 py-1 text-xs font-medium text-white shadow-lg backdrop-blur-sm">{label}</span>{/if}
+				{/each}
+			</div>
+		{/if}
+
+		{#if confirmRestart && viewer.phase === 'connected'}
+			<div class="absolute inset-0 z-20 grid place-items-center bg-black/30 p-4">
+				<div class="w-full max-w-[400px] overflow-hidden rounded-xl bg-surface text-fg shadow-[0_20px_60px_rgb(0_0_0/0.5)]" role="alertdialog" aria-modal="true">
+					<div class="flex items-start gap-3 px-6 pt-5 pb-4">
+						<span class="grid size-9 shrink-0 place-items-center rounded-full bg-danger-soft text-danger"><Icon name="power" size={18} /></span>
+						<div class="min-w-0 pt-1.5">
+							<h2 class="font-semibold">รีสตาร์ทเครื่องปลายทาง?</h2>
+							<p class="mt-1 text-sm text-muted">{peerName} จะปิดโปรแกรมทั้งหมดแล้วเริ่มใหม่ งานที่ยังไม่บันทึกอาจหายไป เมื่อเครื่องกลับมาออนไลน์ หน้านี้จะเชื่อมต่อให้อีกครั้ง</p>
+						</div>
+					</div>
+					<div class="flex justify-end gap-2 border-t border-line bg-raised/60 px-6 py-3">
+						<button class="btn min-w-20" onclick={() => (confirmRestart = false)}>ยกเลิก</button>
+						<button
+							class="btn btn-primary min-w-20"
+							onclick={() => {
+								confirmRestart = false;
+								viewer.sessionControl('restart');
+							}}>รีสตาร์ท</button
+						>
+					</div>
+				</div>
+			</div>
+		{/if}
+
+		{#if viewer.cursor && shown.w && (!pointerOver || relative)}
 			<!-- Remote pointer: screen captures do not include it. -->
 			<svg
 				class="pointer-events-none absolute"
-				style="left: {canvas.offsetLeft + viewer.cursor.x * canvas.clientWidth}px; top: {canvas.offsetTop + viewer.cursor.y * canvas.clientHeight}px"
+				style="left: {shown.x + viewer.cursor.x * shown.w}px; top: {shown.y + viewer.cursor.y * shown.h}px"
 				width="14"
 				height="20"
 				viewBox="-1 -1 14 20"
@@ -450,16 +648,29 @@
 							<span class="mx-1 h-5 w-px bg-line"></span>
 							{#each viewer.info.displays as d (d.index)}
 								<button
-									class="relative grid h-8 w-9 shrink-0 place-items-center rounded-md transition-colors {viewer.info.display === d.index
+									class="relative grid h-8 w-9 shrink-0 place-items-center rounded-md transition-colors {!viewer.displayAll && viewer.info.display === d.index
 										? 'text-accent'
 										: 'text-fg/60 hover:bg-raised hover:text-fg'}"
 									title="{d.name}{d.primary ? ' (หลัก)' : ''} · {d.width}×{d.height}"
+									aria-pressed={!viewer.displayAll && viewer.info.display === d.index}
 									onclick={() => act(() => viewer.configure({ display: d.index }))}
 								>
 									<Icon name="monitor" size={22} />
 									<span class="absolute top-[7px] text-[10px] font-bold">{d.index + 1}</span>
 								</button>
 							{/each}
+							{#if viewer.has('alldisp')}
+								<button
+									class="grid h-8 w-9 shrink-0 place-items-center rounded-md transition-colors {viewer.displayAll
+										? 'text-accent'
+										: 'text-fg/60 hover:bg-raised hover:text-fg'}"
+									title="ทุกหน้าจอ (รวมเป็นภาพเดียว)"
+									aria-pressed={viewer.displayAll}
+									onclick={() => act(() => viewer.showAllDisplays())}
+								>
+									<Icon name="layers" size={20} />
+								</button>
+							{/if}
 						{/if}
 
 						<span class="mx-1 h-5 w-px bg-line"></span>
@@ -479,7 +690,51 @@
 									{#if viewer.info?.input}
 										<button class={mi} role="menuitem" onclick={() => act(sendCtrlAltDel)}><Icon name="keyboard" size={15} /> ส่ง Ctrl+Alt+Del</button>
 									{/if}
+									{#if viewer.hasControl('lock') || (viewer.info?.input && !viewer.viewOnly)}
+										<button class={mi} role="menuitem" onclick={() => act(lockRemote)}><Icon name="lock" size={15} /> ล็อกหน้าจอเครื่องปลายทาง</button>
+									{/if}
+									{#if viewer.hasControl('lock')}
+										<button class={mi} role="menuitemcheckbox" aria-checked={viewer.controls.lock_after} onclick={() => act(() => viewer.sessionControl('lock_after', !viewer.controls.lock_after))}>
+											<Icon name="lock" size={15} /> <span class="flex-1">ล็อกเมื่อจบการเชื่อมต่อ</span>
+											{#if viewer.controls.lock_after}<Icon name="check" size={15} />{/if}
+										</button>
+									{/if}
+									{#if viewer.hasControl('restart')}
+										<button class={mi} role="menuitem" onclick={() => act(() => (confirmRestart = true))}><Icon name="power" size={15} /> รีสตาร์ทเครื่องปลายทาง</button>
+									{/if}
 									<button class={mi} role="menuitem" onclick={() => act(() => viewer.refresh())}><Icon name="refresh" size={15} /> รีเฟรชภาพ (ขอคีย์เฟรมใหม่)</button>
+									<button class={mi} role="menuitem" disabled={!viewer.frame.w} onclick={() => act(saveScreenshot)}><Icon name="camera" size={15} /> บันทึกภาพหน้าจอ</button>
+									{#if viewer.info?.input}
+										<div class="my-1 border-t border-line"></div>
+										<button class={mi} role="menuitemcheckbox" aria-checked={viewer.viewOnly} onclick={() => act(toggleViewOnly)}>
+											<Icon name="eye" size={15} /> <span class="flex-1">ดูอย่างเดียว</span>
+											{#if viewer.viewOnly}<Icon name="check" size={15} />{/if}
+										</button>
+										{#if viewer.hasControl('block_input')}
+											<button
+												class={mi}
+												role="menuitemcheckbox"
+												aria-checked={viewer.controls.block_input}
+												title="คนที่เครื่องปลายทางใช้เมาส์และคีย์บอร์ดไม่ได้ จนกว่าจะปิดหรือจบการเชื่อมต่อ (กด Ctrl+Alt+Shift+Esc ที่เครื่องนั้นเพื่อยกเลิก)"
+												onclick={() => act(() => viewer.sessionControl('block_input', !viewer.controls.block_input))}
+											>
+												<Icon name="ban" size={15} /> <span class="flex-1">บล็อกเมาส์และคีย์บอร์ดปลายทาง</span>
+												{#if viewer.controls.block_input}<Icon name="check" size={15} />{/if}
+											</button>
+										{/if}
+										{#if viewer.hasControl('privacy')}
+											<button
+												class={mi}
+												role="menuitemcheckbox"
+												aria-checked={viewer.controls.privacy}
+												title="หน้าจอปลายทางเป็นสีดำสำหรับคนที่อยู่หน้าเครื่อง แต่คุณยังเห็นภาพตามปกติ และบล็อกเมาส์/คีย์บอร์ดของเครื่องนั้นด้วย"
+												onclick={() => act(() => viewer.sessionControl('privacy', !viewer.controls.privacy))}
+											>
+												<Icon name="shield" size={15} /> <span class="flex-1">โหมดความเป็นส่วนตัว</span>
+												{#if viewer.controls.privacy}<Icon name="check" size={15} />{/if}
+											</button>
+										{/if}
+									{/if}
 									{#if viewer.info?.clipboard || viewer.info?.input}
 										<div class="my-1 border-t border-line"></div>
 									{/if}
@@ -544,6 +799,60 @@
 										</button>
 									{/each}
 									<div class="my-1 border-t border-line"></div>
+									<p class="px-3 pt-1 pb-1 text-xs font-medium text-muted">ขนาดภาพ</p>
+									{#each scaleLabels as [m, label, hint] (m)}
+										<button class={mi} role="menuitemradio" aria-checked={scaleMode === m} onclick={() => act(() => setScale(m))}>
+											<span class="grid size-[15px] place-items-center">
+												<span class="size-2 rounded-full {scaleMode === m ? 'bg-accent ring-2 ring-surface' : ''}"></span>
+											</span>
+											<span class="flex-1">{label}</span>
+											<span class="text-[11px] opacity-70">{hint}</span>
+										</button>
+									{/each}
+									<button
+										class="{mi} disabled:pointer-events-none disabled:opacity-50"
+										role="menuitemcheckbox"
+										aria-checked={followCursor}
+										disabled={scaleMode !== 'original'}
+										title="เลื่อนภาพตามเคอร์เซอร์ของเครื่องปลายทาง เมื่อภาพใหญ่กว่าหน้าต่าง"
+										onclick={() => act(toggleFollow)}
+									>
+										<Icon name="mouse" size={15} /> <span class="flex-1">ตามเคอร์เซอร์ปลายทาง</span>
+										{#if followCursor}<Icon name="check" size={15} />{/if}
+									</button>
+									{#if viewer.canResize && !viewer.displayAll}
+										<div class="my-1 border-t border-line"></div>
+										<p class="px-3 pt-1 pb-1 text-xs font-medium text-muted">
+											ความละเอียด{viewer.info && viewer.info.displays.length > 1 ? ` · จอ ${viewer.info.display + 1}` : ''}
+										</p>
+										{#if !viewer.modes || viewer.modes.display !== viewer.info?.display}
+											<p class="px-3 py-1.5 text-sm text-muted">กำลังโหลด…</p>
+										{:else}
+											<div class="max-h-52 overflow-y-auto">
+												{#each viewer.modes.modes as m, i (i)}
+													<button
+														class={mi}
+														role="menuitemradio"
+														aria-checked={sameMode(m, viewer.modes.current)}
+														onclick={() => act(() => viewer.setResolution(viewer.info?.display ?? 0, m))}
+													>
+														<span class="grid size-[15px] place-items-center">
+															<span class="size-2 rounded-full {sameMode(m, viewer.modes.current) ? 'bg-accent ring-2 ring-surface' : ''}"></span>
+														</span>
+														<span class="mono flex-1 text-[13px]">{modeLabel(m)}</span>
+														{#if sameMode(m, viewer.modes.original)}<span class="text-[11px] opacity-70">เดิม</span>{/if}
+													</button>
+												{/each}
+											</div>
+											{#if !sameMode(viewer.modes.current, viewer.modes.original)}
+												<button class={mi} role="menuitem" onclick={() => act(() => viewer.restoreResolution(viewer.info?.display ?? 0))}>
+													<Icon name="refresh" size={15} /> คืนค่าเดิม ({modeLabel(viewer.modes.original)})
+												</button>
+											{/if}
+											<p class="px-3 pt-1 pb-1.5 text-[11px] text-muted">คืนค่าเดิมให้อัตโนมัติเมื่อตัดการเชื่อมต่อ</p>
+										{/if}
+									{/if}
+									<div class="my-1 border-t border-line"></div>
 									<button class={mi} role="menuitemcheckbox" aria-checked={showMonitor} onclick={() => act(toggleMonitor)}>
 										<Icon name="activity" size={15} /> <span class="flex-1">แสดงตัวตรวจวัดคุณภาพ</span>
 										{#if showMonitor}<Icon name="check" size={15} />{/if}
@@ -561,7 +870,51 @@
 							{/if}
 						</div>
 
-						{#if viewer.info?.whiteboard}
+						{#if viewer.info?.input && (viewer.has('keymode') || canRelative)}
+							<div class="relative">
+								<button
+									class={tb(relative || menu === 'keyboard')}
+									title="แป้นพิมพ์และเมาส์"
+									aria-haspopup="menu"
+									aria-expanded={menu === 'keyboard'}
+									onclick={() => toggleMenu('keyboard')}
+								>
+									<Icon name="keyboard" />
+								</button>
+								{#if menu === 'keyboard'}
+									<div class="absolute top-full left-1/2 mt-2 w-64 -translate-x-1/2 rounded-lg bg-surface py-1 text-fg shadow-[0_10px_30px_rgb(0_0_0/0.35)] ring-1 ring-line" role="menu">
+										{#if viewer.has('keymode')}
+											<p class="px-3 pt-1 pb-1 text-xs font-medium text-muted">โหมดแป้นพิมพ์</p>
+											{#each [['translate', 'พิมพ์ตามตัวอักษร', 'ใช้ภาษาของเครื่องนี้'], ['map', 'ตามตำแหน่งปุ่ม', 'ใช้ภาษาของปลายทาง']] as const as [k, label, hint] (k)}
+												<button class={mi} role="menuitemradio" aria-checked={viewer.keyboard === k} onclick={() => act(() => viewer.setKeyboard(k))}>
+													<span class="grid size-[15px] place-items-center">
+														<span class="size-2 rounded-full {viewer.keyboard === k ? 'bg-accent ring-2 ring-surface' : ''}"></span>
+													</span>
+													<span class="flex-1">{label}</span>
+													<span class="text-[11px] opacity-70">{hint}</span>
+												</button>
+											{/each}
+										{/if}
+										{#if canRelative}
+											{#if viewer.has('keymode')}<div class="my-1 border-t border-line"></div>{/if}
+											<button
+												class={mi}
+												role="menuitemcheckbox"
+												aria-checked={relative}
+												title="สำหรับเกมและโปรแกรม 3 มิติ: ล็อกเมาส์ไว้ในหน้าต่างและส่งการเคลื่อนที่แบบสัมพัทธ์"
+												onclick={() => act(toggleRelative)}
+											>
+												<Icon name="mouse" size={15} /> <span class="flex-1">เมาส์แบบสัมพัทธ์</span>
+												<span class="mono text-[11px] opacity-70">Ctrl+Alt+M</span>
+												{#if relative}<Icon name="check" size={15} />{/if}
+											</button>
+										{/if}
+									</div>
+								{/if}
+							</div>
+						{/if}
+
+						{#if viewer.info?.whiteboard && !viewer.displayAll}
 							<div class="relative">
 								<button
 									class={tb(pen || menu === 'pen')}
@@ -598,6 +951,35 @@
 									</div>
 								{/if}
 							</div>
+						{/if}
+
+						{#if viewer.canChat}
+							<button class="relative {tb(showChat)}" title="แชท" aria-pressed={showChat} onclick={() => (showChat = !showChat)}>
+								<Icon name="message" />
+								{#if viewer.chatUnread && !showChat}
+									<span class="absolute -top-1 -right-1 grid h-4 min-w-4 place-items-center rounded-full bg-danger px-1 text-[10px] font-bold text-white">{Math.min(viewer.chatUnread, 99)}</span>
+								{/if}
+							</button>
+						{/if}
+
+						{#if viewer.canCall}
+							{#if viewer.call === 'idle'}
+								<button class={tb()} title="โทรคุยด้วยเสียง" onclick={() => act(() => viewer.startCall())}><Icon name="phone" /></button>
+							{:else if viewer.call === 'calling'}
+								<button
+									class="grid size-8 shrink-0 animate-pulse place-items-center rounded-md bg-danger text-white"
+									title="กำลังรอปลายทางรับสาย · คลิกเพื่อยกเลิก"
+									onclick={() => act(() => viewer.hangup())}><Icon name="phoneOff" /></button
+								>
+							{:else}
+								<button class={tb(!viewer.micMuted)} title={viewer.micMuted ? 'เปิดไมค์' : 'ปิดไมค์'} aria-pressed={viewer.micMuted} onclick={() => act(() => viewer.setMicMuted(!viewer.micMuted))}>
+									<Icon name={viewer.micMuted ? 'micOff' : 'mic'} />
+								</button>
+								<span class="mono px-1 text-xs text-ok" title={viewer.remoteMuted ? 'อีกฝ่ายปิดไมค์อยู่' : 'กำลังคุย'}>{callTime}</span>
+								<button class="grid size-8 shrink-0 place-items-center rounded-md bg-danger text-white transition-[filter] hover:brightness-110" title="วางสาย" onclick={() => act(() => viewer.hangup())}>
+									<Icon name="phoneOff" />
+								</button>
+							{/if}
 						{/if}
 
 						{#if viewer.info?.audio}
@@ -669,6 +1051,28 @@
 								<button class="btn btn-primary min-w-20" disabled={viewer.authBusy}>{viewer.authBusy ? 'กำลังตรวจสอบ…' : 'ตกลง'}</button>
 							</div>
 						</form>
+					{:else if viewer.phase === 'reconnecting'}
+						<div class="flex items-center gap-3 px-6 pt-5">
+							<span class="grid size-9 shrink-0 place-items-center rounded-full bg-accent-soft text-accent"><Icon name="power" size={18} /></span>
+							<div class="min-w-0">
+								<h2 class="font-semibold">เครื่องปลายทางกำลังรีสตาร์ท</h2>
+								<p class="truncate text-xs text-muted">{peerName} · <span class="mono">{formatId(viewer.deviceId)}</span></p>
+							</div>
+						</div>
+						<div class="px-6 py-5" role="status">
+							<p class="text-sm">
+								{reconnectIn > 0
+									? `รอให้เครื่องกลับมาออนไลน์ · ลองครั้งที่ ${viewer.reconnect?.attempt ?? 1} ใน ${reconnectIn} วินาที`
+									: `กำลังเชื่อมต่ออีกครั้ง (ครั้งที่ ${viewer.reconnect?.attempt ?? 1})…`}
+							</p>
+							<div class="mt-3 h-1 overflow-hidden rounded-full bg-raised">
+								<div class="progress h-full w-1/3 rounded-full bg-accent"></div>
+							</div>
+							<p class="mt-3 text-xs text-muted">จะเชื่อมต่อให้อัตโนมัติโดยไม่ต้องใส่รหัสผ่าน (ภายใน 15 นาที)</p>
+						</div>
+						<div class="flex justify-end border-t border-line bg-raised/60 px-6 py-3">
+							<button class="btn min-w-20" onclick={() => viewer.close()}>เลิกรอ</button>
+						</div>
 					{:else if viewer.phase === 'closed'}
 						<div class="flex items-start gap-3 px-6 pt-5 pb-4">
 							<span class="grid size-9 shrink-0 place-items-center rounded-full {viewer.error ? 'bg-danger-soft text-danger' : 'bg-raised text-muted'}">
@@ -725,6 +1129,9 @@
 	</div>
 	{#if showFiles && viewer.phase === 'connected'}
 		<FilePanel {viewer} onclose={() => (showFiles = false)} />
+	{/if}
+	{#if showChat && viewer.phase === 'connected' && viewer.canChat}
+		<ChatPanel {viewer} peer={peerName} onclose={() => (showChat = false)} />
 	{/if}
 </div>
 

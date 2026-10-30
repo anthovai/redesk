@@ -9,6 +9,10 @@ export interface User {
 	disabled: boolean;
 	created_at: string;
 	last_login_at: string | null;
+	/** Where the password is checked. */
+	auth_source?: 'local' | 'ldap';
+	/** Second factor by emailed code (when TOTP is off). */
+	email_otp?: boolean;
 }
 
 /** A browser or app remembered on the 2FA step (skips the TOTP code, never the password). */
@@ -38,6 +42,8 @@ export interface Device {
 	disabled: boolean;
 	created_at: string;
 	group_id: number | null;
+	/** The device's own strategy (null = its group's). */
+	strategy_id?: number | null;
 	online: boolean;
 	/** Offline, MAC known and an online agent on its LAN can send Wake-on-LAN. */
 	can_wake: boolean;
@@ -60,6 +66,7 @@ export interface Group {
 	created_at: string;
 	member_ids: number[];
 	device_count: number;
+	strategy_id?: number | null;
 }
 
 export interface AddressEntry {
@@ -97,6 +104,10 @@ export interface RemoteSession {
 	endpoint_id: number | null;
 	endpoint_name: string | null;
 	provider: string | null;
+	/** "screen", "tunnel" or "terminal" (absent on older servers). */
+	type?: string;
+	/** Tunnel target host:port as seen from the device. */
+	target?: string;
 }
 
 export interface EnrollToken {
@@ -122,10 +133,15 @@ export interface ServerInfo {
 	require_enroll: boolean;
 	gateway: boolean;
 	oidc?: { enabled: boolean; name: string };
+	/** LDAP sign-in is on: the sign-in name may be a directory user name. */
+	ldap?: boolean;
+	/** Outgoing mail is set up: users can choose sign-in codes by email. */
+	email_otp?: boolean;
 }
 
 export interface SessionTicket {
-	ticket: { sid: string; token: string; relay_path: string };
+	/** `type`: the session type the server started (absent on servers before tunnels and terminals). */
+	ticket: { sid: string; token: string; relay_path: string; type?: string; target?: string };
 	device: { id: string; public_key: string; hostname: string; os: string; alias: string };
 }
 
@@ -288,4 +304,109 @@ export interface RecordingSettings {
 	group_ids: number[];
 	/** 0 = keep until deleted. */
 	retention_days: number;
+}
+
+/** Agent settings an organisation strategy manages; absent = not managed. */
+export interface StrategySettings {
+	approve_mode?: 'password' | 'click' | 'both';
+	allow_permanent_password?: boolean;
+	allow_input?: boolean;
+	allow_clipboard?: boolean;
+	allow_file_transfer?: boolean;
+	allow_audio?: boolean;
+	allow_voice?: boolean;
+	allow_whiteboard?: boolean;
+	allow_resolution?: boolean;
+	allow_block_input?: boolean;
+	allow_privacy_mode?: boolean;
+	allow_lock?: boolean;
+	allow_restart?: boolean;
+	allow_tunnel?: boolean;
+	allow_tunnel_lan?: boolean;
+	allow_terminal?: boolean;
+	direct_enabled?: boolean;
+	lan_discovery?: boolean;
+	lock_after_session?: boolean;
+	/** Enforced by the server: every session to these devices is recorded. */
+	record_sessions?: boolean;
+}
+
+export interface Strategy {
+	id: number;
+	name: string;
+	description: string;
+	settings: StrategySettings;
+	created_at: string;
+	updated_at: string;
+	group_ids: number[];
+	device_ids: string[];
+}
+
+export interface LDAPSettings {
+	url: string;
+	ca_cert: string;
+	bind_dn: string;
+	has_bind_password: boolean;
+	base_dn: string;
+	user_filter: string;
+	email_attr: string;
+	name_attr: string;
+	group_filter: string;
+	admin_groups: string[];
+	user_groups: string[];
+	auto_create: boolean;
+	enabled: boolean;
+}
+
+export interface SMTPSettings {
+	host: string;
+	port: number;
+	security: 'starttls' | 'tls' | 'none';
+	ca_cert: string;
+	username: string;
+	has_password: boolean;
+	from: string;
+	alert_recipients: string[];
+	alert_new_device: boolean;
+	alert_lockout: boolean;
+	enabled: boolean;
+}
+
+export type BookPermission = 'read' | 'rw' | 'full';
+
+/** A shared address book as seen by the current user. */
+export interface AddressBook {
+	id: number;
+	name: string;
+	note: string;
+	owner_id: number | null;
+	owner_email: string | null;
+	created_at: string;
+	entry_count: number;
+	permission: BookPermission;
+}
+
+export interface BookEntry {
+	device_id: string;
+	alias: string;
+	tags: string[];
+	note: string;
+	created_at: string;
+	device: Device | null;
+}
+
+export interface BookShare {
+	user_id: number | null;
+	group_id: number | null;
+	permission: BookPermission;
+}
+
+/** Removes spaces ("123 456 789") and lowercases custom IDs. */
+export function cleanDeviceId(s: string): string {
+	return s.replace(/\s+/g, '').toLowerCase();
+}
+
+/** Device IDs: 9-16 digits, or a custom ID (6-32 of a-z 0-9 _ -, starting with a letter). */
+export function validDeviceId(id: string): boolean {
+	return /^(?:[0-9]{9,16}|[a-z][a-z0-9_-]{5,31})$/.test(id);
 }

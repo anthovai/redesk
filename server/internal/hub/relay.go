@@ -22,6 +22,11 @@ type relay struct {
 	viewerTok string
 	agentTok  string
 	created   time.Time
+	kind      string // KindScreen, KindTunnel or KindTerminal
+	target    string // tunnel target host:port
+	// viewerDevice is set for a switch-sides session: the viewer is that device's agent, which
+	// got the token over its own signaling connection, so no console login is required.
+	viewerDevice string
 
 	mu     sync.Mutex
 	viewer *websocket.Conn
@@ -47,6 +52,10 @@ type Ticket struct {
 	RelayPath string `json:"relay_path"`
 	// Direct is present only when the viewer asked for it and the agent offered candidates.
 	Direct *DirectTicket `json:"direct,omitempty"`
+	// Kind is the session type; viewers of tunnels and terminals check it, so a server that
+	// predates them (and starts a screen session instead) is noticed.
+	Kind   string `json:"type"`
+	Target string `json:"target,omitempty"`
 }
 
 type ViewerInfo struct {
@@ -59,11 +68,30 @@ type ViewerInfo struct {
 // With wantDirect (native viewers that can race a direct path), an agent that supports it
 // also gets a direct token and the ticket carries the agent's candidates.
 func (h *Hub) StartSession(ctx context.Context, deviceID string, userID int64, viewer ViewerInfo, wantDirect bool) (*Ticket, error) {
+	return h.StartSessionOf(ctx, deviceID, userID, viewer, wantDirect, SessionOptions{})
+}
+
+// StartSessionOf is StartSession for any session type (tunnel, terminal). Agents that did not
+// advertise the type get ErrUnsupported and are never asked.
+func (h *Hub) StartSessionOf(ctx context.Context, deviceID string, userID int64, viewer ViewerInfo, wantDirect bool, opts SessionOptions) (*Ticket, error) {
+	return h.startSession(ctx, deviceID, userID, viewer, wantDirect, opts, "")
+}
+
+// startSession is StartSessionOf; viewerDevice (switch sides) names the device whose agent is
+// the viewer, and marks the request to the target agent with "switch": true.
+func (h *Hub) startSession(ctx context.Context, deviceID string, userID int64, viewer ViewerInfo, wantDirect bool, opts SessionOptions, viewerDevice string) (*Ticket, error) {
+	opts, err := opts.Normalize()
+	if err != nil {
+		return nil, err
+	}
 	h.mu.Lock()
 	a := h.agents[deviceID]
 	h.mu.Unlock()
 	if a == nil {
 		return nil, ErrOffline
+	}
+	if !a.supports(opts.Kind) {
+		return nil, ErrUnsupported
 	}
 	rl := &relay{
 		sid:       auth.RandomToken(18),
@@ -75,11 +103,15 @@ func (h *Hub) StartSession(ctx context.Context, deviceID string, userID int64, v
 		created:   time.Now(),
 		paired:    make(chan struct{}),
 		done:      make(chan struct{}),
+		kind:      opts.Kind,
+		target:    opts.Target,
+
+		viewerDevice: viewerDevice,
 	}
 	if wantDirect && h.P2P && a.direct {
 		rl.direct = newDirectState()
 	}
-	if err := h.store.CreateRemoteSession(ctx, rl.sid, deviceID, userID, viewer.IP); err != nil {
+	if err := h.store.CreateRemoteSessionOf(ctx, rl.sid, deviceID, userID, viewer.IP, rl.kind, rl.target); err != nil {
 		return nil, err
 	}
 	h.mu.Lock()
@@ -90,7 +122,18 @@ func (h *Hub) StartSession(ctx context.Context, deviceID string, userID int64, v
 	h.mu.Unlock()
 
 	msg := map[string]any{"t": "session", "sid": rl.sid, "token": rl.agentTok, "relay": "/ws/relay", "viewer": viewer}
-	if h.RecordingToken != nil {
+	if viewerDevice != "" {
+		// Older agents ignore it and ask for the password as usual (the switch then fails).
+		msg["switch"] = true
+	}
+	if rl.kind != KindScreen {
+		msg["type"] = rl.kind
+		if rl.target != "" {
+			msg["target"] = rl.target
+		}
+	}
+	// Tunnelled traffic cannot be recorded (the API refuses tunnels when the policy records).
+	if h.RecordingToken != nil && rl.kind != KindTunnel {
 		if tok := h.RecordingToken(ctx, rl.sid, deviceID, userID, viewer.IP); tok != "" {
 			// Agents that predate recording ignore this and stream unrecorded.
 			msg["record"] = map[string]string{"token": tok, "upload": "/api/agent/recordings/" + rl.sid}
@@ -114,7 +157,7 @@ func (h *Hub) StartSession(ctx context.Context, deviceID string, userID int64, v
 			h.endRelay(rl, "pair_timeout")
 		}
 	})
-	t := &Ticket{SID: rl.sid, Token: rl.viewerTok, RelayPath: "/ws/relay"}
+	t := &Ticket{SID: rl.sid, Token: rl.viewerTok, RelayPath: "/ws/relay", Kind: rl.kind, Target: rl.target}
 	if rl.direct != nil {
 		time.AfterFunc(directGrace, func() {
 			if !rl.direct.isStarted() {
@@ -161,10 +204,10 @@ func (h *Hub) endRelay(rl *relay, reason string) {
 		tv, ta := rl.toViewer.Load(), rl.toAgent.Load()
 		_ = h.store.MarkSessionEnded(ctx, rl.sid, tv, ta, reason)
 		uid := rl.userID
-		_ = h.store.AddAudit(ctx, &uid, rl.viewerIP, "session.end", rl.deviceID, map[string]any{
+		_ = h.store.AddAudit(ctx, &uid, rl.viewerIP, "session.end", rl.deviceID, rl.tagged(map[string]any{
 			"sid": rl.sid, "path": "relay", "reason": reason, "seconds": int(time.Since(rl.created).Seconds()),
 			"bytes_to_viewer": tv, "bytes_to_agent": ta,
-		})
+		}))
 		h.log.Info("session ended", "sid", rl.sid, "device", rl.deviceID, "reason", reason)
 	})
 }
@@ -186,7 +229,7 @@ func (h *Hub) HandleRelay(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// The viewer token is only ever handed to the logged-in requester; require that same login.
-	if isViewer && (h.ViewerUserID == nil || h.ViewerUserID(r) != rl.userID) {
+	if isViewer && rl.viewerDevice == "" && (h.ViewerUserID == nil || h.ViewerUserID(r) != rl.userID) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
@@ -232,7 +275,7 @@ func (h *Hub) HandleRelay(w http.ResponseWriter, r *http.Request) {
 		close(rl.paired)
 		_ = h.store.MarkSessionStarted(r.Context(), rl.sid)
 		uid := rl.userID
-		_ = h.store.AddAudit(r.Context(), &uid, rl.viewerIP, "session.start", rl.deviceID, map[string]any{"sid": rl.sid, "path": "relay"})
+		_ = h.store.AddAudit(r.Context(), &uid, rl.viewerIP, "session.start", rl.deviceID, rl.tagged(map[string]any{"sid": rl.sid, "path": "relay"}))
 		h.log.Info("session started", "sid", rl.sid, "device", rl.deviceID)
 	}
 
@@ -310,11 +353,11 @@ func (h *Hub) ActiveSessions() []map[string]any {
 		if rl.directStarted() {
 			continue // listed below
 		}
-		out = append(out, map[string]any{"sid": rl.sid, "device_id": rl.deviceID, "user_id": rl.userID, "state": state, "path": "relay", "created_at": rl.created})
+		out = append(out, map[string]any{"sid": rl.sid, "device_id": rl.deviceID, "user_id": rl.userID, "state": state, "path": "relay", "created_at": rl.created, "type": rl.kind, "target": rl.target})
 	}
 	for _, rl := range h.directs {
 		if rl.directStarted() {
-			out = append(out, map[string]any{"sid": rl.sid, "device_id": rl.deviceID, "user_id": rl.userID, "state": "active", "path": rl.direct.pathName(), "created_at": rl.created})
+			out = append(out, map[string]any{"sid": rl.sid, "device_id": rl.deviceID, "user_id": rl.userID, "state": "active", "path": rl.direct.pathName(), "created_at": rl.created, "type": rl.kind, "target": rl.target})
 		}
 	}
 	return out

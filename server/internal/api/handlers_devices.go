@@ -1,17 +1,15 @@
 package api
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
-	"regexp"
 	"strings"
 	"time"
 
 	"aegiron/server/internal/hub"
 	"aegiron/server/internal/store"
 )
-
-var deviceIDPattern = regexp.MustCompile(`^[0-9]{9}$`)
 
 type deviceView struct {
 	*store.Device
@@ -122,20 +120,75 @@ func (a *API) updateDevice(w http.ResponseWriter, r *http.Request) {
 		Note     string `json:"note"`
 		Disabled bool   `json:"disabled"`
 		GroupID  *int64 `json:"group_id"`
+		// StrategyID: absent = unchanged, null = follow the group's strategy.
+		StrategyID json.RawMessage `json:"strategy_id"`
 	}
 	if !readJSON(w, r, &req) {
 		return
 	}
 	id := r.PathValue("id")
-	if err := a.store.UpdateDevice(r.Context(), id, trim(req.Alias, 64), trim(req.Note, 1000), req.Disabled, req.GroupID); err != nil {
+	cur, err := a.store.GetDevice(r.Context(), id)
+	if err != nil {
+		storeErr(a, w, err)
+		return
+	}
+	strategyID := cur.StrategyID
+	if len(req.StrategyID) > 0 {
+		strategyID = nil
+		if err := json.Unmarshal(req.StrategyID, &strategyID); err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid strategy_id")
+			return
+		}
+	}
+	if err := a.store.UpdateDevice(r.Context(), id, trim(req.Alias, 64), trim(req.Note, 1000), req.Disabled, req.GroupID, strategyID); err != nil {
 		storeErr(a, w, err)
 		return
 	}
 	if req.Disabled {
 		a.hub.Disconnect(id, "device disabled")
 	}
-	a.audit(r, "device.updated", id, map[string]any{"alias": req.Alias, "disabled": req.Disabled, "group_id": req.GroupID})
+	a.audit(r, "device.updated", id, map[string]any{"alias": req.Alias, "note": trim(req.Note, 1000), "disabled": req.Disabled, "group_id": req.GroupID, "strategy_id": strategyID})
+	a.refreshPolicies()
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// changeDeviceID: POST /api/devices/{id}/change-id {"id": "<new id>"}. The agent learns the new
+// id over signaling (or when it next registers) and keeps its key; address books, sessions and
+// recordings follow the device.
+func (a *API) changeDeviceID(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID string `json:"id"`
+	}
+	if !readJSON(w, r, &req) {
+		return
+	}
+	old := r.PathValue("id")
+	newID := normalizeDeviceID(req.ID)
+	if !hub.ValidDeviceID(newID) {
+		writeErr(w, http.StatusBadRequest, "ID ต้องเป็นตัวเลข 9-16 หลัก หรือตัวอักษร a-z ตัวเลข _ - ยาว 6-32 ตัวที่ขึ้นต้นด้วยตัวอักษร")
+		return
+	}
+	if newID == old {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": newID})
+		return
+	}
+	err := a.store.ChangeDeviceID(r.Context(), old, newID, userFrom(r).ID)
+	switch {
+	case errors.Is(err, store.ErrIDTaken):
+		writeCodeErr(w, http.StatusConflict, "id_taken", "ID นี้มีเครื่องอื่นใช้อยู่แล้ว")
+		return
+	case err != nil:
+		storeErr(a, w, err)
+		return
+	}
+	a.hub.IDChanged(old, newID)
+	a.audit(r, "device.id_changed", newID, map[string]any{"from": old, "to": newID})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": newID})
+}
+
+// normalizeDeviceID drops spaces (IDs are shown as "123 456 789") and lowercases custom IDs.
+func normalizeDeviceID(id string) string {
+	return strings.ToLower(strings.ReplaceAll(strings.TrimSpace(id), " ", ""))
 }
 
 func (a *API) deleteDevice(w http.ResponseWriter, r *http.Request) {
@@ -248,8 +301,8 @@ func (a *API) putAddressEntry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("id")
-	if !deviceIDPattern.MatchString(id) {
-		writeErr(w, http.StatusBadRequest, "device id must be 9 digits")
+	if !hub.ValidDeviceID(id) {
+		writeErr(w, http.StatusBadRequest, "invalid device id")
 		return
 	}
 	tags := []string{}
@@ -278,8 +331,16 @@ func (a *API) deleteAddressEntry(w http.ResponseWriter, r *http.Request) {
 func (a *API) createSession(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		DeviceID string `json:"device_id"`
+		// Session type: "screen" (default), "tunnel" (with Target host:port) or "terminal".
+		Type   string `json:"type"`
+		Target string `json:"target"`
 	}
 	if !readJSON(w, r, &req) {
+		return
+	}
+	opts, err := hub.SessionOptions{Kind: req.Type, Target: req.Target}.Normalize()
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	u := userFrom(r)
@@ -287,7 +348,7 @@ func (a *API) createSession(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusTooManyRequests, "too many connection attempts")
 		return
 	}
-	id := strings.ReplaceAll(req.DeviceID, " ", "")
+	id := normalizeDeviceID(req.DeviceID)
 	if ok, err := a.canAccess(r, id); err != nil {
 		a.internal(w, err)
 		return
@@ -311,9 +372,23 @@ func (a *API) createSession(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusConflict, "device key was reset; waiting for the agent to re-register")
 		return
 	}
+	// Tunnelled traffic cannot be recorded: where the policy records this device, no tunnels.
+	if opts.Kind == hub.KindTunnel {
+		if must, err := a.recordingApplies(r.Context(), d.ID); err != nil {
+			a.internal(w, err)
+			return
+		} else if must {
+			a.audit(r, "session.denied", d.ID, map[string]any{"reason": "recording_required", "type": opts.Kind, "target": opts.Target})
+			writeErr(w, http.StatusUnprocessableEntity, "sessions with this device must be recorded, and tunnels cannot be recorded")
+			return
+		}
+	}
 	ip := a.clientIP(r)
-	t, err := a.hub.StartSession(r.Context(), d.ID, u.ID, hub.ViewerInfo{Email: u.Email, Name: u.Name, IP: ip}, r.URL.Query().Get("direct") == "1")
+	t, err := a.hub.StartSessionOf(r.Context(), d.ID, u.ID, hub.ViewerInfo{Email: u.Email, Name: u.Name, IP: ip}, r.URL.Query().Get("direct") == "1", opts)
 	switch {
+	case errors.Is(err, hub.ErrUnsupported):
+		writeErr(w, http.StatusUnprocessableEntity, err.Error())
+		return
 	case errors.Is(err, hub.ErrOffline):
 		writeErr(w, http.StatusConflict, "device is offline")
 		return
@@ -324,11 +399,87 @@ func (a *API) createSession(w http.ResponseWriter, r *http.Request) {
 		a.internal(w, err)
 		return
 	}
-	a.audit(r, "session.request", d.ID, map[string]any{"sid": t.SID})
+	detail := map[string]any{"sid": t.SID}
+	if opts.Kind != hub.KindScreen {
+		detail["type"] = opts.Kind
+		if opts.Target != "" {
+			detail["target"] = opts.Target
+		}
+	}
+	a.audit(r, "session.request", d.ID, detail)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ticket": t,
 		"device": map[string]any{"id": d.ID, "public_key": d.PublicKey, "hostname": d.Hostname, "os": d.OS, "alias": d.Alias},
 	})
+}
+
+// switchSides: the viewer of session {sid} lets the person at the controlled device control
+// device_id (the viewer's own device) in return. Returns a one-time grant, valid 60 s, that the
+// viewer passes to the controlled agent inside the end-to-end channel (docs/PROTOCOL.md §11).
+func (a *API) switchSides(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		DeviceID string `json:"device_id"`
+	}
+	if !readJSON(w, r, &req) {
+		return
+	}
+	u := userFrom(r)
+	if !a.limiter.allow("switch:"+u.Email, 10, time.Minute) {
+		writeErr(w, http.StatusTooManyRequests, "too many requests")
+		return
+	}
+	sid := r.PathValue("sid")
+	id := normalizeDeviceID(req.DeviceID) // custom and alias IDs as well as 9-digit ones
+	d, err := a.store.GetDevice(r.Context(), id)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		writeErr(w, http.StatusNotFound, "unknown device id")
+		return
+	case err != nil:
+		a.internal(w, err)
+		return
+	case d.Disabled || d.PublicKey == nil:
+		writeErr(w, http.StatusConflict, "device is not available")
+		return
+	}
+	// Only a device this user owns or may control can be handed over.
+	if d.OwnerID == nil || *d.OwnerID != u.ID {
+		if ok, err := a.canAccess(r, id); err != nil {
+			a.internal(w, err)
+			return
+		} else if !ok {
+			a.audit(r, "session.switch_denied", id, map[string]any{"sid": sid, "reason": "not_in_group"})
+			writeErr(w, http.StatusForbidden, "you are not allowed to share this device")
+			return
+		}
+	}
+	from, err := a.hub.SessionOf(sid, u.ID)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "no such active session")
+		return
+	}
+	name := u.Email
+	if fd, err := a.store.GetDevice(r.Context(), from); err == nil {
+		name = fd.Hostname
+		if fd.Alias != "" {
+			name = fd.Alias
+		}
+	}
+	device := map[string]any{"id": d.ID, "public_key": d.PublicKey, "hostname": d.Hostname, "os": d.OS, "alias": d.Alias}
+	grant, err := a.hub.OfferSwitch(sid, u.ID, d.ID, name, device)
+	switch {
+	case errors.Is(err, hub.ErrOffline):
+		writeErr(w, http.StatusConflict, "device is offline")
+		return
+	case errors.Is(err, hub.ErrSameDevice):
+		writeErr(w, http.StatusBadRequest, "cannot switch sides with the same device")
+		return
+	case err != nil:
+		writeErr(w, http.StatusNotFound, "no such active session")
+		return
+	}
+	a.audit(r, "session.switch_offered", d.ID, map[string]any{"sid": sid, "from": from})
+	writeJSON(w, http.StatusOK, map[string]any{"grant": grant, "expires_in": 60})
 }
 
 func (a *API) listSessions(w http.ResponseWriter, r *http.Request) {

@@ -49,6 +49,7 @@ func New(cfg config.Config, s *store.Store, h *hub.Hub, key ed25519.PrivateKey, 
 		return 0
 	}
 	h.RecordingToken = a.recordingToken
+	h.DeviceRegistered = a.deviceRegistered
 	return a
 }
 
@@ -71,6 +72,12 @@ func (a *API) Handler() http.Handler {
 	pub("GET /api/oidc/auth-query", a.oidcAppQuery)
 	admin("GET /api/oidc/settings", a.getOIDCSettings)
 	admin("PUT /api/oidc/settings", a.putOIDCSettings)
+	admin("GET /api/ldap/settings", a.getLDAPSettings)
+	admin("PUT /api/ldap/settings", a.putLDAPSettings)
+	admin("POST /api/ldap/test", a.testLDAP)
+	admin("GET /api/smtp/settings", a.getSMTPSettings)
+	admin("PUT /api/smtp/settings", a.putSMTPSettings)
+	admin("POST /api/smtp/test", a.testSMTP)
 	pub("GET /api/agent/update", a.agentUpdate)
 	pub("GET /api/agent/releases/{id}/download", a.downloadRelease)
 	admin("GET /api/agent/releases", a.listReleases)
@@ -85,6 +92,7 @@ func (a *API) Handler() http.Handler {
 	user("POST /api/auth/totp/setup", a.totpSetup)
 	user("POST /api/auth/totp/enable", a.totpEnable)
 	user("POST /api/auth/totp/disable", a.totpDisable)
+	user("POST /api/auth/email-otp", a.setEmailOTP)
 	user("GET /api/auth/trusted-devices", a.listMyTrustedDevices)
 	user("DELETE /api/auth/trusted-devices", a.deleteMyTrustedDevices)
 	user("DELETE /api/auth/trusted-devices/{tid}", a.deleteMyTrustedDevice)
@@ -94,14 +102,26 @@ func (a *API) Handler() http.Handler {
 	admin("PATCH /api/devices/{id}", a.updateDevice)
 	admin("DELETE /api/devices/{id}", a.deleteDevice)
 	admin("POST /api/devices/{id}/reset-key", a.resetDeviceKey)
+	admin("POST /api/devices/{id}/change-id", a.changeDeviceID)
 	user("POST /api/devices/{id}/wake", a.wakeDevice)
 
 	user("GET /api/my-devices", a.myDevices)
 	user("GET /api/address-book", a.listAddressBook)
 	user("PUT /api/address-book/{id}", a.putAddressEntry)
 	user("DELETE /api/address-book/{id}", a.deleteAddressEntry)
+	user("GET /api/address-books", a.listAddressBooks)
+	user("POST /api/address-books", a.createAddressBook)
+	user("PATCH /api/address-books/{book}", a.updateAddressBook)
+	user("DELETE /api/address-books/{book}", a.deleteAddressBook)
+	user("GET /api/address-books/{book}/entries", a.listBookEntries)
+	user("PUT /api/address-books/{book}/entries/{id}", a.putBookEntry)
+	user("DELETE /api/address-books/{book}/entries/{id}", a.deleteBookEntry)
+	user("GET /api/address-books/{book}/shares", a.getBookShares)
+	user("PUT /api/address-books/{book}/shares", a.putBookShares)
+	user("GET /api/share-targets", a.shareTargets)
 
 	user("POST /api/sessions", a.createSession)
+	user("POST /api/sessions/{sid}/switch", a.switchSides)
 	admin("GET /api/sessions", a.listSessions)
 	admin("GET /api/sessions/active", a.activeSessions)
 
@@ -139,6 +159,10 @@ func (a *API) Handler() http.Handler {
 	admin("POST /api/groups", a.createGroup)
 	admin("PUT /api/groups/{id}", a.updateGroup)
 	admin("DELETE /api/groups/{id}", a.deleteGroup)
+	admin("GET /api/strategies", a.listStrategies)
+	admin("POST /api/strategies", a.createStrategy)
+	admin("PUT /api/strategies/{id}", a.updateStrategy)
+	admin("DELETE /api/strategies/{id}", a.deleteStrategy)
 
 	admin("GET /api/enroll-tokens", a.listEnrollTokens)
 	admin("POST /api/enroll-tokens", a.createEnrollToken)

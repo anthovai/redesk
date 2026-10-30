@@ -1,7 +1,7 @@
 <script lang="ts">
 	import QRCode from 'qrcode';
 	import { goto } from '$app/navigation';
-	import { api, type TrustedDevice } from '#lib/api.js';
+	import { api, type ServerInfo, type TrustedDevice } from '#lib/api.js';
 	import { ago, dateTime } from '#lib/format.js';
 	import { auth, loadMe, logout } from '#lib/session.svelte.js';
 
@@ -12,6 +12,28 @@
 	let totpCode = $state('');
 	let disablePw = $state('');
 	let totpMsg = $state<[string, boolean] | null>(null);
+
+	let mailAvailable = $state(false);
+	let emailPw = $state('');
+	let emailMsg = $state<[string, boolean] | null>(null);
+	$effect(() => {
+		api
+			.get<ServerInfo>('/api/server-info')
+			.then((i) => (mailAvailable = !!i.email_otp))
+			.catch(() => {});
+	});
+
+	async function setEmailOtp(ev: SubmitEvent, enabled: boolean) {
+		ev.preventDefault();
+		try {
+			await api.post('/api/auth/email-otp', { enabled, password: emailPw });
+			emailPw = '';
+			emailMsg = [enabled ? 'เปิดรหัสทางอีเมลแล้ว' : 'ปิดรหัสทางอีเมลแล้ว', true];
+			await loadMe();
+		} catch (e) {
+			emailMsg = [(e as Error).message, false];
+		}
+	}
 
 	let trusted = $state<TrustedDevice[]>([]);
 	let trustMsg = $state<[string, boolean] | null>(null);
@@ -100,6 +122,12 @@
 <p class="mb-6 text-sm text-muted">{auth.user?.email}</p>
 
 <div class="grid gap-6 lg:grid-cols-2">
+	{#if auth.user?.auth_source === 'ldap'}
+	<section class="card space-y-2 p-6">
+		<h2 class="font-semibold">รหัสผ่าน</h2>
+		<p class="text-sm text-muted">บัญชีนี้เข้าสู่ระบบด้วย LDAP / Active Directory เปลี่ยนรหัสผ่านที่ระบบขององค์กร</p>
+	</section>
+	{:else}
 	<form class="card space-y-4 p-6" onsubmit={changePassword}>
 		<h2 class="font-semibold">เปลี่ยนรหัสผ่าน</h2>
 		<div><label class="label" for="p1">รหัสผ่านปัจจุบัน</label><input id="p1" class="input" type="password" autocomplete="current-password" required bind:value={pw.current} /></div>
@@ -108,6 +136,7 @@
 		{#if pwMsg}<p class="text-sm {pwMsg[1] ? 'text-ok' : 'text-danger'}">{pwMsg[0]}</p>{/if}
 		<button class="btn btn-primary">บันทึก</button>
 	</form>
+	{/if}
 
 	<section class="card space-y-4 p-6">
 		<div>
@@ -136,6 +165,25 @@
 			<button class="btn btn-primary" onclick={startTotp}>ตั้งค่า 2FA</button>
 		{/if}
 		{#if totpMsg}<p class="text-sm {totpMsg[1] ? 'text-ok' : 'text-danger'}">{totpMsg[0]}</p>{/if}
+		{#if !auth.user?.totp_enabled && (mailAvailable || auth.user?.email_otp)}
+			<div class="space-y-2 border-t border-line pt-4">
+				<p class="text-sm font-medium">หรือรับรหัสทางอีเมล</p>
+				<p class="text-xs text-muted">หลังใส่รหัสผ่านถูกต้อง ระบบจะส่งรหัส 6 หลักไปที่ {auth.user?.email} (ใช้ได้ 10 นาที) ใช้เมื่อไม่มีแอป Authenticator</p>
+				{#if auth.user?.email_otp}
+					<p class="text-sm text-ok">เปิดใช้งานอยู่</p>
+					<form class="flex gap-2" onsubmit={(ev) => setEmailOtp(ev, false)}>
+						<input class="input" type="password" placeholder="ยืนยันด้วยรหัสผ่าน" required bind:value={emailPw} />
+						<button class="btn btn-danger shrink-0">ปิด</button>
+					</form>
+				{:else}
+					<form class="flex gap-2" onsubmit={(ev) => setEmailOtp(ev, true)}>
+						<input class="input" type="password" placeholder="ยืนยันด้วยรหัสผ่าน" required bind:value={emailPw} />
+						<button class="btn btn-primary shrink-0">เปิดรหัสทางอีเมล</button>
+					</form>
+				{/if}
+				{#if emailMsg}<p class="text-sm {emailMsg[1] ? 'text-ok' : 'text-danger'}">{emailMsg[0]}</p>{/if}
+			</div>
+		{/if}
 	</section>
 
 	<section class="card space-y-4 p-6 lg:col-span-2">

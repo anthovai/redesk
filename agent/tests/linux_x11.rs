@@ -39,7 +39,7 @@ fn paint_screen(color: &str) {
 
 /// Runs the capture loop until it sends a frame message (JPEG rectangle or video).
 fn first_frame(codec: Codec) -> Vec<u8> {
-    let params = Params { display: 0, fps: 10, quality: 80, max_width: 1920, codec };
+    let params = Params { display: 0, all: false, fps: 10, quality: 80, max_width: 1920, codec };
     let (_params_tx, params_rx) = watch::channel(params);
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(4);
     let stop = Arc::new(AtomicBool::new(false));
@@ -139,7 +139,7 @@ fn x11_input_moves_pointer() {
     let tx = input::spawn(g);
     let probe = enigo::Enigo::new(&enigo::Settings::default()).unwrap();
     for (x, y) in [(0.25, 0.75), (0.9, 0.1)] {
-        tx.send(input::Event::Move { x, y }).unwrap();
+        tx.send(input::Event::Move { x, y, on: None }).unwrap();
         let want = (g.x + (x * (g.width - 1) as f64).round() as i32, g.y + (y * (g.height - 1) as f64).round() as i32);
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -152,8 +152,8 @@ fn x11_input_moves_pointer() {
         }
     }
     // Clicks, wheel and keys go through the same XTEST connection; they must not fail.
-    tx.send(input::Event::Button { b: 0, down: true, x: 0.5, y: 0.5 }).unwrap();
-    tx.send(input::Event::Button { b: 0, down: false, x: 0.5, y: 0.5 }).unwrap();
+    tx.send(input::Event::Button { b: 0, down: true, at: Some((0.5, 0.5)), on: None }).unwrap();
+    tx.send(input::Event::Button { b: 0, down: false, at: Some((0.5, 0.5)), on: None }).unwrap();
     tx.send(input::Event::Wheel { dx: 0, dy: 1 }).unwrap();
     tx.send(input::Event::Key { code: "KeyA".into(), key: "a".into(), down: true }).unwrap();
     tx.send(input::Event::Key { code: "KeyA".into(), key: "a".into(), down: false }).unwrap();
@@ -196,4 +196,20 @@ fn x11_clipboard_both_ways() {
         assert!(Instant::now() < deadline, "clipboard reads {got:?}");
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+#[test]
+#[ignore]
+fn x11_resolution_through_xrandr() {
+    let Some(_x) = x_lock() else { return };
+    assert!(aegiron_agent::resolution::supported(), "xrandr backend not available");
+    let mut b = aegiron_agent::resolution::backend().expect("backend");
+    let modes = b.modes(0).unwrap();
+    let cur = b.current(0).unwrap();
+    eprintln!("modes {modes:?}, current {cur:?}");
+    assert_eq!((cur.w, cur.h), (1280, 720));
+    assert!(modes.contains(&cur));
+    // Setting the current mode again goes through `xrandr --output … --mode …` and keeps it.
+    b.set(0, cur).unwrap();
+    assert_eq!(b.current(0).unwrap(), cur);
 }

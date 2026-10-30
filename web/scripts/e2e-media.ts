@@ -10,6 +10,9 @@
 //      H.264 halfway; checks what is on screen and in the speakers at each moment, that audio
 //      and video stay in sync, and that seeking (forward, back, across the codec switch, while
 //      paused) shows the right frame and restarts audio in sync
+//   With AEGIRON_EXPECT_CM=1 (agent run with AEGIRON_TEST_CM=auto), part 1 also chats and makes
+//   a voice call with Chrome's fake microphone: the agent echoes the message and reports the
+//   voice packets it received.
 //
 //   AEGIRON_URL=http://127.0.0.1:21200 AEGIRON_PASSWORD=<admin password> \
 //   AEGIRON_AGENT_CONFIG=<agent.toml> AEGIRON_E2E_DB=<postgres URL of the test server> \
@@ -26,11 +29,11 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Browser, Page } from 'puppeteer-core';
-import { adminEmail, adminPassword, Api, base, check, done, launchChrome, sleep, waitFor } from './e2e-lib';
+import { Api, base, check, done, launchChrome, sleep, waitFor } from './e2e-lib';
 
 const [deviceId, devicePassword] = process.argv.slice(2);
 if (!deviceId || !devicePassword) throw new Error('usage: e2e-media.ts <device-id> <device-password>');
-const admin = await Api.login(adminEmail, adminPassword());
+const admin = await Api.admin();
 
 // Instrumentation injected into every page: what the decoders produce and when audio is due.
 declare global {
@@ -39,7 +42,7 @@ declare global {
 			videoConfigs: string[];
 			videoFrames: number;
 			draws: { at: number; idx: number }[];
-			audioOut: { ts: number; rms: number }[];
+			audioOut: { ts: number; rms: number; ch: number }[];
 			starts: { ts: number | null; rms: number; heard: number; rate: number }[];
 		};
 	}
@@ -56,7 +59,7 @@ function instrument() {
 			return super.configure(c);
 		}
 	} as typeof VideoDecoder;
-	let cur: { ts: number; rms: number } | null = null;
+	let cur: { ts: number; rms: number; ch: number } | null = null;
 	const AD = window.AudioDecoder;
 	window.AudioDecoder = class extends AD {
 		constructor(init: AudioDecoderInit) {
@@ -68,7 +71,7 @@ function instrument() {
 						d.copyTo(p, { planeIndex: 0, format: 'f32-planar' });
 						let s = 0;
 						for (const v of p) s += v * v;
-						cur = { ts: d.timestamp, rms: Math.sqrt(s / Math.max(1, p.length)) };
+						cur = { ts: d.timestamp, rms: Math.sqrt(s / Math.max(1, p.length)), ch: d.numberOfChannels };
 						E.audioOut.push(cur);
 					} catch {
 						cur = null;
@@ -171,6 +174,31 @@ try {
 	await sleep(2000);
 	const afterUnmute = (await e2e(page)).audioOut.length - mutedAt - whileMuted;
 	check(afterUnmute > 50, 'live: unmute resumes it', `${afterUnmute} packets in 2 s`);
+
+	if (process.env.AEGIRON_EXPECT_CM === '1') {
+		// Chrome's fake microphone, without a permission prompt in this browser context.
+		await page.browserContext().overridePermissions(base, ['microphone']);
+		await page.locator('button[title="แชท"]').click();
+		await page.locator('input[aria-label="ข้อความ"]').fill('hello from Chrome');
+		await page.keyboard.press('Enter');
+		const echoed = await waitFor(() => page.evaluate(() => document.querySelector('[role=log]')?.textContent?.includes('echo: hello from Chrome')));
+		check(!!echoed, 'live: chat panel sends a message and shows the reply');
+
+		await page.locator('button[title="โทรคุยด้วยเสียง"]').click();
+		const inCall = await waitFor(() => page.$('button[title="วางสาย"]'), 20_000);
+		check(!!inCall, 'live: voice call accepted (hang-up button shown)');
+		const monoBefore = (await e2e(page)).audioOut.filter((a) => a.ch === 1).length;
+		await sleep(3000);
+		const mono = (await e2e(page)).audioOut.filter((a) => a.ch === 1);
+		check(mono.length - monoBefore > 100 && mono.some((a) => a.rms > 0.05), "live: the agent's voice decodes (mono Opus)", {
+			packets: mono.length - monoBefore,
+			maxRms: Math.max(0, ...mono.map((a) => a.rms)).toFixed(3)
+		});
+		await page.locator('button[title="วางสาย"]').click();
+		const report = await waitFor(() => page.evaluate(() => document.querySelector('[role=log]')?.textContent?.match(/received (\d+) voice packets, peak rms ([\d.]+)/)?.slice(1)));
+		check(!!report && Number(report[0]) > 100 && Number(report[1]) > 0.01, "live: the agent heard the browser's microphone", report);
+		check(!!(await page.$('button[title="โทรคุยด้วยเสียง"]')), 'live: back to idle after hanging up');
+	}
 	await page.browserContext().close();
 
 	// --- 2. Recording of that session -----------------------------------------------------------
