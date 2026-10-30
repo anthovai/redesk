@@ -30,6 +30,63 @@ impl Drop for KeepAwake {
     }
 }
 
+/// Locks the screen of this machine (after a remote session, when `lock_after_session` is on).
+/// Best effort: failures are logged.
+pub fn lock_screen() {
+    if let Err(e) = lock::now() {
+        tracing::warn!("could not lock the screen after the session: {e}");
+    } else {
+        tracing::info!("screen locked after the remote session");
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod lock {
+    /// SACLockScreenImmediate (login.framework) locks like the menu bar's "Lock Screen"; it is
+    /// private API, so it is looked up at run time, with `pmset displaysleepnow` as fallback
+    /// (which locks when the Mac asks for the password right after the display sleeps).
+    pub fn now() -> Result<(), String> {
+        const LOGIN: &[u8] = b"/System/Library/PrivateFrameworks/login.framework/Versions/Current/login\0";
+        // SAFETY: dlopen/dlsym with NUL-terminated strings; the symbol has no arguments and
+        // returns an int.
+        unsafe {
+            let h = libc::dlopen(LOGIN.as_ptr().cast(), libc::RTLD_LAZY);
+            if !h.is_null() {
+                let f = libc::dlsym(h, c"SACLockScreenImmediate".as_ptr());
+                if !f.is_null() {
+                    let lock: extern "C" fn() -> i32 = std::mem::transmute(f);
+                    if lock() == 0 {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        let st = std::process::Command::new("/usr/bin/pmset").arg("displaysleepnow").status().map_err(|e| e.to_string())?;
+        if st.success() { Ok(()) } else { Err(format!("pmset: {st}")) }
+    }
+}
+
+#[cfg(windows)]
+mod lock {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn LockWorkStation() -> i32;
+    }
+
+    pub fn now() -> Result<(), String> {
+        // SAFETY: no arguments; fails (0) outside an interactive desktop.
+        if unsafe { LockWorkStation() } != 0 { Ok(()) } else { Err(std::io::Error::last_os_error().to_string()) }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+mod lock {
+    pub fn now() -> Result<(), String> {
+        let st = std::process::Command::new("loginctl").arg("lock-session").status().map_err(|e| e.to_string())?;
+        if st.success() { Ok(()) } else { Err(format!("loginctl: {st}")) }
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod imp {
     use std::ffi::{CString, c_char, c_void};

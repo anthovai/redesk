@@ -1489,6 +1489,8 @@ impl App {
         let res = {
             let mut c = agent.config.lock().unwrap();
             f(&mut c);
+            // Whatever the page did, settings the organisation manages keep their values.
+            c.apply_policy();
             c.save(&agent.config_path)
         };
         match res {
@@ -1821,7 +1823,7 @@ impl App {
     fn home(&mut self, ui: &mut Ui, agent: &Agent) {
         permissions_ui::missing_permissions_banner(ui);
         let pal = Palette::of(ui);
-        let digits: String = self.remote_id.chars().filter(|c| c.is_ascii_digit()).collect();
+        let typed = crate::local::normalize_id(&self.remote_id);
         let mut go = false;
         card_frame(&pal).show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -1840,15 +1842,15 @@ impl App {
             }
             ui.add_space(4.0);
             ui.allocate_ui_with_layout(vec2(ui.available_width(), 40.0), Layout::right_to_left(Align::Center), |ui| {
-                if primary(ui, "เชื่อมต่อ", digits.len() == 9).clicked() {
+                if primary(ui, "เชื่อมต่อ", typed.is_some()).clicked() {
                     go = true;
                 }
             });
         });
-        if go && digits.len() == 9 {
+        if go && let Some(id) = typed {
             let ctx = ui.ctx().clone();
-            let name = self.device_title(&digits);
-            self.open_remote(&ctx, &digits, &name);
+            let name = self.device_title(&id);
+            self.open_remote(&ctx, &id, &name);
         }
         ui.add_space(18.0);
         self.address_book(ui, agent);

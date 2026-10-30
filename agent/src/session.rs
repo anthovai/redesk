@@ -151,6 +151,8 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
     });
     agent.changed();
     let _registered = Registered { agent: agent.clone(), sid: sid.to_string() };
+    // Dropped before `_registered`, so this session still counts as running.
+    let _lock = LockOnEnd(agent.clone());
     agent.report(sid, "auth_ok", json!({"method": if need_password { "password" } else { "click" }, "approved_locally": need_click}));
     let _awake = crate::power::KeepAwake::new("Aegiron remote session");
 
@@ -434,6 +436,19 @@ impl Drop for Registered {
             st.boards.retain(|b| b.sid != self.sid);
         }
         self.agent.changed();
+    }
+}
+
+/// Locks the screen when an authenticated session ends and `lock_after_session` is on (often set
+/// by the organisation's strategy), unless another session is still running.
+struct LockOnEnd(Arc<Agent>);
+impl Drop for LockOnEnd {
+    fn drop(&mut self) {
+        let on = self.0.config.lock().unwrap().lock_after_session;
+        let others = self.0.status.lock().unwrap().sessions.len() > 1;
+        if on && !others {
+            crate::power::lock_screen();
+        }
     }
 }
 
