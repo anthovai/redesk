@@ -8,6 +8,12 @@ make test     # go vet + go test, cargo test, svelte-check and bun test (web/src
 
 Windows code is at least compiled from a Mac: `cd agent && cargo check --target x86_64-pc-windows-gnu --all-targets`.
 
+Database-backed server tests run when `AEGIRON_TEST_DATABASE_URL` points at a scratch database (e.g. `postgres:///aegiron_test?host=/tmp`); without it they are skipped. Mail tests use an in-process SMTP server with STARTTLS (`server/internal/mail/mailtest`).
+
+### LDAP / Active Directory
+
+`deploy/test/ldap-test.sh` starts a directory (glauth, container `aegiron-admintest-ldap`, `127.0.0.1:13893` StartTLS and `13894` LDAPS) with a throwaway CA and the users in `deploy/test/ldap/glauth.cfg`, runs the LDAP tests and removes it. They cover both transports, wrong passwords, unknown and wildcard user names, groups through `memberOf` and a group search, an unknown CA, a server that refuses StartTLS (no plaintext fallback) and, with `AEGIRON_TEST_DATABASE_URL` set, web and desktop-app sign-in, role mapping, allowed groups, demotion and local-account protection. Not tested against a real Active Directory.
+
 ## End to end on one machine (`make e2e`)
 
 `scripts/e2e.sh` builds everything and runs the real programs against each other on this machine, isolated from anything already installed:

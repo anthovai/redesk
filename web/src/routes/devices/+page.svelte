@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { page } from '$app/state';
-	import { api, wakeDevice, type Device, type Group } from '#lib/api.js';
+	import { api, cleanDeviceId, validDeviceId, wakeDevice, type Device, type Group, type Strategy } from '#lib/api.js';
 	import { ago, fingerprint, formatId } from '#lib/format.js';
 	import Icon from '#lib/Icon.svelte';
 	import PeerCard, { type PeerAction } from '#lib/PeerCard.svelte';
@@ -14,14 +14,23 @@
 	let onlyOnline = $state(false);
 	let groups = $state<Group[]>([]);
 	let groupFilter = $state(page.url.searchParams.get('group') ?? '');
-	let editing = $state<{ d: Device; alias: string; note: string; disabled: boolean; group: string; fp: string } | null>(null);
+	let strategies = $state<Strategy[]>([]);
+	let editing = $state<{ d: Device; alias: string; note: string; disabled: boolean; group: string; strategy: string; newId: string; fp: string } | null>(null);
 	const groupName = (id: number | null) => groups.find((g) => g.id === id)?.name ?? '';
+	const strategyName = (id: number | null | undefined) => strategies.find((s) => s.id === id)?.name ?? '';
+	/** The strategy in force: the device's own, else its group's. */
+	const effectiveStrategy = (d: Device) => strategyName(d.strategy_id ?? groups.find((g) => g.id === d.group_id)?.strategy_id);
 
 	async function load() {
 		try {
-			const [d, g] = await Promise.all([api.get<{ devices: Device[] }>('/api/devices'), api.get<{ groups: Group[] }>('/api/groups')]);
+			const [d, g, s] = await Promise.all([
+				api.get<{ devices: Device[] }>('/api/devices'),
+				api.get<{ groups: Group[] }>('/api/groups'),
+				api.get<{ strategies: Strategy[] }>('/api/strategies')
+			]);
 			devices = d.devices;
 			groups = g.groups;
+			strategies = s.strategies;
 			error = '';
 		} catch (e) {
 			error = (e as Error).message;
@@ -41,18 +50,45 @@
 			if (onlyOnline && !d.online) return false;
 			if (groupFilter === 'none' ? d.group_id !== null : groupFilter && String(d.group_id) !== groupFilter) return false;
 			const q = filter.trim().toLowerCase();
-			return !q || [d.id, d.alias, d.hostname, d.os, d.last_ip].some((v) => v.toLowerCase().includes(q));
+			return !q || [d.id, d.alias, d.hostname, d.os, d.last_ip, d.note].some((v) => v.toLowerCase().includes(q));
 		})
 	);
 	const onlineCount = $derived(devices.filter((d) => d.online).length);
 
 	async function open(d: Device) {
-		editing = { d, alias: d.alias, note: d.note, disabled: d.disabled, group: d.group_id ? String(d.group_id) : '', fp: d.public_key ? await fingerprint(d.public_key) : '' };
+		editing = {
+			d,
+			alias: d.alias,
+			note: d.note,
+			disabled: d.disabled,
+			group: d.group_id ? String(d.group_id) : '',
+			strategy: d.strategy_id ? String(d.strategy_id) : '',
+			newId: d.id,
+			fp: d.public_key ? await fingerprint(d.public_key) : ''
+		};
 	}
 
 	async function save() {
 		if (!editing) return;
-		await act(() => api.patch(`/api/devices/${editing!.d.id}`, { alias: editing!.alias, note: editing!.note, disabled: editing!.disabled, group_id: editing!.group ? +editing!.group : null }));
+		const e = editing;
+		const newId = cleanDeviceId(e.newId);
+		if (newId !== e.d.id) {
+			if (!validDeviceId(newId)) {
+				error = 'ID ต้องเป็นตัวเลข 9-16 หลัก หรือ a-z ตัวเลข _ - ยาว 6-32 ตัวที่ขึ้นต้นด้วยตัวอักษร';
+				return;
+			}
+			if (!confirm(`เปลี่ยน ID ${formatId(e.d.id)} เป็น ${formatId(newId)}?\n\nเครื่องจะได้รับ ID ใหม่อัตโนมัติ (ถ้าออฟไลน์จะได้รับเมื่อออนไลน์ครั้งถัดไป) ต้องใช้ agent รุ่นที่รองรับ`)) return;
+		}
+		await act(async () => {
+			await api.patch(`/api/devices/${e.d.id}`, {
+				alias: e.alias,
+				note: e.note,
+				disabled: e.disabled,
+				group_id: e.group ? +e.group : null,
+				strategy_id: e.strategy ? +e.strategy : null
+			});
+			if (newId !== e.d.id) await api.post(`/api/devices/${e.d.id}/change-id`, { id: newId });
+		});
 		editing = null;
 	}
 
@@ -187,8 +223,12 @@
 					<td>
 						<p class="font-medium">{d.alias || d.hostname}</p>
 						{#if d.alias}<p class="text-xs text-muted">{d.hostname}</p>{/if}
+						{#if d.note}<p class="line-clamp-1 max-w-xs text-xs text-muted" title={d.note}>{d.note}</p>{/if}
 					</td>
-					<td>{#if d.group_id}<span class="badge">{groupName(d.group_id)}</span>{:else}<span class="text-muted">—</span>{/if}</td>
+					<td>
+						{#if d.group_id}<span class="badge">{groupName(d.group_id)}</span>{:else}<span class="text-muted">—</span>{/if}
+						{#if effectiveStrategy(d)}<p class="mt-1 text-xs text-muted" title="นโยบายที่ใช้อยู่">นโยบาย: {effectiveStrategy(d)}</p>{/if}
+					</td>
 					<td class="text-muted">{d.os} <span class="text-xs">v{d.agent_version}</span></td>
 					<td class="mono text-muted">{d.last_ip}</td>
 					<td class="whitespace-nowrap text-muted">{d.online ? 'ตอนนี้' : ago(d.last_seen_at)}</td>
@@ -250,6 +290,18 @@
 					<option value="">ไม่มีกลุ่ม</option>
 					{#each groups as g (g.id)}<option value={String(g.id)}>{g.name}</option>{/each}
 				</select>
+			</div>
+			<div>
+				<label class="label" for="d-strategy">นโยบาย</label>
+				<select id="d-strategy" class="input" bind:value={editing.strategy}>
+					<option value="">ตามกลุ่ม{editing.group && strategyName(groups.find((g) => String(g.id) === editing!.group)?.strategy_id) ? ` (${strategyName(groups.find((g) => String(g.id) === editing!.group)?.strategy_id)})` : ''}</option>
+					{#each strategies as s (s.id)}<option value={String(s.id)}>{s.name}</option>{/each}
+				</select>
+			</div>
+			<div>
+				<label class="label" for="d-id">ID ของเครื่อง</label>
+				<input id="d-id" class="input mono" bind:value={editing.newId} />
+				<p class="mt-1 text-xs text-muted">ตัวเลข 9-16 หลัก หรือชื่อ a-z, 0-9, _ - (6-32 ตัว ขึ้นต้นด้วยตัวอักษร) ประวัติและสมุดที่อยู่จะย้ายตาม</p>
 			</div>
 			<div>
 				<label class="label" for="d-note">หมายเหตุ</label>

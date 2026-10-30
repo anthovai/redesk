@@ -17,15 +17,20 @@ type User struct {
 	Disabled     bool       `json:"disabled"`
 	CreatedAt    time.Time  `json:"created_at"`
 	LastLoginAt  *time.Time `json:"last_login_at"`
+	// AuthSource is where the password is checked: "local" or "ldap".
+	AuthSource string `json:"auth_source"`
+	ExternalDN string `json:"external_dn,omitempty"`
+	// EmailOTP: the second factor is a code sent by email (when TOTP is not enabled).
+	EmailOTP bool `json:"email_otp"`
 }
 
-const userCols = `id, email, name, role, password_hash, totp_secret, totp_enabled, disabled, created_at, last_login_at`
+const userCols = `id, email, name, role, password_hash, totp_secret, totp_enabled, disabled, created_at, last_login_at, auth_source, external_dn, email_otp`
 
 type scanner interface{ Scan(dest ...any) error }
 
 func scanUser(r scanner) (*User, error) {
 	var u User
-	err := r.Scan(&u.ID, &u.Email, &u.Name, &u.Role, &u.PasswordHash, &u.TOTPSecret, &u.TOTPEnabled, &u.Disabled, &u.CreatedAt, &u.LastLoginAt)
+	err := r.Scan(&u.ID, &u.Email, &u.Name, &u.Role, &u.PasswordHash, &u.TOTPSecret, &u.TOTPEnabled, &u.Disabled, &u.CreatedAt, &u.LastLoginAt, &u.AuthSource, &u.ExternalDN, &u.EmailOTP)
 	if err != nil {
 		return nil, notFound(err)
 	}
@@ -87,6 +92,45 @@ func (s *Store) SetUserPassword(ctx context.Context, id int64, hash string) erro
 func (s *Store) SetTOTP(ctx context.Context, id int64, secret *string, enabled bool) error {
 	_, err := s.DB.Exec(ctx, `UPDATE users SET totp_secret=$2, totp_enabled=$3 WHERE id=$1`, id, secret, enabled)
 	return err
+}
+
+// CreateLDAPUser creates an account whose password lives in the directory. passwordHash is an
+// unusable random hash.
+func (s *Store) CreateLDAPUser(ctx context.Context, email, name, role, passwordHash, dn string) (*User, error) {
+	return scanUser(s.DB.QueryRow(ctx,
+		`INSERT INTO users(email, name, role, password_hash, auth_source, external_dn) VALUES ($1,$2,$3,$4,'ldap',$5) RETURNING `+userCols,
+		NormalizeEmail(email), name, role, passwordHash, dn))
+}
+
+// SyncLDAPUser refreshes the directory facts of an LDAP account after a successful bind.
+// An empty name keeps the stored one; role "" keeps the stored role.
+func (s *Store) SyncLDAPUser(ctx context.Context, id int64, name, role, dn string) error {
+	_, err := s.DB.Exec(ctx, `UPDATE users SET name=CASE WHEN $2='' THEN name ELSE $2 END,
+		role=CASE WHEN $3='' THEN role ELSE $3 END, external_dn=$4 WHERE id=$1 AND auth_source='ldap'`, id, name, role, dn)
+	return err
+}
+
+func (s *Store) SetEmailOTP(ctx context.Context, id int64, on bool) error {
+	_, err := s.DB.Exec(ctx, `UPDATE users SET email_otp=$2 WHERE id=$1`, id, on)
+	return err
+}
+
+// AdminEmails lists the addresses of enabled admins (alert recipients by default).
+func (s *Store) AdminEmails(ctx context.Context) ([]string, error) {
+	rows, err := s.DB.Query(ctx, `SELECT email FROM users WHERE role='admin' AND NOT disabled ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var e string
+		if err := rows.Scan(&e); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) TouchLogin(ctx context.Context, id int64) error {

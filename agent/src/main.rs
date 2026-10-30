@@ -7,7 +7,7 @@ use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use clap::{Parser, Subcommand};
 use tokio::io::AsyncBufReadExt;
 
-use aegiron_agent::config::{ApproveMode, Config, EncoderPref, Verification, ViewerCodec};
+use aegiron_agent::config::{ApproveMode, Config, EncoderPref, MANAGED_TEXT, Managed, Verification, ViewerCodec};
 use aegiron_agent::net::ProxyConfig;
 use aegiron_agent::{fingerprint, identity, service, signal};
 
@@ -109,6 +109,12 @@ enum Cmd {
         /// Allow direct LAN/P2P sessions (false = always through the server relay)
         #[arg(long)]
         direct: Option<bool>,
+        /// Answer LAN discovery broadcasts (UDP 21120)
+        #[arg(long)]
+        lan_discovery: Option<bool>,
+        /// Lock this machine's screen when a remote session ends
+        #[arg(long)]
+        lock_after_session: Option<bool>,
         /// TCP port for direct sessions (default 21118)
         #[arg(long)]
         direct_port: Option<u16>,
@@ -262,6 +268,7 @@ async fn main() -> Result<()> {
         }
         Cmd::SetPassword => {
             let mut c = Config::load(&path)?;
+            refuse_managed(&c, &[(Managed::PermanentPassword, true)])?;
             let pw = rpassword::prompt_password("New permanent password: ")?;
             if pw.len() < 8 {
                 bail!("use at least 8 characters");
@@ -295,6 +302,8 @@ async fn main() -> Result<()> {
             jpeg_quality,
             max_width,
             direct,
+            lan_discovery,
+            lock_after_session,
             direct_port,
             proxy,
             proxy_user,
@@ -303,6 +312,28 @@ async fn main() -> Result<()> {
             allow_terminal,
         } => {
             let mut c = Config::load(&path)?;
+            // Settings the organisation's strategy manages cannot be changed here.
+            refuse_managed(&c, &[
+                (Managed::Verification, verification.is_some()),
+                (Managed::ApproveMode, approve_mode.is_some()),
+                (Managed::AllowInput, allow_input.is_some()),
+                (Managed::AllowClipboard, allow_clipboard.is_some()),
+                (Managed::AllowFileTransfer, allow_file_transfer.is_some()),
+                (Managed::AllowWhiteboard, allow_whiteboard.is_some()),
+                (Managed::AllowAudio, allow_audio.is_some()),
+                (Managed::AllowVoice, allow_voice.is_some()),
+                (Managed::AllowResolution, allow_resolution.is_some()),
+                (Managed::AllowBlockInput, allow_block_input.is_some()),
+                (Managed::AllowPrivacyMode, allow_privacy_mode.is_some()),
+                (Managed::AllowLock, allow_lock.is_some()),
+                (Managed::AllowRestart, allow_restart.is_some()),
+                (Managed::AllowTunnel, allow_tunnel.is_some()),
+                (Managed::AllowTunnelLan, allow_tunnel_lan.is_some()),
+                (Managed::AllowTerminal, allow_terminal.is_some()),
+                (Managed::DirectEnabled, direct.is_some()),
+                (Managed::LanDiscovery, lan_discovery.is_some()),
+                (Managed::LockAfterSession, lock_after_session.is_some()),
+            ])?;
             if let Some(v) = verification {
                 if v != Verification::Temporary && c.permanent_password.is_none() {
                     bail!("run `aegiron-agent set-password` first");
@@ -326,6 +357,8 @@ async fn main() -> Result<()> {
             if let Some(v) = jpeg_quality { c.jpeg_quality = v.clamp(10, 95); }
             if let Some(v) = max_width { c.max_width = v.clamp(320, 3840); }
             if let Some(v) = direct { c.direct_enabled = v; }
+            if let Some(v) = lan_discovery { c.lan_discovery = v; }
+            if let Some(v) = lock_after_session { c.lock_after_session = v; }
             if let Some(v) = direct_port { c.direct_port = v; }
             if let Some(v) = allow_tunnel { c.allow_tunnel = v; }
             if let Some(v) = allow_tunnel_lan { c.allow_tunnel_lan = v; }
@@ -373,6 +406,11 @@ async fn main() -> Result<()> {
             println!("Tunnel:       {tunnel}, terminal: {}", if c.allow_terminal { "allowed" } else { "off" });
             println!("Direct/P2P:   {} (TCP port {})", if c.direct_enabled { "allowed" } else { "off (relay only)" }, c.direct_port);
             println!("Proxy:        {}", c.proxy.as_ref().map(|p| p.display()).unwrap_or_else(|| "none".into()));
+            println!("Lock after session: {}", c.lock_after_session);
+            match &c.managed {
+                Some(p) => println!("Strategy:     \"{}\" (settings it manages cannot be changed on this device)", p.name),
+                None => println!("Strategy:     none"),
+            }
             service::status()?;
         }
         Cmd::ShowPassword => {
@@ -422,6 +460,38 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Fails when one of the requested changes touches a setting the organisation manages.
+fn refuse_managed(c: &Config, wanted: &[(Managed, bool)]) -> Result<()> {
+    let names = |m: Managed| match m {
+        Managed::ApproveMode => "--approve-mode",
+        Managed::Verification => "--verification",
+        Managed::PermanentPassword => "set-password",
+        Managed::AllowInput => "--allow-input",
+        Managed::AllowClipboard => "--allow-clipboard",
+        Managed::AllowFileTransfer => "--allow-file-transfer",
+        Managed::AllowAudio => "--allow-audio",
+        Managed::AllowVoice => "--allow-voice",
+        Managed::AllowWhiteboard => "--allow-whiteboard",
+        Managed::AllowResolution => "--allow-resolution",
+        Managed::AllowBlockInput => "--allow-block-input",
+        Managed::AllowPrivacyMode => "--allow-privacy-mode",
+        Managed::AllowLock => "--allow-lock",
+        Managed::AllowRestart => "--allow-restart",
+        Managed::AllowTunnel => "--allow-tunnel",
+        Managed::AllowTunnelLan => "--allow-tunnel-lan",
+        Managed::AllowTerminal => "--allow-terminal",
+        Managed::DirectEnabled => "--direct",
+        Managed::LanDiscovery => "--lan-discovery",
+        Managed::LockAfterSession => "--lock-after-session",
+    };
+    let locked: Vec<&str> = wanted.iter().filter(|(m, asked)| *asked && c.is_managed(*m)).map(|(m, _)| names(*m)).collect();
+    if locked.is_empty() {
+        return Ok(());
+    }
+    let strategy = c.managed.as_ref().map(|p| p.name.as_str()).unwrap_or_default();
+    bail!("{} is managed by your organisation (strategy \"{strategy}\", {MANAGED_TEXT}); ask your administrator", locked.join(", "))
+}
+
 /// `aegiron-agent connect`: runs the desktop app's viewer without a window.
 async fn connect(path: &std::path::Path, id: &str, seconds: u64, only: Option<String>, codec: Option<ViewerCodec>) -> Result<()> {
     use aegiron_agent::direct::Path as Route;
@@ -438,7 +508,7 @@ async fn connect(path: &std::path::Path, id: &str, seconds: u64, only: Option<St
         Ok(p) if !p.is_empty() => p,
         _ => rpassword::prompt_password(format!("Password of {id}: "))?,
     };
-    let id = id.replace(' ', "");
+    let id = aegiron_agent::local::normalize_id(id).unwrap_or_else(|| id.replace(' ', ""));
     let target = Target {
         server: c.server_url.clone(),
         token: acc.token,

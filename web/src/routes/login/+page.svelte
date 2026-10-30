@@ -12,6 +12,8 @@
 	let busy = $state(false);
 	let error = $state('');
 	let sso = $state<ServerInfo['oidc'] | null>(null);
+	let ldap = $state(false);
+	let byEmail = $state(false);
 
 	const ssoErrors: Record<string, string> = {
 		bad_state: 'คำขอเข้าสู่ระบบไม่ถูกต้องหรือหมดอายุ กรุณาลองใหม่',
@@ -35,7 +37,10 @@
 	$effect(() => {
 		api
 			.get<ServerInfo>('/api/server-info')
-			.then((i) => (sso = i.oidc ?? null))
+			.then((i) => {
+				sso = i.oidc ?? null;
+				ldap = !!i.ldap;
+			})
 			.catch(() => {});
 	});
 
@@ -48,7 +53,7 @@
 		busy = true;
 		error = '';
 		try {
-			const r = await api.post<{ user?: User; need_totp?: boolean }>('/api/auth/login', {
+			const r = await api.post<{ user?: User; need_totp?: boolean; method?: string }>('/api/auth/login', {
 				email,
 				password,
 				totp,
@@ -56,6 +61,7 @@
 			});
 			if (r.need_totp) {
 				needTotp = true;
+				byEmail = r.method === 'email';
 			} else if (r.user) {
 				auth.user = r.user;
 			}
@@ -81,8 +87,8 @@
 		<form class="card space-y-4 p-6" onsubmit={submit}>
 			{#if !needTotp}
 				<div>
-					<label class="label" for="email">อีเมล</label>
-					<input id="email" class="input" type="email" autocomplete="username" required bind:value={email} />
+					<label class="label" for="email">{ldap ? 'อีเมลหรือชื่อผู้ใช้' : 'อีเมล'}</label>
+					<input id="email" class="input" type={ldap ? 'text' : 'email'} autocomplete="username" required bind:value={email} />
 				</div>
 				<div>
 					<label class="label" for="password">รหัสผ่าน</label>
@@ -100,7 +106,9 @@
 						required
 						bind:value={totp}
 					/>
-					<p class="mt-2 text-xs text-muted">เปิดแอป Authenticator แล้วใส่รหัสของ Aegiron</p>
+					<p class="mt-2 text-xs text-muted">
+						{byEmail ? 'ส่งรหัสไปที่อีเมลของบัญชีนี้แล้ว (ใช้ได้ 10 นาที)' : 'เปิดแอป Authenticator แล้วใส่รหัสของ Aegiron'}
+					</p>
 				</div>
 				<label class="flex items-start gap-2 text-sm">
 					<input type="checkbox" class="mt-0.5" bind:checked={remember} />

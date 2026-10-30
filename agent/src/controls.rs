@@ -113,6 +113,9 @@ pub struct SessionCtl {
     out: Option<mpsc::Sender<Vec<u8>>>,
     block: Option<Guard>,
     privacy: Option<(Guard, Guard)>,
+    /// Lock when the session ends because this machine says so (`lock_after_session`, often
+    /// set by the organisation's strategy), independent of `allow_lock` for viewers.
+    pub host_lock_after: bool,
 }
 
 impl SessionCtl {
@@ -127,6 +130,7 @@ impl SessionCtl {
             out,
             block: None,
             privacy: None,
+            host_lock_after: false,
         }
     }
 
@@ -246,7 +250,7 @@ impl Drop for SessionCtl {
         // Unblock first, so the lock screen is usable.
         self.block = None;
         self.privacy = None;
-        if self.flags.lock_after.load(Ordering::Relaxed) && self.perms.lock {
+        if (self.flags.lock_after.load(Ordering::Relaxed) && self.perms.lock) || self.host_lock_after {
             match self.platform.lock() {
                 Ok(()) => (self.report)("lock_screen", json!({"after_session": true})),
                 Err(e) => tracing::warn!("could not lock after the session: {e:#}"),
@@ -697,6 +701,20 @@ mod tests {
         assert!(fake.calls.lock().unwrap().is_empty() && fake2.calls.lock().unwrap().is_empty());
         assert!(events.lock().unwrap().is_empty());
         drop(s);
+        std::fs::remove_dir_all(&d).unwrap();
+        std::fs::remove_dir_all(&d2).unwrap();
+    }
+
+    #[test]
+    fn host_lock_after_session_needs_no_viewer_permission() {
+        // lock_after_session on this machine (or its strategy) locks even when viewers may not.
+        let (mut s, fake, _events, d, _rx) = session(Perms::default(), "hostlock");
+        s.host_lock_after = true;
+        drop(s);
+        assert_eq!(*fake.calls.lock().unwrap(), ["lock"]);
+        let (s, fake2, _, d2, _rx2) = session(Perms::default(), "nolock");
+        drop(s);
+        assert!(fake2.calls.lock().unwrap().is_empty());
         std::fs::remove_dir_all(&d).unwrap();
         std::fs::remove_dir_all(&d2).unwrap();
     }

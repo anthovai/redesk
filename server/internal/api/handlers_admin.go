@@ -137,6 +137,10 @@ func (a *API) adminSetPassword(w http.ResponseWriter, r *http.Request) {
 	if !readJSON(w, r, &req) {
 		return
 	}
+	if target.AuthSource == "ldap" {
+		writeErr(w, http.StatusConflict, "this account's password is managed by the directory (LDAP)")
+		return
+	}
 	if err := auth.ValidatePassword(req.Password); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -165,7 +169,12 @@ func (a *API) adminResetTOTP(w http.ResponseWriter, r *http.Request) {
 		a.internal(w, err)
 		return
 	}
-	a.audit(r, "user.totp_reset", target.Email, nil)
+	// Also the emailed code, so an admin can let someone in whose mailbox is unreachable.
+	if err := a.store.SetEmailOTP(r.Context(), target.ID, false); err != nil {
+		a.internal(w, err)
+		return
+	}
+	a.audit(r, "user.totp_reset", target.Email, map[string]any{"email_otp": target.EmailOTP})
 	a.revokeTrustedDevices(r, target, "totp_reset")
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
@@ -327,5 +336,6 @@ func (a *API) deleteGroup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.audit(r, "group.deleted", r.PathValue("id"), nil)
+	a.refreshPolicies()
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }

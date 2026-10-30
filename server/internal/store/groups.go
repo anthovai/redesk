@@ -14,12 +14,13 @@ type Group struct {
 	CreatedAt   time.Time `json:"created_at"`
 	MemberIDs   []int64   `json:"member_ids"`
 	DeviceCount int       `json:"device_count"`
+	StrategyID  *int64    `json:"strategy_id"`
 }
 
 func (s *Store) ListGroups(ctx context.Context) ([]*Group, error) {
 	rows, err := s.DB.Query(ctx, `SELECT g.id, g.name, g.description, g.created_at,
 			COALESCE((SELECT array_agg(user_id ORDER BY user_id) FROM group_members m WHERE m.group_id=g.id), '{}'),
-			(SELECT count(*) FROM devices d WHERE d.group_id=g.id)
+			(SELECT count(*) FROM devices d WHERE d.group_id=g.id), g.strategy_id
 		FROM device_groups g ORDER BY g.name`)
 	if err != nil {
 		return nil, err
@@ -28,7 +29,7 @@ func (s *Store) ListGroups(ctx context.Context) ([]*Group, error) {
 	out := []*Group{}
 	for rows.Next() {
 		var g Group
-		if err := rows.Scan(&g.ID, &g.Name, &g.Description, &g.CreatedAt, &g.MemberIDs, &g.DeviceCount); err != nil {
+		if err := rows.Scan(&g.ID, &g.Name, &g.Description, &g.CreatedAt, &g.MemberIDs, &g.DeviceCount, &g.StrategyID); err != nil {
 			return nil, err
 		}
 		out = append(out, &g)
