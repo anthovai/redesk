@@ -127,6 +127,9 @@ pub struct Config {
     /// Send this machine's sound to viewers that ask for it.
     #[serde(default = "yes")]
     pub allow_audio: bool,
+    /// Let viewers ask for a voice call (each call still has to be accepted here).
+    #[serde(default = "yes")]
+    pub allow_voice: bool,
     /// Hardware or software H.264 (absent in older configs = auto).
     #[serde(default)]
     pub video_encoder: EncoderPref,
@@ -192,6 +195,7 @@ impl Config {
             allow_clipboard: true,
             allow_file_transfer: true,
             allow_audio: true,
+            allow_voice: true,
             video_encoder: EncoderPref::Auto,
             viewer_codec: ViewerCodec::H264,
             max_fps: 15,

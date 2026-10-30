@@ -7,7 +7,8 @@ use super::*;
 use egui::{Order, Popup, RectAlign, Shadow};
 
 use crate::codec::Codec;
-use crate::viewer::{ClipEntry, Info, Paste, Phase, RemoteDir, Transfer, TransferStatus};
+use crate::status::ChatLine;
+use crate::viewer::{CallState, ClipEntry, Info, Paste, Phase, RemoteDir, Transfer, TransferStatus};
 
 const QUALITY: [(&str, u8, u32); 3] = [("คมชัด", 85, 2560), ("สมดุล", 70, 1920), ("ประหยัดเน็ต", 45, 1280)];
 
@@ -81,6 +82,13 @@ struct WinUi {
     confirm_delete: Option<String>,
     /// A paste was seen on key-down, so the matching key-up is not a second paste.
     paste_seen: bool,
+    /// Chat panel on the right.
+    show_chat: bool,
+    chat_draft: String,
+    /// Chat messages already announced with a toast.
+    chat_seen: usize,
+    /// Asking whether to let the other side control this machine.
+    confirm_switch: bool,
 }
 
 pub struct ViewerWindow {
@@ -106,6 +114,9 @@ struct Frame1<'a> {
     audio_level: Option<f32>,
     fb: (usize, usize),
     path: Option<crate::direct::Path>,
+    chat_unread: usize,
+    call: CallState,
+    switch_pending: bool,
 }
 
 impl ViewerWindow {
@@ -140,6 +151,15 @@ impl ViewerWindow {
         self.demo_state(&ctx, w);
 
         // Pull new screen regions into the GPU texture and pick up state for this frame.
+        let (chat, chat_unread, call, switch_pending, switched) = {
+            let st = self.viewer.state.lock().unwrap();
+            (st.chat.clone(), st.chat_unread, st.call, st.switch_pending, st.switched)
+        };
+        if switched {
+            // The other side now controls this machine (switch sides): this window is done.
+            self.close_window();
+            return;
+        }
         let (phase, error, name, fp, info, fps, kbps, clip, transfers, fb_size, cursor, codec, path, browser, clip_offer, notice, encoder, muted, audio_level) = {
             let mut st = self.viewer.state.lock().unwrap();
             if st.fb.w > 0 {
@@ -225,6 +245,27 @@ impl ViewerWindow {
         if w.show_files {
             self.files_panel(ui, w, &browser, fs2);
         }
+        // Chat: a new message from the other side opens nothing by itself, but shows a toast
+        // and a count on the toolbar button.
+        let can_chat = connected && info.as_ref().is_some_and(Info::chat);
+        if !can_chat {
+            w.show_chat = false;
+        }
+        if chat.len() > w.chat_seen {
+            if !w.show_chat
+                && let Some(l) = chat[w.chat_seen..].iter().rev().find(|l| !l.mine)
+            {
+                let text: String = l.text.chars().take(80).collect();
+                Self::flash(w, format!("ข้อความจาก {name}: {text}"));
+            }
+            w.chat_seen = chat.len();
+        }
+        if w.show_chat {
+            if chat_unread > 0 {
+                self.viewer.mark_chat_read();
+            }
+            self.chat_panel(ui, w, &chat, &name);
+        }
 
         // Remote screen: the whole window.
         egui::CentralPanel::default().frame(Frame::new().fill(SCREEN_BG)).show(ui, |ui| {
@@ -250,7 +291,7 @@ impl ViewerWindow {
                 };
                 ui.painter().image(tex.id(), rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
                 let resp = ui.allocate_rect(rect.intersect(area), Sense::click_and_drag());
-                let typing = w.new_folder.is_some() || w.renaming.is_some();
+                let typing = w.new_folder.is_some() || w.renaming.is_some() || (w.show_chat && ui.ctx().egui_wants_keyboard_input());
                 let drawing = connected && w.pen.on && info.as_ref().is_some_and(|i| i.whiteboard);
                 if drawing {
                     self.draw(&mut w.pen, &resp, rect);
@@ -279,7 +320,23 @@ impl ViewerWindow {
         });
 
         if connected {
-            let f = Frame1 { name: &name, id: &self.device_id, fp: &fp, info: info.as_ref(), fps, kbps, codec: &codec, encoder: &encoder, muted, audio_level, fb: fb_size, path };
+            let f = Frame1 {
+                name: &name,
+                id: &self.device_id,
+                fp: &fp,
+                info: info.as_ref(),
+                fps,
+                kbps,
+                codec: &codec,
+                encoder: &encoder,
+                muted,
+                audio_level,
+                fb: fb_size,
+                path,
+                chat_unread: if w.show_chat { 0 } else { chat_unread },
+                call,
+                switch_pending,
+            };
             if w.show_quality {
                 self.quality_monitor(&ctx, &f);
             }
@@ -287,6 +344,12 @@ impl ViewerWindow {
                 self.recording_badge(&ctx);
             }
             self.toolbar(&ctx, w, &f);
+            if w.confirm_switch {
+                self.switch_dialog(&ctx, w, &name);
+            }
+            if call != CallState::Idle {
+                self.call_badge(&ctx, call);
+            }
         } else {
             self.dialog(&ctx, w, &phase, error.as_deref(), &name);
         }
@@ -466,6 +529,17 @@ impl ViewerWindow {
                     Err(_) => Self::flash(w, "คลิปบอร์ดว่าง"),
                 }
             }
+            // Switch sides: both ends are desktop apps and this one runs its agent.
+            if f.info.is_some_and(|i| i.has(crate::proto::FEATURE_SWITCH)) {
+                menu_separator(ui);
+                let can = self.viewer.can_switch();
+                let hint = if f.switch_pending { "รอตอบรับ…" } else { "" };
+                let r = menu_row(ui, Lead::Glyph(Glyph::Swap), "สลับฝั่ง", hint, can && !f.switch_pending);
+                let r = if can { r.on_hover_text("ให้คนที่เครื่องปลายทางควบคุมเครื่องนี้แทน") } else { r.on_hover_text("ต้องเข้าสู่ระบบและเชื่อมต่อเซิร์ฟเวอร์อยู่") };
+                if r.clicked() {
+                    w.confirm_switch = true;
+                }
+            }
         });
 
         // Display settings
@@ -565,6 +639,44 @@ impl ViewerWindow {
             });
         }
 
+        // Chat with the person at the remote machine, with the number of unread messages.
+        if f.info.is_some_and(Info::chat) {
+            let resp = bar_button(ui, Glyph::Chat, "แชท", if w.show_chat { Tone::Neutral } else { Tone::Accent }, false);
+            if f.chat_unread > 0 {
+                let c = resp.rect.right_top() + vec2(-3.0, 3.0);
+                ui.painter().circle_filled(c, 7.5, pal.danger);
+                ui.painter().text(c, Align2::CENTER_CENTER, f.chat_unread.min(9).to_string(), semi(10.0), Color32::WHITE);
+            }
+            if resp.clicked() {
+                w.show_chat = !w.show_chat;
+            }
+        }
+
+        // Voice call: call, then (once accepted) mute the microphone and hang up.
+        if f.info.is_some_and(Info::voice) {
+            match f.call {
+                CallState::Idle => {
+                    if bar_button(ui, Glyph::Phone, "โทรคุยด้วยเสียง", Tone::Accent, false).clicked() {
+                        self.viewer.call();
+                    }
+                }
+                CallState::Calling(_) => {
+                    if bar_button(ui, Glyph::PhoneOff, "กำลังรอปลายทางรับสาย · คลิกเพื่อยกเลิก", Tone::Danger, false).clicked() {
+                        self.viewer.hangup();
+                    }
+                }
+                CallState::Active { muted, .. } => {
+                    let (g, tip) = if muted { (Glyph::MicOff, "เปิดไมค์") } else { (Glyph::Mic, "ปิดไมค์") };
+                    if bar_button(ui, g, tip, if muted { Tone::Neutral } else { Tone::Accent }, false).clicked() {
+                        self.viewer.set_mic_muted(!muted);
+                    }
+                    if bar_button(ui, Glyph::PhoneOff, "วางสาย", Tone::Danger, false).clicked() {
+                        self.viewer.hangup();
+                    }
+                }
+            }
+        }
+
         // Speaker: only when the agent streams audio to us.
         if f.info.is_some_and(|i| i.audio) {
             let (g, tip) = if f.muted { (Glyph::SpeakerOff, "เปิดเสียง") } else { (Glyph::Speaker, "ปิดเสียง") };
@@ -622,6 +734,128 @@ impl ViewerWindow {
     }
 
     /// "Recording" badge in the top-right corner while the remote machine records the session.
+    /// Chat with the person at the remote machine (this session only; nothing is stored).
+    fn chat_panel(&self, ui: &mut Ui, w: &mut WinUi, chat: &[ChatLine], name: &str) {
+        let pal = Palette::of(ui);
+        egui::Panel::right(egui::Id::unique(("chat-panel", self.viewport)))
+            .exact_size(300.0)
+            .resizable(false)
+            .show_separator_line(true)
+            .frame(Frame::new().fill(pal.bg).inner_margin(Margin::symmetric(12, 10)))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+                    glyph(ui, r, Glyph::Chat, pal.accent);
+                    ui.label(RichText::new("แชท").font(semi(14.0)).color(pal.fg));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if small_glyph_button(ui, Glyph::Close, "ปิด").clicked() {
+                            w.show_chat = false;
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                let list_h = (ui.available_height() - 52.0).max(60.0);
+                egui::ScrollArea::vertical()
+                    .id_salt(("chat-list", self.viewport))
+                    .max_height(list_h)
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        if chat.is_empty() {
+                            ui.add_space(20.0);
+                            ui.vertical_centered(|ui| {
+                                ui.label(RichText::new(format!("พิมพ์ข้อความถึงคนที่ {name}")).size(13.0).color(pal.muted));
+                                ui.label(RichText::new("ข้อความเข้ารหัสต้นทาง-ปลายทาง ไม่ถูกเก็บไว้ที่เซิร์ฟเวอร์").size(11.5).color(pal.muted));
+                            });
+                        }
+                        for l in chat {
+                            cm_ui::chat_bubble(ui, l.mine, &l.text, l.at);
+                        }
+                    });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let edit = ui.add(
+                        egui::TextEdit::singleline(&mut w.chat_draft)
+                            .hint_text("ข้อความ")
+                            .desired_width(ui.available_width() - 48.0)
+                            .margin(Margin::symmetric(10, 8))
+                            .char_limit(crate::proto::CHAT_MAX),
+                    );
+                    let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let send = dialog_button(ui, "ส่ง", true, !w.chat_draft.trim().is_empty()).clicked();
+                    if (enter || send) && !w.chat_draft.trim().is_empty() {
+                        self.viewer.send_chat(&std::mem::take(&mut w.chat_draft));
+                        edit.request_focus();
+                    }
+                });
+            });
+    }
+
+    /// Switch sides: the person here confirms before the other side may control this machine.
+    fn switch_dialog(&self, ctx: &egui::Context, w: &mut WinUi, name: &str) {
+        let mut answer = None;
+        egui::Modal::new(egui::Id::unique(("switch-confirm", self.viewport))).backdrop_color(Color32::from_black_alpha(110)).show(ctx, |ui| {
+            let pal = Palette::of(ui);
+            ui.set_width(380.0);
+            ui.spacing_mut().item_spacing.y = 10.0;
+            dialog_title(ui, Glyph::Swap, "สลับฝั่ง", pal.accent);
+            ui.label(
+                RichText::new(format!(
+                    "คนที่ใช้ {name} จะได้รับคำเชิญให้ควบคุมเครื่องนี้ ถ้าเขาตอบรับ หน้าต่างนี้จะปิดและเขาจะควบคุมเครื่องนี้ได้ทันที โดยไม่ต้องใช้รหัสผ่าน (คำเชิญใช้ได้ครั้งเดียว ภายใน 1 นาที)"
+                ))
+                .size(13.5)
+                .color(pal.muted),
+            );
+            ui.label(RichText::new("ตัดการเชื่อมต่อได้ทุกเมื่อจากหน้าต่างการเชื่อมต่อเข้า").size(12.5).color(pal.muted));
+            ui.add_space(4.0);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if dialog_button(ui, "สลับฝั่ง", true, true).clicked() {
+                    answer = Some(true);
+                }
+                if dialog_button(ui, "ยกเลิก", false, true).clicked() {
+                    answer = Some(false);
+                }
+            });
+        });
+        if let Some(yes) = answer {
+            w.confirm_switch = false;
+            if yes {
+                self.viewer.switch_sides();
+                Self::flash(w, "ส่งคำเชิญแล้ว รออีกฝ่ายตอบรับ");
+            }
+        }
+    }
+
+    /// Call status under the toolbar while calling or in a call.
+    fn call_badge(&self, ctx: &egui::Context, call: CallState) {
+        let text = match call {
+            CallState::Calling(_) => "กำลังโทร… รอปลายทางรับสาย".to_string(),
+            CallState::Active { since, muted, remote_muted } => {
+                let t = since.elapsed().as_secs();
+                let mut s = format!("กำลังคุย  {:02}:{:02}", t / 60, t % 60);
+                if muted {
+                    s.push_str(" · ไมค์ของคุณปิดอยู่");
+                }
+                if remote_muted {
+                    s.push_str(" · อีกฝ่ายปิดไมค์");
+                }
+                s
+            }
+            CallState::Idle => return,
+        };
+        egui::Area::new(egui::Id::unique(("call-badge", self.viewport)))
+            .order(Order::Foreground)
+            .interactable(false)
+            .anchor(Align2::RIGHT_TOP, [-12.0, 12.0])
+            .show(ctx, |ui| {
+                let pal = Palette::of(ui);
+                Frame::new().fill(pal.ok.gamma_multiply(0.92)).corner_radius(14).inner_margin(Margin::symmetric(12, 5)).show(ui, |ui| {
+                    ui.label(RichText::new(text).font(semi(12.5)).color(Color32::WHITE));
+                });
+            });
+        ctx.request_repaint_after(Duration::from_millis(500));
+    }
+
     fn recording_badge(&self, ctx: &egui::Context) {
         egui::Area::new(egui::Id::unique(("recording", self.viewport)))
             .order(Order::Middle)
@@ -1219,6 +1453,12 @@ enum Glyph {
     File,
     Speaker,
     SpeakerOff,
+    Chat,
+    Phone,
+    PhoneOff,
+    Mic,
+    MicOff,
+    Swap,
 }
 
 fn glyph(ui: &Ui, rect: Rect, g: Glyph, color: Color32) {
@@ -1337,6 +1577,37 @@ fn glyph(ui: &Ui, rect: Rect, g: Glyph, color: Color32) {
         Glyph::File => {
             line(&[(3.0, 1.5), (9.5, 1.5), (13.0, 5.0), (13.0, 14.5), (3.0, 14.5), (3.0, 1.5)]);
             line(&[(9.5, 1.5), (9.5, 5.0), (13.0, 5.0)]);
+        }
+        Glyph::Chat => {
+            p.add(Shape::closed_line(
+                [(2.0, 3.0), (14.0, 3.0), (14.0, 11.0), (7.5, 11.0), (4.0, 14.0), (4.5, 11.0), (2.0, 11.0)].iter().map(|&(x, y)| at(x, y)).collect(),
+                st,
+            ));
+            line(&[(5.0, 6.2), (11.0, 6.2)]);
+            line(&[(5.0, 8.4), (9.0, 8.4)]);
+        }
+        Glyph::Phone | Glyph::PhoneOff => {
+            // A handset; hung up it lies flat and red buttons get it.
+            let pts: &[(f32, f32)] = if g == Glyph::Phone {
+                &[(3.2, 2.0), (5.8, 2.0), (6.8, 5.2), (5.2, 6.6), (9.4, 10.8), (10.8, 9.2), (14.0, 10.2), (14.0, 12.8), (12.6, 14.2), (2.0, 3.4), (3.2, 2.0)]
+            } else {
+                &[(1.5, 9.5), (2.5, 7.0), (8.0, 5.5), (13.5, 7.0), (14.5, 9.5), (13.5, 11.0), (10.6, 10.2), (10.4, 8.4), (5.6, 8.4), (5.4, 10.2), (2.5, 11.0), (1.5, 9.5)]
+            };
+            line(pts);
+        }
+        Glyph::Mic | Glyph::MicOff => {
+            p.rect_stroke(Rect::from_min_max(at(5.5, 1.5), at(10.5, 10.0)), 2.5 * s, st, egui::StrokeKind::Middle);
+            line(&[(3.0, 7.5), (3.6, 10.0), (5.5, 12.0), (8.0, 12.8), (10.5, 12.0), (12.4, 10.0), (13.0, 7.5)]);
+            line(&[(8.0, 12.8), (8.0, 15.0)]);
+            if g == Glyph::MicOff {
+                line(&[(2.0, 2.0), (14.0, 14.5)]);
+            }
+        }
+        Glyph::Swap => {
+            line(&[(2.0, 5.0), (13.5, 5.0)]);
+            line(&[(10.5, 2.0), (13.5, 5.0), (10.5, 8.0)]);
+            line(&[(14.0, 11.0), (2.5, 11.0)]);
+            line(&[(5.5, 8.0), (2.5, 11.0), (5.5, 14.0)]);
         }
         Glyph::Speaker | Glyph::SpeakerOff => {
             p.add(Shape::convex_polygon(

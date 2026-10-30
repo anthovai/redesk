@@ -23,29 +23,45 @@ const BITRATE: i32 = 96_000;
 
 // --- Opus ---------------------------------------------------------------------------------
 
-pub struct OpusEncoder(*mut unsafe_libopus::OpusEncoder);
+pub struct OpusEncoder {
+    st: *mut unsafe_libopus::OpusEncoder,
+    channels: usize,
+}
 // The state is only touched through &mut self.
 unsafe impl Send for OpusEncoder {}
 
+/// Voice calls: mono speech at this bitrate.
+const VOICE_BITRATE: i32 = 32_000;
+
 impl OpusEncoder {
+    /// System audio: stereo music/general audio.
     pub fn new() -> Result<Self> {
+        Self::create(CHANNELS, unsafe_libopus::OPUS_APPLICATION_AUDIO, BITRATE)
+    }
+
+    /// Voice calls: mono, tuned for speech.
+    pub fn voice() -> Result<Self> {
+        Self::create(1, unsafe_libopus::OPUS_APPLICATION_VOIP, VOICE_BITRATE)
+    }
+
+    fn create(channels: usize, application: i32, bitrate: i32) -> Result<Self> {
         let mut err = 0;
-        let st = unsafe { unsafe_libopus::opus_encoder_create(SAMPLE_RATE as i32, CHANNELS as i32, unsafe_libopus::OPUS_APPLICATION_AUDIO, &mut err) };
+        let st = unsafe { unsafe_libopus::opus_encoder_create(SAMPLE_RATE as i32, channels as i32, application, &mut err) };
         if st.is_null() || err != unsafe_libopus::OPUS_OK {
             bail!("opus encoder: error {err}");
         }
         unsafe {
-            unsafe_libopus::opus_encoder_ctl_impl(st, unsafe_libopus::OPUS_SET_BITRATE_REQUEST, unsafe_libopus::varargs!(BITRATE));
+            unsafe_libopus::opus_encoder_ctl_impl(st, unsafe_libopus::OPUS_SET_BITRATE_REQUEST, unsafe_libopus::varargs!(bitrate));
             unsafe_libopus::opus_encoder_ctl_impl(st, unsafe_libopus::OPUS_SET_COMPLEXITY_REQUEST, unsafe_libopus::varargs!(5i32));
         }
-        Ok(Self(st))
+        Ok(Self { st, channels })
     }
 
-    /// Encodes one 20 ms interleaved stereo frame (FRAME * CHANNELS samples).
+    /// Encodes one 20 ms interleaved frame (FRAME samples per channel).
     pub fn encode(&mut self, pcm: &[f32]) -> Result<Vec<u8>> {
-        assert_eq!(pcm.len(), FRAME * CHANNELS);
+        assert_eq!(pcm.len(), FRAME * self.channels);
         let mut out = vec![0u8; 1500];
-        let n = unsafe { unsafe_libopus::opus_encode_float(self.0, pcm.as_ptr(), FRAME as i32, out.as_mut_ptr(), out.len() as i32) };
+        let n = unsafe { unsafe_libopus::opus_encode_float(self.st, pcm.as_ptr(), FRAME as i32, out.as_mut_ptr(), out.len() as i32) };
         if n < 0 {
             bail!("opus encode: error {n}");
         }
@@ -56,7 +72,7 @@ impl OpusEncoder {
 
 impl Drop for OpusEncoder {
     fn drop(&mut self) {
-        unsafe { unsafe_libopus::opus_encoder_destroy(self.0) }
+        unsafe { unsafe_libopus::opus_encoder_destroy(self.st) }
     }
 }
 
@@ -188,9 +204,12 @@ fn test_tone() -> bool {
 }
 
 /// A running capture: the platform backend or the test tone. Dropping it stops capture.
-enum Source {
+pub(crate) enum Source {
     #[allow(dead_code)]
     System(imp::Capture),
+    #[cfg(any(windows, target_os = "macos"))]
+    #[allow(dead_code)]
+    Mic(mic::Capture),
     Tone(Arc<AtomicBool>),
 }
 
@@ -203,7 +222,13 @@ impl Drop for Source {
 }
 
 /// Feeds the test tone to `sink` in real time, 10 ms per block (48 kHz stereo).
-fn start_tone(mut sink: PcmSink) -> Result<Source> {
+fn start_tone(sink: PcmSink) -> Result<Source> {
+    start_tone_at(sink, 440.0)
+}
+
+/// The test tone at `hz` (the microphone's test tone uses another pitch than system audio, so a
+/// test can tell them apart).
+fn start_tone_at(mut sink: PcmSink, hz: f32) -> Result<Source> {
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = stop.clone();
     std::thread::Builder::new()
@@ -217,7 +242,7 @@ fn start_tone(mut sink: PcmSink) -> Result<Source> {
                 for (i, f) in buf.chunks_exact_mut(CHANNELS).enumerate() {
                     let k = n + i as u64;
                     let on = (k / (SAMPLE_RATE as u64 / 2)) % 2 == 0;
-                    let s = if on { (k as f32 * 440.0 * std::f32::consts::TAU / SAMPLE_RATE as f32).sin() * 0.3 } else { 0.0 };
+                    let s = if on { (k as f32 * hz * std::f32::consts::TAU / SAMPLE_RATE as f32).sin() * 0.3 } else { 0.0 };
                     f.fill(s);
                 }
                 sink(&buf, CHANNELS, SAMPLE_RATE);
@@ -296,6 +321,113 @@ pub fn stream(out: mpsc::Sender<Vec<u8>>, on: Arc<AtomicBool>, stop: Arc<AtomicB
     }
     drop(capture);
     tracing::info!("audio: capture stopped");
+}
+
+// --- Microphone (voice calls) ---------------------------------------------------------------
+
+/// Whether this machine can take part in a voice call: a microphone (or the test tone) and
+/// audio playback.
+pub fn voice_supported() -> bool {
+    playback_supported() && (test_tone() || mic_present())
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn mic_present() -> bool {
+    use cpal::traits::HostTrait;
+    cpal::default_host().default_input_device().is_some()
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn mic_present() -> bool {
+    false
+}
+
+/// Starts the default microphone (or, with `AEGIRON_TEST_AUDIO=tone`, a generated 660 Hz tone)
+/// feeding `sink`. Dropping the result stops it. On macOS the first use asks for the
+/// Microphone permission (NSMicrophoneUsageDescription in the app bundle).
+pub(crate) fn start_mic(sink: PcmSink) -> Result<Source> {
+    if test_tone() {
+        tracing::warn!("voice: AEGIRON_TEST_AUDIO=tone, sending a generated test tone instead of the microphone");
+        return start_tone_at(sink, 660.0);
+    }
+    #[cfg(any(windows, target_os = "macos"))]
+    return mic::start(sink).map(Source::Mic);
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = sink;
+        bail!("voice calls are not supported on this platform")
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+mod mic {
+    //! The default input device through cpal (CoreAudio on macOS, WASAPI on Windows).
+    use super::*;
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+    pub struct Capture {
+        stop: Arc<AtomicBool>,
+    }
+
+    impl Drop for Capture {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+        }
+    }
+
+    pub fn start(sink: PcmSink) -> Result<Capture> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<()>>();
+        let stop2 = stop.clone();
+        std::thread::Builder::new()
+            .name("aegiron-mic".into())
+            .spawn(move || {
+                let res = (|| -> Result<cpal::Stream> {
+                    let device = cpal::default_host().default_input_device().ok_or_else(|| anyhow!("no microphone"))?;
+                    let def = device.default_input_config().map_err(|e| anyhow!("microphone config: {e}"))?;
+                    let (ch, rate) = (def.channels() as usize, def.sample_rate());
+                    let config = cpal::StreamConfig { channels: def.channels(), sample_rate: rate, buffer_size: cpal::BufferSize::Default };
+                    let mut sink = sink;
+                    let err = |e| tracing::warn!("microphone: {e}");
+                    let stream = match def.sample_format() {
+                        cpal::SampleFormat::F32 => device.build_input_stream(config, move |d: &[f32], _| sink(d, ch, rate), err, None),
+                        cpal::SampleFormat::I16 => {
+                            let mut tmp = Vec::new();
+                            device.build_input_stream(
+                                config,
+                                move |d: &[i16], _| {
+                                    tmp.clear();
+                                    tmp.extend(d.iter().map(|s| *s as f32 / 32768.0));
+                                    sink(&tmp, ch, rate)
+                                },
+                                err,
+                                None,
+                            )
+                        }
+                        f => bail!("unsupported microphone format {f:?}"),
+                    }
+                    .map_err(|e| anyhow!("microphone: {e}"))?;
+                    stream.play().map_err(|e| anyhow!("microphone: {e}"))?;
+                    tracing::info!("voice: microphone {} ({rate} Hz, {ch} ch)", device.description().map(|d| d.name().to_string()).unwrap_or_default());
+                    Ok(stream)
+                })();
+                match res {
+                    Ok(stream) => {
+                        let _ = ready_tx.send(Ok(()));
+                        while !stop2.load(Ordering::Relaxed) {
+                            std::thread::sleep(Duration::from_millis(100));
+                        }
+                        drop(stream);
+                    }
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e));
+                    }
+                }
+            })
+            .map_err(|e| anyhow!("microphone thread: {e}"))?;
+        ready_rx.recv_timeout(Duration::from_secs(5)).map_err(|_| anyhow!("microphone did not start"))??;
+        Ok(Capture { stop })
+    }
 }
 
 // --- Viewer side: playback ------------------------------------------------------------------

@@ -128,6 +128,9 @@ enum ServerMsg {
         /// Present when the viewer may also connect directly (see direct.rs).
         #[serde(default)]
         direct: Option<crate::direct::Offer>,
+        /// Switch sides: the viewer is the agent of the device this app invited (switch.rs).
+        #[serde(default)]
+        switch: bool,
     },
     /// Wake-on-LAN request: send magic packets for these MACs on our LAN.
     #[serde(rename = "wol")]
@@ -278,12 +281,21 @@ async fn run_once(agent: &Arc<Agent>) -> Result<()> {
             Some(m) = out_rx.recv() => tx.send(Message::Text(m.into())).await?,
             m = tokio::time::timeout(Duration::from_secs(70), rx.next()) => {
                 let Some(m) = m.context("server silent for 70s")? else { return Ok(()) };
-                match parse(m?) {
-                    Some(ServerMsg::Session { sid, token, relay, viewer, record, direct }) => {
+                let m = m?;
+                if let Message::Text(t) = &m
+                    && t.as_str().contains("\"switch_ticket\"")
+                    && let Ok(v) = serde_json::from_str::<serde_json::Value>(t.as_str())
+                    && v["t"] == "switch_ticket"
+                {
+                    crate::switch::ticket_arrived(v);
+                    continue;
+                }
+                match parse(m) {
+                    Some(ServerMsg::Session { sid, token, relay, viewer, record, direct, switch }) => {
                         let agent = agent.clone();
                         tokio::spawn(async move {
-                            tracing::info!("session {sid} requested by {} from {}", viewer.email, viewer.ip);
-                            if let Err(e) = crate::session::run(agent.clone(), &sid, &token, &relay, viewer, record, direct).await {
+                            tracing::info!("session {sid} requested by {} from {}{}", viewer.email, viewer.ip, if switch { " (switch sides)" } else { "" });
+                            if let Err(e) = crate::session::run(agent.clone(), &sid, &token, &relay, viewer, record, direct, switch).await {
                                 tracing::warn!("session {sid} ended: {e:#}");
                                 agent.send_server(json!({"t": "session_reject", "sid": sid, "reason": format!("{e}")}));
                             }

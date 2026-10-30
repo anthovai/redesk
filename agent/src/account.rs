@@ -247,6 +247,30 @@ pub fn start_session(server: &str, token: &str, device_id: &str, direct: bool) -
     })
 }
 
+/// Switch sides: a one-time grant (60 s) that lets the device controlled in session `sid` open
+/// one session to `device_id`, this app's own device (docs/PROTOCOL.md §11).
+pub fn switch_grant(server: &str, token: &str, sid: &str, device_id: &str) -> Result<String, String> {
+    #[derive(Deserialize)]
+    struct R {
+        grant: String,
+    }
+    call::<R>(
+        agent()
+            .post(&format!("{server}/api/sessions/{sid}/switch"))
+            .header("X-Aegiron", "1")
+            .header("Authorization", &format!("Bearer {token}"))
+            .send_json(&json!({"device_id": device_id})),
+    )
+    .map(|r| r.grant)
+    .map_err(|(status, msg)| match status {
+        401 => "การเข้าสู่ระบบหมดอายุ กรุณาเข้าสู่ระบบใหม่".into(),
+        403 => "บัญชีนี้ไม่มีสิทธิ์ให้ผู้อื่นควบคุมเครื่องนี้".into(),
+        404 | 405 => "เซิร์ฟเวอร์ไม่รองรับการสลับฝั่ง หรือเซสชันสิ้นสุดแล้ว".into(),
+        409 => "เครื่องนี้ยังไม่ได้เชื่อมต่อกับเซิร์ฟเวอร์".into(),
+        _ => msg,
+    })
+}
+
 // --- single sign-on (OIDC), like RustDesk's /api/oidc/auth + /api/oidc/auth-query ---
 
 /// Starts SSO sign-in. Returns `(code, url)`: open `url` in the browser, then call

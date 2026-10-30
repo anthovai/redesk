@@ -78,6 +78,9 @@ enum Cmd {
         /// Send this machine's audio to viewers (macOS 13+, Windows).
         #[arg(long)]
         allow_audio: Option<bool>,
+        /// Let viewers ask for voice calls (each call is accepted in the desktop app).
+        #[arg(long)]
+        allow_voice: Option<bool>,
         /// H.264 encoder: auto (hardware when available) or software (OpenH264)
         #[arg(long, value_enum)]
         video_encoder: Option<EncoderPref>,
@@ -238,6 +241,7 @@ async fn main() -> Result<()> {
             allow_file_transfer,
             allow_whiteboard,
             allow_audio,
+            allow_voice,
             video_encoder,
             max_fps,
             jpeg_quality,
@@ -260,6 +264,7 @@ async fn main() -> Result<()> {
             if let Some(v) = allow_file_transfer { c.allow_file_transfer = v; }
             if let Some(v) = allow_whiteboard { c.allow_whiteboard = v; }
             if let Some(v) = allow_audio { c.allow_audio = v; }
+            if let Some(v) = allow_voice { c.allow_voice = v; }
             if let Some(v) = video_encoder { c.video_encoder = v; }
             if let Some(v) = max_fps { c.max_fps = v.clamp(1, 60); }
             if let Some(v) = jpeg_quality { c.jpeg_quality = v.clamp(10, 95); }
@@ -295,7 +300,10 @@ async fn main() -> Result<()> {
             println!("Verification: {:?}, approve mode: {:?}", c.verification, c.approve_mode);
             println!("Device key:   {}", fingerprint(identity(&c)?.verifying_key().as_bytes()));
             println!("Server key:   {}", fingerprint(&B64.decode(&c.server_key)?));
-            println!("Input: {}, clipboard: {}, file transfer: {}, whiteboard: {}, audio: {}", c.allow_input, c.allow_clipboard, c.allow_file_transfer, c.allow_whiteboard, c.allow_audio);
+            println!(
+                "Input: {}, clipboard: {}, file transfer: {}, whiteboard: {}, audio: {}, voice calls: {}",
+                c.allow_input, c.allow_clipboard, c.allow_file_transfer, c.allow_whiteboard, c.allow_audio, c.allow_voice
+            );
             println!("Encoder:      {:?}", c.video_encoder);
             println!("Direct/P2P:   {} (TCP port {})", if c.direct_enabled { "allowed" } else { "off (relay only)" }, c.direct_port);
             println!("Proxy:        {}", c.proxy.as_ref().map(|p| p.display()).unwrap_or_else(|| "none".into()));
@@ -369,6 +377,8 @@ async fn connect(path: &std::path::Path, id: &str, seconds: u64, only: Option<St
         direct: c.direct_enabled,
         only,
         codec: codec.unwrap_or(c.viewer_codec).codec(),
+        local_id: None,
+        switch: None,
     };
     let viewer = Viewer::connect(target, std::sync::Arc::new(|| {}));
     let started = Instant::now();

@@ -26,11 +26,14 @@ use crate::proto::{self, ViewerMsg};
 use crate::recording::{RecordRequest, Recorder};
 use crate::signal::{Agent, Viewer};
 use crate::whiteboard::Board;
-use crate::status::{ApprovalRequest, SessionInfo};
+use crate::status::{ApprovalRequest, Attention, CallState, HostCmd, SessionInfo, SessionLink};
+use crate::voice::Call;
 
 const MAX_ATTEMPTS: u32 = 3;
 const LOCKOUT_AFTER: u32 = 5;
 const LOCKOUT: Duration = Duration::from_secs(60);
+/// A voice call not answered here within this time is declined.
+pub const RING_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Deserialize)]
 struct Hello {
@@ -39,7 +42,19 @@ struct Hello {
     epk: String,
 }
 
-pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer: Viewer, record: Option<RecordRequest>, direct: Option<crate::direct::Offer>) -> Result<()> {
+/// `switching`: the server marked this session as switch sides (see switch.rs); it is accepted
+/// only with a secret this app handed out, never with a password.
+#[allow(clippy::too_many_arguments)]
+pub async fn run(
+    agent: Arc<Agent>,
+    sid: &str,
+    token: &str,
+    relay: &str,
+    viewer: Viewer,
+    record: Option<RecordRequest>,
+    direct: Option<crate::direct::Offer>,
+    switching: bool,
+) -> Result<()> {
     let base = agent.config.lock().unwrap().ws_base()?;
     let url = format!("{base}{relay}?sid={sid}&token={token}");
 
@@ -64,16 +79,18 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
         let c = agent.config.lock().unwrap();
         (c.verification, c.approve_mode)
     };
-    let need_password = approve != ApproveMode::Click;
-    let need_click = approve != ApproveMode::Password;
-    send_json(&mut tx, &mut ch, json!({"t": "auth_required", "password": need_password, "click": need_click})).await?;
+    // A switched session was approved by the person here when they offered it.
+    let need_password = !switching && approve != ApproveMode::Click;
+    let need_click = !switching && approve != ApproveMode::Password;
+    send_json(&mut tx, &mut ch, json!({"t": "auth_required", "password": need_password, "click": need_click, "switch": switching})).await?;
 
     let mut attempts = 0;
     let mut viewer_codecs;
     let mut viewer_features;
     let mut wants_audio;
+    let mut switched = None;
     loop {
-        let Incoming::Msg(ViewerMsg::Auth { password, codecs, features, audio }) = read_viewer(&mut rx, &mut ch, Duration::from_secs(120)).await? else {
+        let Incoming::Msg(ViewerMsg::Auth { password, codecs, features, audio, switch }) = read_viewer(&mut rx, &mut ch, Duration::from_secs(120)).await? else {
             bail!("expected auth message")
         };
         attempts += 1;
@@ -81,6 +98,17 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
         viewer_features = features;
         // Viewers that do not list an audio codec never get 0x05 packets.
         wants_audio = audio.iter().any(|c| c == "opus");
+
+        if switching {
+            switched = switch.as_deref().and_then(crate::switch::redeem);
+            if switched.is_none() {
+                tracing::warn!("session {sid}: switch sides without a valid secret from {}", viewer.ip);
+                agent.report(sid, "denied", json!({"switch": true}));
+                send_json(&mut tx, &mut ch, json!({"t": "auth_result", "ok": false, "reason": "denied"})).await?;
+                bail!("switch sides: no valid invitation");
+            }
+            break;
+        }
 
         if need_password {
             if let Some(wait) = locked_for(&agent) {
@@ -110,7 +138,11 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
         }
         break;
     }
-    agent.failures.lock().unwrap().0 = 0;
+    if let Some(started) = switched {
+        started(); // the window controlling the other machine closes: the sides are switched
+    } else {
+        agent.failures.lock().unwrap().0 = 0;
+    }
     if need_password && verification != Verification::Permanent {
         agent.rotate_temp_password(); // one-time: the password just used is now dead
     }
@@ -139,6 +171,26 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
     }
     let recording = recorder.rec.is_some();
 
+    // In-session communication needs the desktop app's connection manager; the headless agent
+    // never offers it.
+    let cfg = agent.config.lock().unwrap().clone();
+    let has_ui = agent.ui.lock().unwrap().is_some();
+    let offers_voice = has_ui && cfg.allow_voice && audio::voice_supported();
+    let viewer_has = |f: &str| viewer_features.iter().any(|v| v == f);
+    let (link, mut host_rx) = SessionLink::new(
+        has_ui && viewer_has(proto::FEATURE_CHAT),
+        offers_voice && viewer_has(proto::FEATURE_VOICE),
+        has_ui && viewer_has(proto::FEATURE_SWITCH),
+    );
+    let mut features: Vec<&str> = files::FEATURES.to_vec();
+    if has_ui {
+        features.extend([proto::FEATURE_CHAT, proto::FEATURE_SWITCH]);
+    }
+    if offers_voice {
+        features.push(proto::FEATURE_VOICE);
+    }
+    let who = if viewer.name.is_empty() { viewer.email.clone() } else { viewer.name.clone() };
+
     let kill = Arc::new(tokio::sync::Notify::new());
     agent.status.lock().unwrap().sessions.push(SessionInfo {
         sid: sid.to_string(),
@@ -148,14 +200,15 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
         started: std::time::SystemTime::now(),
         kill: kill.clone(),
         recording,
+        link: link.clone(),
     });
     agent.changed();
     let _registered = Registered { agent: agent.clone(), sid: sid.to_string() };
-    agent.report(sid, "auth_ok", json!({"method": if need_password { "password" } else { "click" }, "approved_locally": need_click}));
+    let method = if switching { "switch" } else if need_password { "password" } else { "click" };
+    agent.report(sid, "auth_ok", json!({"method": method, "approved_locally": need_click}));
     let _awake = crate::power::KeepAwake::new("Aegiron remote session");
 
     // 4. Stream.
-    let cfg = agent.config.lock().unwrap().clone();
     let displays = capture::displays();
     // Annotations need the desktop app's overlay window; the headless agent ignores them.
     let whiteboard = cfg.allow_whiteboard && agent.ui.lock().unwrap().is_some();
@@ -207,7 +260,7 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
         "codecs": switchable.iter().map(|c| c.name()).collect::<Vec<_>>(),
         "recording": recording,
         "whiteboard": whiteboard,
-        "features": files::FEATURES,
+        "features": features,
         "encoder": encoder,
         "audio": audio_on,
         "audio_codec": if audio_on { Some("opus") } else { None },
@@ -246,9 +299,73 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
     }
     let mut files = files::Files::new();
     let input_tx = cfg.allow_input.then(|| input::spawn(capture::geometry(0).unwrap_or_default()));
+    // Voice call: this machine's microphone as 0x06 packets (never recorded), and the viewer's
+    // voice played here. The person here has 30 s to accept a call.
+    let (voice_tx, mut voice_rx) = mpsc::channel::<Vec<u8>>(16);
+    let mut call: Option<Call> = None;
+    let mut ring_until: Option<tokio::time::Instant> = None;
+    let attention = |text: &str| {
+        agent.status.lock().unwrap().notify(Attention { sid: sid.to_string(), who: who.clone(), text: text.to_string() });
+        agent.changed();
+    };
+    let set_call = |s: CallState| {
+        *link.call.lock().unwrap() = s;
+        agent.changed();
+    };
 
     loop {
         tokio::select! {
+            Some(plain) = voice_rx.recv() => tx.send(Message::Binary(ch.seal(&plain)?.into())).await?,
+            _ = tokio::time::sleep_until(ring_until.unwrap_or_else(tokio::time::Instant::now)), if ring_until.is_some() => {
+                ring_until = None;
+                set_call(CallState::Idle);
+                send_json(&mut tx, &mut ch, json!({"t": "voice", "op": "decline", "reason": "timeout"})).await?;
+            }
+            cmd = host_rx.recv() => match cmd {
+                Some(HostCmd::Chat(text)) if link.chat => {
+                    link.push(true, text.clone());
+                    agent.changed();
+                    send_json(&mut tx, &mut ch, json!({"t": "chat", "text": text})).await?;
+                }
+                Some(HostCmd::Answer(yes)) if matches!(link.call_state(), CallState::Ringing(_)) => {
+                    ring_until = None;
+                    let started = if yes { Some(tokio::task::block_in_place(|| Call::start(voice_tx.clone()))) } else { None };
+                    match started {
+                        Some(Ok(c)) => {
+                            call = Some(c);
+                            set_call(CallState::Active { since: Instant::now(), muted: false, remote_muted: false });
+                            agent.report(sid, "voice_call", json!({}));
+                            send_json(&mut tx, &mut ch, json!({"t": "voice", "op": "accept"})).await?;
+                        }
+                        Some(Err(e)) => {
+                            tracing::warn!("session {sid}: cannot start the voice call: {e:#}");
+                            set_call(CallState::Idle);
+                            attention(&format!("รับสายไม่ได้: เปิดไมโครโฟนไม่สำเร็จ ({e})"));
+                            send_json(&mut tx, &mut ch, json!({"t": "voice", "op": "decline", "reason": "unavailable"})).await?;
+                        }
+                        None => {
+                            set_call(CallState::Idle);
+                            send_json(&mut tx, &mut ch, json!({"t": "voice", "op": "decline", "reason": "declined"})).await?;
+                        }
+                    }
+                }
+                Some(HostCmd::Hangup) if call.is_some() => {
+                    call = None;
+                    set_call(CallState::Idle);
+                    send_json(&mut tx, &mut ch, json!({"t": "voice", "op": "hangup"})).await?;
+                }
+                Some(HostCmd::Mute(muted)) => {
+                    if let (Some(c), CallState::Active { since, remote_muted, .. }) = (&call, link.call_state()) {
+                        c.set_muted(muted);
+                        set_call(CallState::Active { since, muted, remote_muted });
+                        send_json(&mut tx, &mut ch, json!({"t": "voice", "op": "mute", "muted": muted})).await?;
+                    }
+                }
+                Some(HostCmd::SwitchFailed(reason)) => {
+                    send_json(&mut tx, &mut ch, json!({"t": "switch_result", "ok": false, "reason": reason})).await?;
+                }
+                _ => {}
+            },
             _ = kill.notified() => {
                 tracing::info!("session {sid}: disconnected by the local user");
                 agent.report(sid, "denied", json!({"stage": "during_session"}));
@@ -273,6 +390,17 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
             msg = read_viewer(&mut rx, &mut ch, Duration::from_secs(300)) => {
                 let msg = match msg {
                     Ok(Incoming::Msg(m)) => m,
+                    Ok(Incoming::Voice(data)) => {
+                        if let Some(c) = call.as_mut() {
+                            // The first packet opens the output device, which can take a moment.
+                            if c.needs_output() {
+                                tokio::task::block_in_place(|| c.receive(&data));
+                            } else {
+                                c.receive(&data);
+                            }
+                        }
+                        continue;
+                    }
                     Ok(Incoming::FileChunk(id, data)) => {
                         if cfg.allow_file_transfer {
                             if let Some(e) = files.chunk(id, &data) {
@@ -400,6 +528,43 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
                             agent.changed();
                         }
                     }
+                    ViewerMsg::Chat { text } if link.chat => {
+                        let text: String = text.chars().take(proto::CHAT_MAX).collect();
+                        if !text.trim().is_empty() {
+                            link.push(false, text.clone());
+                            attention(&text);
+                        }
+                    }
+                    ViewerMsg::Voice { op, muted } => match op.as_str() {
+                        "call" if !link.voice => {
+                            send_json(&mut tx, &mut ch, json!({"t": "voice", "op": "decline", "reason": "unavailable"})).await?;
+                        }
+                        "call" if link.call_state() == CallState::Idle => {
+                            ring_until = Some(tokio::time::Instant::now() + RING_TIMEOUT);
+                            set_call(CallState::Ringing(Instant::now()));
+                            attention("ขอโทรคุยด้วยเสียง");
+                        }
+                        "hangup" => {
+                            let was_on = call.take().is_some();
+                            if was_on || ring_until.take().is_some() {
+                                set_call(CallState::Idle);
+                                attention(if was_on { "วางสายแล้ว" } else { "ยกเลิกการโทร" });
+                            }
+                        }
+                        "mute" => {
+                            if let CallState::Active { since, muted: m, .. } = link.call_state() {
+                                set_call(CallState::Active { since, muted: m, remote_muted: muted });
+                            }
+                        }
+                        _ => {}
+                    },
+                    ViewerMsg::SwitchSides { grant, secret } if link.switch => {
+                        *link.switch_offer.lock().unwrap() = Some((grant, secret, Instant::now()));
+                        attention("เชิญให้คุณควบคุมเครื่องของเขา (สลับฝั่ง)");
+                    }
+                    ViewerMsg::SwitchSides { .. } => {
+                        send_json(&mut tx, &mut ch, json!({"t": "switch_result", "ok": false, "reason": "unavailable"})).await?;
+                    }
                     ViewerMsg::Refresh => force_full.store(true, Ordering::Relaxed),
                     ViewerMsg::Audio { on } => audio_enabled.store(on, Ordering::Relaxed),
                     ViewerMsg::Bye => return Ok(()),
@@ -463,6 +628,8 @@ impl Drop for StopOnDrop {
 enum Incoming {
     Msg(ViewerMsg),
     FileChunk(u32, Vec<u8>),
+    /// A 0x06 voice packet (whole message).
+    Voice(Vec<u8>),
 }
 
 async fn read_viewer<S>(rx: &mut S, ch: &mut Channel, idle: Duration) -> Result<Incoming>
@@ -484,6 +651,7 @@ where
                 plain.drain(..5);
                 return Ok(Incoming::FileChunk(id, plain));
             }
+            Some(&proto::MSG_VOICE) => return Ok(Incoming::Voice(plain)),
             Some(&proto::MSG_JSON) => {}
             _ => continue,
         }
