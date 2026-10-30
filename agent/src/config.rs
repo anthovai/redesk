@@ -147,6 +147,9 @@ pub struct Config {
     /// Let viewers draw annotations on this screen (desktop app only).
     #[serde(default = "yes")]
     pub allow_whiteboard: bool,
+    /// Let viewers change this machine's display resolution (restored when the session ends).
+    #[serde(default = "yes")]
+    pub allow_resolution: bool,
     /// Allow direct sessions (LAN/TCP and P2P over UDP hole punching). False = always through
     /// the server relay (enterprise policy). Applies to both incoming and outgoing sessions.
     #[serde(default = "yes")]
@@ -201,6 +204,7 @@ impl Config {
             lan_discovery: true,
             unlock_pin: None,
             allow_whiteboard: true,
+            allow_resolution: true,
             direct_enabled: true,
             direct_port: crate::direct::DEFAULT_PORT,
             proxy: None,

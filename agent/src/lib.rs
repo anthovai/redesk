@@ -17,6 +17,7 @@ pub mod permissions;
 pub mod power;
 pub mod proto;
 pub mod recording;
+pub mod resolution;
 pub mod service;
 pub mod session;
 pub mod signal;

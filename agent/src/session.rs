@@ -1,5 +1,6 @@
 //! One remote-control session: relay connect, E2E handshake, authentication, streaming.
 
+use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -156,7 +157,9 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
 
     // 4. Stream.
     let cfg = agent.config.lock().unwrap().clone();
-    let displays = capture::displays();
+    let mut displays = capture::displays();
+    // Resolution changes, restored when `resolution` is dropped at the end of the session.
+    let mut resolution = cfg.allow_resolution.then(crate::resolution::backend).flatten().map(crate::resolution::Changer::new);
     // Annotations need the desktop app's overlay window; the headless agent ignores them.
     let whiteboard = cfg.allow_whiteboard && agent.ui.lock().unwrap().is_some();
     if whiteboard {
@@ -207,14 +210,15 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
         "codecs": switchable.iter().map(|c| c.name()).collect::<Vec<_>>(),
         "recording": recording,
         "whiteboard": whiteboard,
-        "features": files::FEATURES,
+        "features": files::FEATURES.iter().chain(&proto::DISPLAY_FEATURES).collect::<Vec<_>>(),
+        "resolution": resolution.is_some(),
         "encoder": encoder,
         "audio": audio_on,
         "audio_codec": if audio_on { Some("opus") } else { None },
     }))
     .await?;
 
-    let params = Params { display: 0, fps: cfg.max_fps, quality: cfg.jpeg_quality, max_width: cfg.max_width, codec };
+    let params = Params { display: 0, all: false, fps: cfg.max_fps, quality: cfg.jpeg_quality, max_width: cfg.max_width, codec };
     let (params_tx, params_rx) = watch::channel(params);
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(2);
     let stop = Arc::new(AtomicBool::new(false));
@@ -246,6 +250,8 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
     }
     let mut files = files::Files::new();
     let input_tx = cfg.allow_input.then(|| input::spawn(capture::geometry(0).unwrap_or_default()));
+    // Extra display streams (`cfg {streams}`), by display index.
+    let mut streams: HashMap<usize, Stream> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -265,7 +271,8 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
             },
             out = out_rx.recv() => {
                 let Some(plain) = out else { bail!("capture stopped") };
-                if let Some(r) = recorder.rec.as_mut() {
+                // Recordings show the main stream only.
+                if let Some(r) = recorder.rec.as_mut().filter(|_| plain.first() != Some(&proto::MSG_STREAM)) {
                     r.record(&plain);
                 }
                 tx.send(Message::Binary(ch.seal(&plain)?.into())).await?;
@@ -285,9 +292,15 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
                     Err(e) => return Err(e),
                 };
                 let send_input = |ev| if let Some(t) = &input_tx { let _ = t.send(ev); };
+                // Input on an extra display stream is normalised to that display.
+                let on = |d: Option<usize>| d.and_then(|d| streams.get(&d)).map(|s| s.geo);
                 match msg {
-                    ViewerMsg::MouseMove { x, y } => send_input(input::Event::Move { x, y }),
-                    ViewerMsg::MouseButton { b, down, x, y } => send_input(input::Event::Button { b, down, x, y }),
+                    ViewerMsg::MouseMove { x, y, d } => send_input(input::Event::Move { x, y, on: on(d) }),
+                    ViewerMsg::MouseButton { b, down, x, y, d } => send_input(input::Event::Button { b, down, at: x.zip(y), on: on(d) }),
+                    ViewerMsg::MouseRel { dx, dy } => {
+                        let px = |v: f64| if v.is_finite() { v.round().clamp(-2000.0, 2000.0) as i32 } else { 0 };
+                        send_input(input::Event::Rel { dx: px(dx), dy: px(dy) });
+                    }
                     ViewerMsg::Wheel { dx, dy } => send_input(input::Event::Wheel { dx: dx.clamp(-20, 20), dy: dy.clamp(-20, 20) }),
                     ViewerMsg::Key { code, key, down } => send_input(input::Event::Key { code, key, down }),
                     ViewerMsg::Text { s } => send_input(input::Event::Text(s.chars().take(4096).collect())),
@@ -299,25 +312,49 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
                             }
                         });
                     }
-                    ViewerMsg::Config { fps, quality, max_width, display, codec } => {
+                    ViewerMsg::Config { fps, quality, max_width, display, codec, display_all, streams: wanted, keyboard } => {
+                        let mut moved = false;
                         params_tx.send_modify(|p| {
                             if let Some(c) = codec.as_deref().and_then(Codec::from_name).filter(|c| switchable.contains(c)) { p.codec = c; }
                             if let Some(f) = fps { p.fps = f.clamp(1, cfg.max_fps.max(1)); }
                             if let Some(q) = quality { p.quality = q.clamp(10, 95); }
                             if let Some(w) = max_width { p.max_width = w.clamp(320, 3840); }
                             if let Some(d) = display.filter(|d| *d < displays.len()) {
-                                p.display = d;
-                                if let Some(g) = capture::geometry(d) { send_input(input::Event::Geometry(g)); }
-                                if whiteboard {
-                                    // Strokes belong to the display they were drawn on.
-                                    let area = capture::logical_area(d).unwrap_or_default();
-                                    if let Some(b) = agent.status.lock().unwrap().boards.iter_mut().find(|b| b.sid == sid) {
-                                        *b = Board::new(sid, area);
-                                    }
-                                    agent.changed();
-                                }
+                                (p.display, p.all) = (d, false);
+                                moved = true;
+                            }
+                            if let Some(all) = display_all.filter(|a| *a != p.all) {
+                                p.all = all;
+                                moved = true;
                             }
                         });
+                        let p = *params_tx.borrow();
+                        if moved {
+                            if let Some(g) = capture::geometry_of(&p) { send_input(input::Event::Geometry(g)); }
+                            if whiteboard {
+                                // Strokes belong to the display they were drawn on.
+                                let area = if p.all { capture::logical_area_all() } else { capture::logical_area(p.display) };
+                                if let Some(b) = agent.status.lock().unwrap().boards.iter_mut().find(|b| b.sid == sid) {
+                                    *b = Board::new(sid, area.unwrap_or_default());
+                                }
+                                agent.changed();
+                            }
+                        }
+                        if let Some(k) = keyboard {
+                            send_input(input::Event::MapKeys(k == "map"));
+                        }
+                        if let Some(list) = wanted {
+                            let list: Vec<usize> = list.into_iter().filter(|d| *d < displays.len()).take(proto::MAX_STREAMS).collect();
+                            streams.retain(|d, _| list.contains(d));
+                            for d in list {
+                                streams.entry(d).or_insert_with(|| Stream::start(d, p, out_tx.clone(), encoder, h264));
+                            }
+                        }
+                        // Quality, fps and codec apply to every stream.
+                        for s in streams.values() {
+                            s.params.send_modify(|q| (q.fps, q.quality, q.max_width, q.codec) = (p.fps, p.quality, p.max_width, p.codec));
+                            s.force_full.store(true, Ordering::Relaxed);
+                        }
                         force_full.store(true, Ordering::Relaxed);
                     }
                     ViewerMsg::List { path } if cfg.allow_file_transfer => {
@@ -400,7 +437,39 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
                             agent.changed();
                         }
                     }
-                    ViewerMsg::Refresh => force_full.store(true, Ordering::Relaxed),
+                    ViewerMsg::Refresh => {
+                        force_full.store(true, Ordering::Relaxed);
+                        streams.values().for_each(|s| s.force_full.store(true, Ordering::Relaxed));
+                    }
+                    ViewerMsg::ResList { display } => {
+                        let reply = match &resolution {
+                            Some(r) => blocking(|| r.list(display)),
+                            None => json!({"t": "res_error", "display": display, "message": "changing the resolution is not allowed on this device"}),
+                        };
+                        send_json(&mut tx, &mut ch, reply).await?;
+                    }
+                    ViewerMsg::ResSet { display, w, h, hz } => {
+                        let res = match resolution.as_mut() {
+                            Some(r) => blocking(|| r.set(display, w, h, hz)).map(Some),
+                            None => Err(anyhow!("changing the resolution is not allowed on this device")),
+                        };
+                        let reply = resolution_reply(&agent, sid, display, res, false);
+                        send_json(&mut tx, &mut ch, reply).await?;
+                        displays = after_resolution_change(&agent, sid, whiteboard, &params_tx, input_tx.as_ref(), &mut streams);
+                        send_json(&mut tx, &mut ch, json!({"t": "displays", "displays": displays})).await?;
+                        force_full.store(true, Ordering::Relaxed);
+                    }
+                    ViewerMsg::ResRestore { display } => {
+                        let res = match resolution.as_mut() {
+                            Some(r) => blocking(|| r.restore(display)),
+                            None => Err(anyhow!("changing the resolution is not allowed on this device")),
+                        };
+                        let reply = resolution_reply(&agent, sid, display, res, true);
+                        send_json(&mut tx, &mut ch, reply).await?;
+                        displays = after_resolution_change(&agent, sid, whiteboard, &params_tx, input_tx.as_ref(), &mut streams);
+                        send_json(&mut tx, &mut ch, json!({"t": "displays", "displays": displays})).await?;
+                        force_full.store(true, Ordering::Relaxed);
+                    }
                     ViewerMsg::Audio { on } => audio_enabled.store(on, Ordering::Relaxed),
                     ViewerMsg::Bye => return Ok(()),
                     _ => {}
@@ -408,6 +477,95 @@ pub async fn run(agent: Arc<Agent>, sid: &str, token: &str, relay: &str, viewer:
             }
         }
     }
+}
+
+/// An extra display stream (`cfg {streams}`): its own capture thread, tagged with `0x06`.
+struct Stream {
+    params: watch::Sender<Params>,
+    stop: Arc<AtomicBool>,
+    force_full: Arc<AtomicBool>,
+    /// Input geometry of the display (pointer events with `d`).
+    geo: capture::Geometry,
+}
+
+impl Stream {
+    fn start(display: usize, main: Params, out: mpsc::Sender<Vec<u8>>, encoder: &'static str, h264: &'static str) -> Self {
+        let p = Params { display, all: false, ..main };
+        let (params, params_rx) = watch::channel(p);
+        let stop = Arc::new(AtomicBool::new(false));
+        let force_full = Arc::new(AtomicBool::new(true));
+        let (stream_tx, mut stream_rx) = mpsc::channel::<Vec<u8>>(2);
+        {
+            let (stop, force_full) = (stop.clone(), force_full.clone());
+            std::thread::spawn(move || capture::run(params_rx, stream_tx, stop, force_full, encoder, h264));
+        }
+        // Ends when the capture thread stops (its sender is dropped) or the session is gone.
+        tokio::spawn(async move {
+            while let Some(msg) = stream_rx.recv().await {
+                if out.send(proto::stream(display as u8, &msg)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let n = display;
+        tracing::debug!("extra stream for display {n} started");
+        Stream { params, stop, force_full, geo: capture::geometry(display).unwrap_or_default() }
+    }
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Runs a short blocking call (display configuration) without stalling other tasks on this
+/// worker when the runtime allows it.
+fn blocking<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::current().runtime_flavor() {
+        tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(f),
+        _ => f(),
+    }
+}
+
+/// `res_ok` / `res_error` for a resolution change (None: nothing changed, e.g. restoring a
+/// display this session never changed).
+fn resolution_reply(agent: &Agent, sid: &str, display: usize, res: Result<Option<crate::resolution::Mode>>, restored: bool) -> serde_json::Value {
+    match res {
+        Ok(Some(m)) => {
+            agent.report(sid, "resolution_change", json!({"display": display, "w": m.w, "h": m.h, "restored": restored}));
+            json!({"t": "res_ok", "display": display, "w": m.w, "h": m.h, "hz": m.hz})
+        }
+        Ok(None) => json!({"t": "res_ok", "display": display}),
+        Err(e) => json!({"t": "res_error", "display": display, "message": format!("{e:#}")}),
+    }
+}
+
+/// Display sizes changed: point input, extra streams and annotations at the new geometry and
+/// return the new display list for the viewer.
+fn after_resolution_change(
+    agent: &Agent,
+    sid: &str,
+    whiteboard: bool,
+    params: &watch::Sender<Params>,
+    input: Option<&std::sync::mpsc::Sender<input::Event>>,
+    streams: &mut HashMap<usize, Stream>,
+) -> Vec<capture::DisplayInfo> {
+    let p = *params.borrow();
+    if let (Some(t), Some(g)) = (input, capture::geometry_of(&p)) {
+        let _ = t.send(input::Event::Geometry(g));
+    }
+    for (d, s) in streams.iter_mut() {
+        s.geo = capture::geometry(*d).unwrap_or_default();
+    }
+    if whiteboard {
+        let area = if p.all { capture::logical_area_all() } else { capture::logical_area(p.display) };
+        if let Some(b) = agent.status.lock().unwrap().boards.iter_mut().find(|b| b.sid == sid) {
+            *b = Board::new(sid, area.unwrap_or_default());
+        }
+        agent.changed();
+    }
+    capture::displays()
 }
 
 type WsError = tokio_tungstenite::tungstenite::Error;

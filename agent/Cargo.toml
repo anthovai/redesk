@@ -60,7 +60,7 @@ block2 = "0.6"
 
 # Media Foundation hardware H.264 encoder (same `windows` version as cpal).
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant"] }
 windows-core = "0.62"
 
 # rav1e (pure Rust AV1 encoder) is only used by tests and examples/codec_bench.rs: it is too slow

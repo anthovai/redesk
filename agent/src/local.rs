@@ -45,6 +45,9 @@ pub struct LocalState {
     /// Device list as rows instead of cards.
     #[serde(default)]
     pub peer_list: bool,
+    /// Remote sessions as tabs of one window (RustDesk style) instead of one window each.
+    #[serde(default)]
+    pub viewer_tabs: bool,
 }
 
 /// A device ID as typed or linked: exactly nine digits once spaces are removed.
