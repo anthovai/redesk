@@ -27,6 +27,8 @@ pub struct SessionInfo {
     /// What a tunnel or terminal session does (Thai, e.g. "เปิดเทอร์มินัล…"); empty for
     /// remote control.
     pub purpose: String,
+    /// View-only, input blocked, privacy mode, lock after the session (connection manager).
+    pub controls: Arc<crate::controls::Flags>,
 }
 
 /// Someone wants to take control; the UI answers through `reply`.

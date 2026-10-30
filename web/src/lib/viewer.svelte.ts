@@ -6,8 +6,10 @@ import { fingerprint } from './format';
 import { sanitizeRel, ZIP_LIMIT, ZipWriter, type LocalTree } from './filetree';
 import { RemoteAudio, supportedAudioCodecs } from './audio';
 import { decodableCodecs, decoderConfig, type VideoCodec } from './videocodec';
+import { applyCtl, hasControl, KEEPALIVE_MS, noControls, RECONNECT_FOR_MS, reconnectDelay, type ControlFeature } from './controls';
 
-export type Phase = 'requesting' | 'waiting' | 'handshake' | 'auth' | 'approval' | 'connected' | 'closed';
+/** `reconnecting`: the remote machine restarts at our request; we come back when it is online. */
+export type Phase = 'requesting' | 'waiting' | 'handshake' | 'auth' | 'approval' | 'connected' | 'reconnecting' | 'closed';
 
 export interface DisplayInfo {
 	index: number;
@@ -187,8 +189,14 @@ export class RemoteViewer {
 	modes = $state<ModeList | null>(null);
 	/** How keys reach the remote machine (feature "keymode"); this session only. */
 	keyboard = $state<KeyboardMode>('translate');
-	/** A message for the page to show once (resolution changes); `n` changes every time. */
+	/** A message for the page to show once (resolution changes, session controls); `n` changes every time. */
 	notice = $state<{ text: string; n: number } | null>(null);
+	/** This viewer sends no input (agents that know `view_only` show it at the machine). */
+	viewOnly = $state(false);
+	/** Session controls the agent confirmed (block input, privacy, lock after the session). */
+	controls = $state(noControls());
+	/** Waiting for a restarted machine: attempt number and when the next one starts (ms). */
+	reconnect = $state<{ attempt: number; next: number } | null>(null);
 
 	private ws: WebSocket | null = null;
 	private ch: Channel | null = null;
@@ -226,6 +234,11 @@ export class RemoteViewer {
 	private quiet = new Set<number>();
 	/** File operations started from the panel (rm / mv / mkdir). */
 	private ops = new Set<number>();
+	/** One-time token for reconnecting after the restart we asked for. */
+	private resume: string | null = null;
+	private reconnectSince = 0;
+	private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+	private keepalive: ReturnType<typeof setInterval> | null = null;
 
 	constructor(public deviceId: string) {}
 
@@ -236,6 +249,8 @@ export class RemoteViewer {
 
 	async start() {
 		try {
+			this.ch = null;
+			this.keys = null;
 			const t = await api.post<SessionTicket>('/api/sessions', { device_id: this.deviceId });
 			this.device = t.device;
 			this.sid = t.ticket.sid;
@@ -245,17 +260,20 @@ export class RemoteViewer {
 			const ws = new WebSocket(`${proto}//${location.host}${t.ticket.relay_path}?${q}`);
 			ws.binaryType = 'arraybuffer';
 			this.ws = ws;
-			this.phase = 'waiting';
+			if (!this.resume) this.phase = 'waiting';
 			ws.onmessage = (ev) => {
+				if (this.ws !== ws) return;
 				if (typeof ev.data !== 'string') this.bytesIn += (ev.data as ArrayBuffer).byteLength;
 				this.recvChain = this.recvChain.then(() => this.onMessage(ev.data)).catch((e) => this.fail(e));
 			};
 			ws.onclose = (ev) => {
+				if (this.ws !== ws) return; // an earlier connection (before a restart)
+				this.stopStats();
+				if (this.phase !== 'closed' && this.scheduleReconnect()) return;
 				if (this.phase !== 'closed') {
 					this.phase = 'closed';
 					this.error ??= explainClose(ev.reason);
 				}
-				this.stopStats();
 			};
 			ws.onerror = () => {
 				this.error ??= 'เชื่อมต่อ relay ไม่สำเร็จ';
@@ -266,17 +284,44 @@ export class RemoteViewer {
 	}
 
 	private fail(e: unknown) {
+		const ws = this.ws;
+		this.ws = null;
+		ws?.close();
+		this.stopStats();
+		// Waiting for a restarted machine: offline or not ready yet, try again later.
+		if (this.phase !== 'closed' && this.scheduleReconnect()) return;
 		this.error = e instanceof ApiError || e instanceof Error ? e.message : String(e);
 		this.phase = 'closed';
-		this.ws?.close();
-		this.stopStats();
+	}
+
+	/** After a restart we asked for: the next attempt to come back (false = not restarting). */
+	private scheduleReconnect(): boolean {
+		if (!this.resume) return false;
+		if (!this.reconnectSince) this.reconnectSince = Date.now();
+		if (Date.now() - this.reconnectSince > RECONNECT_FOR_MS) {
+			this.resume = null;
+			this.reconnect = null;
+			this.phase = 'closed';
+			this.error = 'เครื่องปลายทางยังไม่กลับมาออนไลน์หลังรีสตาร์ท';
+			return true;
+		}
+		const attempt = (this.reconnect?.attempt ?? 0) + 1;
+		const wait = reconnectDelay(attempt);
+		this.reconnect = { attempt, next: Date.now() + wait };
+		this.phase = 'reconnecting';
+		this.error = null;
+		this.reconnectTimer = setTimeout(() => {
+			this.reconnectTimer = null;
+			if (this.resume) this.start();
+		}, wait);
+		return true;
 	}
 
 	private async onMessage(data: string | ArrayBuffer) {
 		if (typeof data === 'string') {
 			const m = JSON.parse(data);
 			if (m.t === 'paired') {
-				this.phase = 'handshake';
+				if (!this.resume) this.phase = 'handshake';
 				this.keys = await newViewerKeys();
 				this.ws?.send(JSON.stringify({ t: 'hello', v: 1, epk: b64encode(this.keys.epk) }));
 			} else if (m.t === 'hello' && this.keys && this.device) {
@@ -298,6 +343,12 @@ export class RemoteViewer {
 	private onControl(m: any) {
 		switch (m.t) {
 			case 'auth_required':
+				if (this.resume) {
+					// Back after the restart: the agent's one-time token replaces the password.
+					const resume = this.resume;
+					this.authMessage(null).then((m) => this.send({ ...m, resume }));
+					break;
+				}
 				this.needPassword = m.password;
 				if (m.password) {
 					this.phase = 'auth';
@@ -314,7 +365,18 @@ export class RemoteViewer {
 				if (m.ok) {
 					this.phase = 'connected';
 					this.error = null;
+					this.resume = null;
+					this.reconnect = null;
+					this.reconnectSince = 0;
 					this.startStats();
+				} else if (this.resume) {
+					// The token was not accepted (expired, device reset): ask for the password.
+					this.resume = null;
+					this.reconnect = null;
+					this.reconnectSince = 0;
+					this.needPassword = true;
+					this.phase = 'auth';
+					this.error = 'เครื่องปลายทางรีสตาร์ทแล้ว ใส่รหัสผ่านเพื่อเชื่อมต่ออีกครั้ง';
 				} else if (m.reason === 'wrong_password') {
 					this.attemptsLeft = m.attempts_left;
 					this.error = m.attempts_left > 0 ? `รหัสผ่านไม่ถูกต้อง (เหลือ ${m.attempts_left} ครั้ง)` : 'รหัสผ่านไม่ถูกต้อง';
@@ -329,7 +391,16 @@ export class RemoteViewer {
 				break;
 			case 'info':
 				this.info = m;
+				this.controls = noControls();
+				if (this.viewOnly && this.hasControl('view_only')) this.send({ t: 'view_only', on: true });
 				break;
+			case 'ctl': {
+				const r = applyCtl(this.controls, m);
+				this.controls = r.state;
+				if (r.notice) this.say(r.notice);
+				if (r.resume !== undefined) this.resume = r.resume;
+				break;
+			}
 			case 'encoder':
 				// The agent switched encoders mid-session (e.g. hardware -> OpenH264 -> JPEG).
 				if (this.info) this.info = { ...this.info, encoder: m.encoder, codec: m.codec ?? this.info.codec };
@@ -473,11 +544,18 @@ export class RemoteViewer {
 			this.frames = 0;
 			this.bytesIn = 0;
 		}, 1000);
+		// Only while the machine is blocked; older agents ignore it anyway.
+		if (this.keepalive) clearInterval(this.keepalive);
+		this.keepalive = setInterval(() => {
+			if (this.controls.block_input || this.controls.privacy) this.send({ t: 'ka' });
+		}, KEEPALIVE_MS);
 	}
 
 	private stopStats() {
 		if (this.statsTimer) clearInterval(this.statsTimer);
 		this.statsTimer = null;
+		if (this.keepalive) clearInterval(this.keepalive);
+		this.keepalive = null;
 		// Stats stop exactly when the session ends; release the hardware decoder with them.
 		if (this.decoder && this.decoder.state !== 'closed') this.decoder.close();
 		this.decoder = null;
@@ -810,9 +888,27 @@ export class RemoteViewer {
 		this.send({ t: 'audio', on: !muted });
 	}
 
+	// --- session controls (only those the agent lists in info.features) ---
+
+	hasControl(f: ControlFeature): boolean {
+		return hasControl(this.info?.features, f);
+	}
+
+	/** View-only: no input leaves this browser; agents that know it show it at the machine. */
+	setViewOnly(on: boolean) {
+		this.viewOnly = on;
+		if (this.hasControl('view_only')) this.send({ t: 'view_only', on });
+	}
+
+	/** `block_input`, `privacy` or `lock_after` with `on`; `lock` and `restart` ignore it. */
+	sessionControl(op: 'block_input' | 'privacy' | 'lock_after' | 'lock' | 'restart', on = true) {
+		this.send(op === 'lock' || op === 'restart' ? { t: op } : { t: op, on });
+	}
+
 	// --- input (coordinates normalised to the displayed frame) ---
 
 	mouseMove(x: number, y: number) {
+		if (this.viewOnly) return;
 		this.pendingMove = [x, y];
 		if (this.moveScheduled) return;
 		this.moveScheduled = true;
@@ -824,12 +920,14 @@ export class RemoteViewer {
 	}
 
 	mouseButton(b: number, down: boolean, x: number, y: number) {
+		if (this.viewOnly) return;
 		this.pendingMove = null;
 		this.send({ t: 'mb', b, down, x, y });
 	}
 
 	/** Relative pointer motion in the remote's input units (feature "relmouse"), one message per frame. */
 	relativeMove(dx: number, dy: number) {
+		if (this.viewOnly) return;
 		this.pendingRel[0] += dx;
 		this.pendingRel[1] += dy;
 		if (this.relScheduled) return;
@@ -846,18 +944,22 @@ export class RemoteViewer {
 
 	/** Button press/release where the remote pointer is (relative mode). */
 	relativeButton(b: number, down: boolean) {
+		if (this.viewOnly) return;
 		this.send({ t: 'mb', b, down });
 	}
 
 	wheel(dx: number, dy: number) {
+		if (this.viewOnly) return;
 		this.send({ t: 'wh', dx, dy });
 	}
 
 	key(code: string, key: string, down: boolean) {
+		if (this.viewOnly) return;
 		this.send({ t: 'key', code, key, down });
 	}
 
 	typeText(s: string) {
+		if (this.viewOnly) return;
 		this.send({ t: 'text', s });
 	}
 
@@ -979,6 +1081,10 @@ export class RemoteViewer {
 	}
 
 	close() {
+		this.resume = null; // closed by the user: no reconnect
+		this.reconnect = null;
+		if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+		this.reconnectTimer = null;
 		if (this.phase === 'closed') return;
 		this.send({ t: 'bye' });
 		this.sendChain.then(() => this.ws?.close(1000, 'viewer_closed'));

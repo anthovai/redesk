@@ -130,6 +130,10 @@ pub enum ViewerMsg {
         /// Tunnel target (`host:port`); must match the server's session request.
         #[serde(default)]
         target: Option<String>,
+        /// One-time token from `ctl {op:"restart"}`: reconnecting after the restart it asked
+        /// for, without the password or a click (feature "restart").
+        #[serde(default)]
+        resume: Option<String>,
     },
     /// Viewer muted (`on: false`) or unmuted its speaker; the agent stops/resumes 0x05 packets.
     #[serde(rename = "audio")]
@@ -246,6 +250,29 @@ pub enum ViewerMsg {
         id: Option<u32>,
         paths: Vec<String>,
     },
+    /// The viewer stopped (`on: true`) or resumed sending input; shown in the connection
+    /// manager (feature "view_only").
+    #[serde(rename = "view_only")]
+    ViewOnly { on: bool },
+    /// Block the keyboard and mouse of the person at this machine (feature "block_input").
+    #[serde(rename = "block_input")]
+    BlockInput { on: bool },
+    /// Black out this screen for the people in front of it (feature "privacy").
+    #[serde(rename = "privacy")]
+    Privacy { on: bool },
+    /// Lock this machine now (feature "lock").
+    #[serde(rename = "lock")]
+    Lock,
+    /// Lock this machine when the session ends (feature "lock").
+    #[serde(rename = "lock_after")]
+    LockAfter { on: bool },
+    /// Restart this machine (feature "restart").
+    #[serde(rename = "restart")]
+    Restart,
+    /// Keepalive while the viewer blocks input or uses privacy mode, so a viewer that vanished
+    /// does not leave the machine blocked.
+    #[serde(rename = "ka")]
+    Keepalive,
     /// Resend the whole screen (JPEG) or a keyframe (H.264), e.g. after a decoder error.
     #[serde(rename = "refresh", alias = "keyframe")]
     Refresh,

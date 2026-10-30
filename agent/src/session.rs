@@ -20,6 +20,7 @@ use crate::audio;
 use crate::capture::{self, Params};
 use crate::codec::{self, Codec};
 use crate::config::{ApproveMode, EncoderPref, Verification};
+use crate::controls;
 use crate::crypto::{self, Channel};
 use crate::files;
 use crate::input;
@@ -33,6 +34,8 @@ use crate::status::{ApprovalRequest, SessionInfo};
 const MAX_ATTEMPTS: u32 = 3;
 const LOCKOUT_AFTER: u32 = 5;
 const LOCKOUT: Duration = Duration::from_secs(60);
+/// Viewers send a keepalive every 10 s while they block the machine.
+const VIEWER_SILENT: Duration = Duration::from_secs(30);
 
 #[derive(Deserialize)]
 struct Hello {
@@ -93,8 +96,9 @@ pub async fn run(
     let mut viewer_codecs;
     let mut viewer_features;
     let mut wants_audio;
+    let mut resumed = false;
     loop {
-        let Incoming::Msg(ViewerMsg::Auth { password, codecs, features, audio, session, target }) = read_viewer(&mut rx, &mut ch, Duration::from_secs(120)).await? else {
+        let Incoming::Msg(ViewerMsg::Auth { password, codecs, features, audio, session, target, resume }) = read_viewer(&mut rx, &mut ch, Duration::from_secs(120)).await? else {
             bail!("expected auth message")
         };
         // The viewer must want the session the server asked for (an old server would turn a
@@ -109,6 +113,15 @@ pub async fn run(
         // Viewers that do not list an audio codec never get 0x05 packets.
         wants_audio = audio.iter().any(|c| c == "opus");
 
+        // Back after a restart this viewer asked for: its one-time token replaces the password
+        // and the click (an unknown or expired token falls through to the usual checks). Only
+        // for remote control, the session the restart was asked from.
+        if let Some(t) = resume.as_deref().filter(|_| kind == SessionKind::Screen)
+            && controls::take_resume(&agent.config_path, Some(&viewer.email), t)
+        {
+            resumed = true;
+            break;
+        }
         if need_password {
             if let Some(wait) = locked_for(&agent) {
                 agent.report(sid, "locked", json!({"retry_after": wait.as_secs()}));
@@ -138,7 +151,7 @@ pub async fn run(
         break;
     }
     agent.failures.lock().unwrap().0 = 0;
-    if need_password && verification != Verification::Permanent {
+    if need_password && !resumed && verification != Verification::Permanent {
         agent.rotate_temp_password(); // one-time: the password just used is now dead
     }
     tracing::info!("session {sid}: {} ({}) is now connected ({})", viewer.email, viewer.ip, kind.name());
@@ -166,6 +179,25 @@ pub async fn run(
     }
     let recording = recorder.rec.is_some();
 
+    // Session controls (view-only, block input, privacy, lock, restart). Dropped when the
+    // session ends however it ends: input is unblocked and the screen given back.
+    let ui_attached = agent.ui.lock().unwrap().is_some();
+    let platform = controls::platform();
+    // Tunnels and terminals stream no screen and take no input: they offer no controls.
+    let perms = match kind {
+        SessionKind::Screen => controls::Perms::new(&agent.config.lock().unwrap(), platform.supports(ui_attached)),
+        _ => controls::Perms::default(),
+    };
+    let report: Arc<dyn Fn(&str, serde_json::Value) + Send + Sync> = {
+        let (agent, sid) = (agent.clone(), sid.to_string());
+        Arc::new(move |kind, detail| {
+            agent.report(&sid, kind, detail);
+            agent.changed();
+        })
+    };
+    let mut ctl = controls::SessionCtl::new(perms, platform, report, &agent.config_path, &viewer.email, None);
+    let mut escapes = controls::escape_signal();
+
     let kill = Arc::new(tokio::sync::Notify::new());
     agent.status.lock().unwrap().sessions.push(SessionInfo {
         sid: sid.to_string(),
@@ -175,11 +207,13 @@ pub async fn run(
         started: std::time::SystemTime::now(),
         kill: kill.clone(),
         recording,
+        controls: ctl.flags.clone(),
         purpose: kind.purpose(),
     });
     agent.changed();
     let _registered = Registered { agent: agent.clone(), sid: sid.to_string() };
-    agent.report(sid, "auth_ok", json!({"method": if need_password { "password" } else { "click" }, "approved_locally": need_click}));
+    let method = if resumed { "resume" } else if need_password { "password" } else { "click" };
+    agent.report(sid, "auth_ok", json!({"method": method, "approved_locally": need_click && !resumed}));
     let _awake = crate::power::KeepAwake::new("Aegiron remote session");
 
     // Tunnel and terminal sessions stream no screen.
@@ -247,7 +281,7 @@ pub async fn run(
         "codecs": switchable.iter().map(|c| c.name()).collect::<Vec<_>>(),
         "recording": recording,
         "whiteboard": whiteboard,
-        "features": files::FEATURES.iter().chain(&proto::DISPLAY_FEATURES).collect::<Vec<_>>(),
+        "features": files::FEATURES.iter().chain(&proto::DISPLAY_FEATURES).copied().chain(ctl.perms.features()).collect::<Vec<_>>(),
         "resolution": resolution.is_some(),
         "encoder": encoder,
         "audio": audio_on,
@@ -258,6 +292,7 @@ pub async fn run(
     let params = Params { display: 0, all: false, fps: cfg.max_fps, quality: cfg.jpeg_quality, max_width: cfg.max_width, codec };
     let (params_tx, params_rx) = watch::channel(params);
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(2);
+    ctl.set_out(out_tx.clone());
     let stop = Arc::new(AtomicBool::new(false));
     let force_full = Arc::new(AtomicBool::new(true));
     let _stop_guard = StopOnDrop(stop.clone());
@@ -287,6 +322,9 @@ pub async fn run(
     }
     let mut files = files::Files::new();
     let input_tx = cfg.allow_input.then(|| input::spawn(capture::geometry(0).unwrap_or_default()));
+    // While the machine is blocked, a viewer that went silent (no keepalive) ends the session.
+    let mut last_seen = Instant::now();
+    let mut watchdog = tokio::time::interval(Duration::from_secs(5));
     // Extra display streams (`cfg {streams}`), by display index.
     let mut streams: HashMap<usize, Stream> = HashMap::new();
 
@@ -296,6 +334,19 @@ pub async fn run(
                 tracing::info!("session {sid}: disconnected by the local user");
                 agent.report(sid, "denied", json!({"stage": "during_session"}));
                 return Ok(());
+            }
+            Ok(()) = escapes.changed() => {
+                if ctl.blocking() {
+                    tracing::info!("session {sid}: ended with {} at this machine", controls::ESCAPE_HINT);
+                    agent.report(sid, "denied", json!({"stage": "local_escape"}));
+                    return Ok(());
+                }
+            }
+            _ = watchdog.tick() => {
+                if ctl.blocking() && last_seen.elapsed() > VIEWER_SILENT {
+                    tracing::warn!("session {sid}: viewer silent while the machine is blocked; ending the session");
+                    return Ok(());
+                }
             }
             pkt = audio_rx.recv(), if audio_open => match pkt {
                 Some(plain) => {
@@ -315,6 +366,7 @@ pub async fn run(
                 tx.send(Message::Binary(ch.seal(&plain)?.into())).await?;
             }
             msg = read_viewer(&mut rx, &mut ch, Duration::from_secs(300)) => {
+                last_seen = Instant::now();
                 let msg = match msg {
                     Ok(Incoming::Msg(m)) => m,
                     Ok(Incoming::FileChunk(id, data)) => {
@@ -328,7 +380,15 @@ pub async fn run(
                     Err(e) if e.to_string() == "relay closed" => return Ok(()),
                     Err(e) => return Err(e),
                 };
-                let send_input = |ev| if let Some(t) = &input_tx { let _ = t.send(ev); };
+                if matches!(msg, ViewerMsg::BlockInput { on: true } | ViewerMsg::Privacy { on: true }) {
+                    escapes.borrow_and_update(); // an earlier escape does not end this block
+                }
+                if let Some(reply) = ctl.handle(&msg) {
+                    send_json(&mut tx, &mut ch, reply).await?;
+                    continue;
+                }
+                let live_input = input_tx.as_ref().filter(|_| ctl.input_allowed());
+                let send_input = |ev| if let Some(t) = live_input { let _ = t.send(ev); };
                 // Input on an extra display stream is normalised to that display.
                 let on = |d: Option<usize>| d.and_then(|d| streams.get(&d)).map(|s| s.geo);
                 match msg {

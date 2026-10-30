@@ -160,6 +160,9 @@ var agentEvents = map[string]bool{
 	"recording_started": true, "recording_failed": true,
 	"file_delete": true, "file_rename": true, "resolution_change": true,
 	"tunnel_open": true, "tunnel_closed": true, "terminal_open": true, "terminal_closed": true,
+	// Session controls the viewer used on the device (docs/PROTOCOL.md §4, Session controls).
+	"view_only": true, "block_input": true, "privacy_mode": true,
+	"lock_screen": true, "lock_after_session": true, "restart": true, "restart_failed": true,
 }
 
 func (h *Hub) HandleAgent(w http.ResponseWriter, r *http.Request) {
