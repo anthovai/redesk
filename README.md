@@ -193,7 +193,9 @@ AEGIRON_ADMIN_PASSWORD='change-me-now-123' make server
 | `make web` | เว็บแบบ hot reload ที่ http://localhost:5173 |
 | `make agent` | รัน agent (หลัง `aegiron-agent init`) |
 | `cd agent && cargo run --bin aegiron` | รันแอปบนเครื่อง |
-| `make test` | go vet + go test, cargo test, svelte-check |
+| `make test` | go vet + go test, cargo test, svelte-check, bun test |
+| `make e2e` | ทดสอบทั้งระบบบน Mac (เซิร์ฟเวอร์, agent, Chrome แบบ headless) — ดู [docs/TESTING.md](docs/TESTING.md) |
+| `deploy/test/gateway-e2e.sh` | ทดสอบ gateway กับเซิร์ฟเวอร์ RDP / VNC / SSH จริงใน Docker |
 | `deploy/macos/build-kit.sh` | สร้างชุดติดตั้งเซิร์ฟเวอร์, agent และ `.dmg` ใน `dist/` |
 | `deploy/windows/build-installer.sh` | สร้างตัวติดตั้ง Windows (cross-compile จาก Mac/Linux) |
 
@@ -206,11 +208,11 @@ cd web && AEGIRON_PASSWORD=... bun scripts/e2e-viewer.ts <device-id> <device-pas
 ## ข้อจำกัดและแผนต่อไป
 
 - AV1 เป็นตัวเลือกเสริม ใช้ได้เฉพาะเมื่อเครื่องปลายทางเป็น Windows ที่มี AV1 hardware encoder (Mac ไม่มี AV1 encoder; encoder แบบ software ช้าเกินไปสำหรับใช้งานสด) ค่าเริ่มต้นยังเป็น H.264; ไม่มี VP9 เพราะ libvpx build จาก cargo อย่างเดียวไม่ได้
-- hardware encoder (H.264 และ AV1) และเสียงบน Windows ยังไม่ได้ทดสอบกับเครื่องจริง
+- hardware encoder (H.264 และ AV1) บน Windows ยังไม่ได้ทดสอบกับ GPU จริง (CI ทดสอบเสียง, encoder แบบ software ของ Media Foundation และตัวติดตั้งบน Windows จริงแล้ว)
 - เสียงจากเครื่องปลายทางต้องใช้ macOS 13 ขึ้นไป หรือ Windows
 - ยังไม่มีการควบคุมที่หน้าจอล็อกอินของ macOS (ต้องใช้ daemon ระดับ root ซึ่งตั้งใจไม่ทำ)
 - Wake-on-LAN ต้องมี agent อีกเครื่องออนไลน์ในวงแลนเดียวกัน และเครื่องเป้าหมายต้องเปิด WoL ไว้
-- ผู้ให้บริการอื่น: TeamViewer ทดสอบกับ mock เท่านั้น, AnyDesk ไม่มี API สาธารณะ, RDP ยังไม่ได้ทดสอบกับ Windows จริง
+- ผู้ให้บริการอื่น: TeamViewer ทดสอบกับ mock เท่านั้น, AnyDesk ไม่มี API สาธารณะ, gateway RDP / VNC / SSH ทดสอบกับ xrdp, FreeRDP, TigerVNC และ OpenSSH แล้ว แต่ยังไม่ได้ทดสอบกับ Windows จริง (Kerberos/โดเมน, rdpclip, GFX)
 
 ## อัปเกรดจาก ReDesk
 
