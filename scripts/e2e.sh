@@ -69,7 +69,10 @@ AGENT=("$REL/aegiron-agent" --config "$WORK/agent/agent.toml")
 sed -i.bak 's/^lan_discovery = true/lan_discovery = false/' "$WORK/agent/agent.toml"
 TONE=tone
 [ -n "${E2E_REAL_AUDIO:-}" ] && TONE=
-AEGIRON_TEST_AUDIO=$TONE RUST_LOG=info "${AGENT[@]}" run >"$WORK/agent.log" 2>&1 &
+# With the test tone, the agent also answers voice calls and echoes chat (AEGIRON_TEST_CM).
+CM=auto
+[ -n "${E2E_REAL_AUDIO:-}" ] && CM=
+AEGIRON_TEST_AUDIO=$TONE AEGIRON_TEST_CM=$CM RUST_LOG=info "${AGENT[@]}" run >"$WORK/agent.log" 2>&1 &
 PIDS+=($!)
 for _ in $(seq 50); do grep -q 'registered with server' "$WORK/agent.log" && break; sleep 0.2; done
 ID=$(sed -n 's/^id = "\(.*\)"/\1/p' "$WORK/agent/agent.toml")
@@ -78,17 +81,18 @@ echo "device $ID"
 pw() { "${AGENT[@]}" show-password; }
 
 export AEGIRON_URL="$URL" AEGIRON_PASSWORD="$ADMIN_PW" ROOT ID REL
+export AEGIRON_EXPECT_CM=$([ -n "$CM" ] && echo 1 || echo 0)
 export PW=
 FAILED=0
 step() { echo; echo "=== $1"; shift; PW=$(pw); "$@" || FAILED=$((FAILED + 1)); }
 
-step "protocol: codecs, audio, mute (web/scripts/e2e-viewer.ts)" \
+step "protocol: codecs, audio, mute, chat, voice call (web/scripts/e2e-viewer.ts)" \
 	bash -c 'cd "$ROOT/web" && bun scripts/e2e-viewer.ts "$ID" "$PW"'
 step "native viewer asks for AV1 (examples/media_probe)" bash -c '
 	out=$(AEGIRON_CODEC=av1 AEGIRON_AUDIO_OUT=0 "$REL/examples/media_probe" "$ID" "$PW" 5 2>/dev/null | grep -E "^t=|SUMMARY")
 	echo "$out" | tail -3
 	echo "$out" | grep -q "codec=h264" && echo "$out" | grep -qE "audio_seconds_nonsilent=[1-9]"'
-step "browser: live viewer, recordings, AV1 playback (web/scripts/e2e-media.ts)" \
+step "browser: live viewer, chat, voice call, recordings, AV1 playback (web/scripts/e2e-media.ts)" \
 	env AEGIRON_AGENT_CONFIG="$WORK/agent/agent.toml" AEGIRON_E2E_DB="$DB_URL" PSQL="$PG_BIN/psql" \
 	AEGIRON_MAKE_RECORDING="$REL/examples/make_recording" bash -c 'cd "$ROOT/web" && bun scripts/e2e-media.ts "$ID" "$PW"'
 step "browser + CLI: remembered 2FA devices (web/scripts/e2e-auth.ts)" \

@@ -172,19 +172,24 @@ pub async fn run(
     let recording = recorder.rec.is_some();
 
     // In-session communication needs the desktop app's connection manager; the headless agent
-    // never offers it.
+    // never offers it (except to tests, see `test_cm`).
     let cfg = agent.config.lock().unwrap().clone();
-    let has_ui = agent.ui.lock().unwrap().is_some();
+    let has_app = agent.ui.lock().unwrap().is_some();
+    let test_cm = test_cm();
+    let has_ui = has_app || test_cm;
     let offers_voice = has_ui && cfg.allow_voice && audio::voice_supported();
     let viewer_has = |f: &str| viewer_features.iter().any(|v| v == f);
     let (link, mut host_rx) = SessionLink::new(
         has_ui && viewer_has(proto::FEATURE_CHAT),
         offers_voice && viewer_has(proto::FEATURE_VOICE),
-        has_ui && viewer_has(proto::FEATURE_SWITCH),
+        has_app && viewer_has(proto::FEATURE_SWITCH),
     );
     let mut features: Vec<&str> = files::FEATURES.to_vec();
     if has_ui {
-        features.extend([proto::FEATURE_CHAT, proto::FEATURE_SWITCH]);
+        features.push(proto::FEATURE_CHAT);
+    }
+    if has_app {
+        features.push(proto::FEATURE_SWITCH);
     }
     if offers_voice {
         features.push(proto::FEATURE_VOICE);
@@ -303,6 +308,8 @@ pub async fn run(
     // voice played here. The person here has 30 s to accept a call.
     let (voice_tx, mut voice_rx) = mpsc::channel::<Vec<u8>>(16);
     let mut call: Option<Call> = None;
+    // Voice packets received in this call and their loudest block (reported to tests).
+    let mut heard = (0usize, 0f32);
     let mut ring_until: Option<tokio::time::Instant> = None;
     let attention = |text: &str| {
         agent.status.lock().unwrap().notify(Attention { sid: sid.to_string(), who: who.clone(), text: text.to_string() });
@@ -398,6 +405,8 @@ pub async fn run(
                             } else {
                                 c.receive(&data);
                             }
+                            heard.0 += 1;
+                            heard.1 = heard.1.max(c.take_level().unwrap_or(0.0));
                         }
                         continue;
                     }
@@ -533,6 +542,9 @@ pub async fn run(
                         if !text.trim().is_empty() {
                             link.push(false, text.clone());
                             attention(&text);
+                            if test_cm {
+                                let _ = link.cmd.send(HostCmd::Chat(format!("echo: {text}")));
+                            }
                         }
                     }
                     ViewerMsg::Voice { op, muted } => match op.as_str() {
@@ -543,8 +555,17 @@ pub async fn run(
                             ring_until = Some(tokio::time::Instant::now() + RING_TIMEOUT);
                             set_call(CallState::Ringing(Instant::now()));
                             attention("ขอโทรคุยด้วยเสียง");
+                            if test_cm {
+                                let _ = link.cmd.send(HostCmd::Answer(true));
+                            }
                         }
                         "hangup" => {
+                            if test_cm && call.is_some() {
+                                // Tells the test what arrived from the viewer's microphone.
+                                let report = format!("test: received {} voice packets, peak rms {:.3}", heard.0, heard.1);
+                                let _ = link.cmd.send(HostCmd::Chat(report));
+                            }
+                            heard = (0, 0.0);
                             let was_on = call.take().is_some();
                             if was_on || ring_until.take().is_some() {
                                 set_call(CallState::Idle);
@@ -660,6 +681,15 @@ where
             Err(e) => tracing::debug!("ignoring viewer message: {e}"),
         }
     }
+}
+
+/// `AEGIRON_TEST_CM=auto` together with `AEGIRON_TEST_AUDIO=tone`: a headless agent offers
+/// chat and voice calls as if someone sat at the connection manager, answers every call (its
+/// "microphone" is the test tone), echoes chat messages and, when the viewer hangs up, reports in
+/// the chat how many voice packets arrived. End-to-end tests only; never set by the app or the
+/// installers, and without the test tone it does nothing, so it can never open a microphone.
+fn test_cm() -> bool {
+    std::env::var("AEGIRON_TEST_CM").is_ok_and(|v| v == "auto") && audio::test_audio()
 }
 
 fn check_password(agent: &Agent, mode: Verification, pw: &str) -> bool {

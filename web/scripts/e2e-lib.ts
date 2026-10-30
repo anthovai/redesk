@@ -112,12 +112,22 @@ export function chromePath(): string {
 	return process.env.CHROME_PATH ?? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 }
 
-/** Headless Chrome with WebCodecs and autoplay allowed (no user gesture in automation). */
+/**
+ * Headless Chrome with WebCodecs and autoplay allowed (no user gesture in automation), and a
+ * fake microphone (a beep) granted without a prompt for voice calls.
+ */
 export async function launchChrome(): Promise<Browser> {
 	return puppeteer.launch({
 		executablePath: chromePath(),
 		headless: process.env.HEADFUL ? false : true,
-		args: ['--autoplay-policy=no-user-gesture-required', '--no-first-run', '--no-default-browser-check', '--mute-audio']
+		args: [
+			'--autoplay-policy=no-user-gesture-required',
+			'--no-first-run',
+			'--no-default-browser-check',
+			'--mute-audio',
+			'--use-fake-device-for-media-stream',
+			'--use-fake-ui-for-media-stream'
+		]
 	});
 }
 

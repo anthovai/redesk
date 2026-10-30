@@ -203,6 +203,11 @@ fn test_tone() -> bool {
     std::env::var("AEGIRON_TEST_AUDIO").is_ok_and(|v| v == "tone")
 }
 
+/// Whether `AEGIRON_TEST_AUDIO=tone` replaces capture (system audio and microphone).
+pub fn test_audio() -> bool {
+    test_tone()
+}
+
 /// A running capture: the platform backend or the test tone. Dropping it stops capture.
 pub(crate) enum Source {
     #[allow(dead_code)]

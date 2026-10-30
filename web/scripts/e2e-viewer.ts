@@ -7,7 +7,8 @@
 // Env: AEGIRON_URL (default http://127.0.0.1:21114), AEGIRON_EMAIL, AEGIRON_PASSWORD,
 //      AEGIRON_CODECS (what the viewer offers, best first; default "av1,h264,jpeg"),
 //      AEGIRON_EXPECT_CODEC (default h264: what an agent without an AV1 encoder must pick),
-//      AEGIRON_EXPECT_AUDIO=0 when the agent has no audio (allow_audio off, Linux).
+//      AEGIRON_EXPECT_AUDIO=0 when the agent has no audio (allow_audio off, Linux),
+//      AEGIRON_EXPECT_CM=1 when the agent runs with AEGIRON_TEST_CM=auto (chat and voice calls).
 // With a remote dir, also lists it, uploads a random file there, downloads it back and compares.
 
 import { b64decode, b64encode, completeHandshake, newViewerKeys, type Channel } from '../src/lib/crypto';
@@ -18,6 +19,8 @@ if (!deviceId || !devicePassword) throw new Error('usage: e2e-viewer.ts <device-
 const offered = (process.env.AEGIRON_CODECS ?? 'av1,h264,jpeg').split(',');
 const expectCodec = process.env.AEGIRON_EXPECT_CODEC ?? 'h264';
 const expectAudio = process.env.AEGIRON_EXPECT_AUDIO !== '0';
+const expectCm = process.env.AEGIRON_EXPECT_CM === '1';
+const features = expectCm ? ['chat', 'voice'] : undefined;
 
 const api = await Api.login(adminEmail, adminPassword());
 const t = await api.post<any>('/api/sessions', { device_id: deviceId });
@@ -38,6 +41,12 @@ const downloaded: Uint8Array[] = [];
 // What arrived, by kind; `mark()` starts a new counting window.
 let stats = { jpeg: 0, h264: 0, av1: 0, keyframes: 0, firstVideoKey: null as boolean | null, audio: 0, audioGaps: 0, bytes: 0 };
 let lastSeq = -1;
+// Voice call (0x06) from the agent: packets, sequence gaps, and the packets themselves, which
+// are sent straight back as this viewer's microphone (bun has no Opus encoder).
+let voice = { packets: 0, gaps: 0, lastSeq: -1, echo: false };
+let voiceSeq = 0;
+const chats: string[] = [];
+const voiceMsgs: any[] = [];
 const mark = () => {
 	const s = stats;
 	stats = { jpeg: 0, h264: 0, av1: 0, keyframes: 0, firstVideoKey: null, audio: 0, audioGaps: 0, bytes: 0 };
@@ -102,14 +111,28 @@ ws.onmessage = (ev) => {
 				lastSeq = seq;
 				return;
 			}
+			if (plain[0] === 6) {
+				const seq = new DataView(plain.buffer, plain.byteOffset).getUint32(2);
+				if (plain[1] === 1 && plain.length > 6) voice.packets++;
+				if (voice.lastSeq >= 0 && seq !== voice.lastSeq + 1) voice.gaps++;
+				voice.lastSeq = seq;
+				if (voice.echo) {
+					const out = plain.slice();
+					new DataView(out.buffer).setUint32(2, ++voiceSeq);
+					ws.send(await ch!.seal(out));
+				}
+				return;
+			}
 			if (plain[0] === 3) return void downloaded.push(plain.slice(5));
 			const m = JSON.parse(new TextDecoder().decode(plain.subarray(1)));
 			if (m.t !== 'cursor') console.log('agent:', JSON.stringify(m).slice(0, 200));
-			if (m.t === 'auth_required') await send({ t: 'auth', password: 'wrong-password', codecs: offered, audio: ['opus'] });
+			if (m.t === 'auth_required') await send({ t: 'auth', password: 'wrong-password', codecs: offered, audio: ['opus'], features });
 			if (m.t === 'auth_result' && !m.ok) {
 				check(m.reason === 'wrong_password', 'wrong password rejected', m);
-				await send({ t: 'auth', password: devicePassword, codecs: offered, audio: ['opus'] });
+				await send({ t: 'auth', password: devicePassword, codecs: offered, audio: ['opus'], features });
 			}
+			if (m.t === 'chat') chats.push(m.text);
+			if (m.t === 'voice') voiceMsgs.push(m);
 			if (m.t === 'info') info = m;
 			if (m.t === 'encoder') encoderMsgs.push(m);
 			if (m.t === 'auth_result' && m.ok) authed();
@@ -185,6 +208,31 @@ if (expectAudio) {
 	await sleep(1500);
 	s = mark();
 	check(s.audio >= 60, 'audio {on: true} resumes them', s.audio);
+}
+
+if (expectCm) {
+	const f: string[] = info?.features ?? [];
+	check(f.includes('chat') && f.includes('voice') && !f.includes('switch'), 'info.features: chat and voice (no switch without the desktop app)', f);
+	await send({ t: 'chat', text: 'สวัสดี e2e 👋' });
+	await sleep(800);
+	check(chats.includes('echo: สวัสดี e2e 👋'), 'chat reaches the agent and comes back', chats);
+
+	await send({ t: 'voice', op: 'call' });
+	await sleep(1000);
+	check(voiceMsgs.some((m) => m.op === 'accept'), 'voice call accepted', voiceMsgs);
+	voice = { packets: 0, gaps: 0, lastSeq: voice.lastSeq, echo: true };
+	await sleep(2000);
+	check(voice.packets >= 80 && voice.gaps === 0, 'voice: 0x06 Opus packets every 20 ms without gaps', voice);
+	await send({ t: 'voice', op: 'mute', muted: true });
+	await send({ t: 'voice', op: 'hangup' });
+	await sleep(800);
+	const report = chats.find((c) => c.startsWith('test: received'));
+	const [, n, rms] = report?.match(/received (\d+) voice packets, peak rms ([\d.]+)/) ?? [];
+	check(Number(n) >= 80 && Number(rms) > 0.05, "the agent heard this viewer's voice", report);
+	voice.echo = false;
+	const before = voice.packets;
+	await sleep(500);
+	check(voice.packets - before <= 2, 'no voice packets after hanging up', voice.packets - before);
 }
 
 if (fileDir) {

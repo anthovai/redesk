@@ -13,8 +13,8 @@ Windows code is at least compiled from a Mac: `cd agent && cargo check --target 
 `scripts/e2e.sh` builds everything and runs the real programs against each other on this machine, isolated from anything already installed:
 
 - a server on `127.0.0.1:21200` with its own database (`aegiron_e2e`, dropped and recreated), data folder and a random admin password
-- an agent with a scratch config (`--config` in a temporary folder): audio allowed, remote input, clipboard, LAN discovery and direct connections off, so tests never move the mouse or touch the network beyond the server
-- Google Chrome, headless, driven by `puppeteer-core` (a web dev dependency; `CHROME_PATH` if Chrome is not in `/Applications`)
+- an agent with a scratch config (`--config` in a temporary folder): audio allowed, remote input, clipboard, LAN discovery and direct connections off, so tests never move the mouse or touch the network beyond the server; with the test tone it also runs with `AEGIRON_TEST_CM=auto` (chat and voice calls answered automatically, see [PROTOCOL.md §11](PROTOCOL.md#11-chat-voice-calls-and-switch-sides))
+- Google Chrome, headless, driven by `puppeteer-core` (a web dev dependency; `CHROME_PATH` if Chrome is not in `/Applications`), with Chrome's fake microphone for voice calls
 
 Everything is stopped, the database dropped and the folder removed at the end. Requirements: PostgreSQL 16 running locally (`make dev-db`; `PG_BIN` for the folder with `psql`/`createdb`/`dropdb` if they are not on `PATH`), Go, Rust, Bun, Chrome, and **Screen Recording permission** for the terminal (the agent captures the real screen). Options: `E2E_NO_BUILD=1`, `E2E_KEEP=1` (leave it running), `E2E_PORT`, `E2E_DB`, `E2E_REAL_AUDIO=1`.
 
@@ -22,16 +22,16 @@ The server limits sign-ins to 20 per address per 10 minutes, and one run uses mo
 
 | Step | Script | What it checks |
 |---|---|---|
-| Protocol | `web/scripts/e2e-viewer.ts <id> <password> [dir]` | Relay, handshake with the browser's crypto, wrong then right password; a viewer offering `av1,h264,jpeg` gets `h264` from an agent without an AV1 encoder and `info.codecs` without `av1`; `cfg {codec: av1}` is ignored, `cfg {codec: jpeg}` and back switch with `encoder` messages; Opus `0x05` every 20 ms without sequence gaps; `audio {on}` stops and resumes it; optional file round trip |
+| Protocol | `web/scripts/e2e-viewer.ts <id> <password> [dir]` | Relay, handshake with the browser's crypto, wrong then right password; a viewer offering `av1,h264,jpeg` gets `h264` from an agent without an AV1 encoder and `info.codecs` without `av1`; `cfg {codec: av1}` is ignored, `cfg {codec: jpeg}` and back switch with `encoder` messages; Opus `0x05` every 20 ms without sequence gaps; `audio {on}` stops and resumes it; `info.features` has `chat` and `voice`; a chat message comes back; a voice call is accepted, `0x06` Opus packets arrive every 20 ms without gaps, the agent hears them sent back and stops after `hangup`; optional file round trip |
 | Native viewer | `agent/examples/media_probe.rs` | The desktop app's viewer code (`AEGIRON_CODEC=av1`) gets H.264, decodes frames and audio (`AEGIRON_AUDIO_OUT=0` decodes without playing) |
-| Browser media | `web/scripts/e2e-media.ts <id> <password>` | Live viewer with AV1 remembered: decoder configured for H.264, quality monitor shows H264 and Opus, the menu shows AV1 disabled ("ปลายทางไม่รองรับ") with H.264 marked, `AudioDecoder` output, mute/unmute; recording policy "all": the session is uploaded with `codec h264`, `audio opus` and plays with sound; synthetic AV1 + Opus recordings (below): what is drawn and heard at each moment, audio within 60 ms of video, seeking forward, back, across a muted stretch and while paused, AV1 → H.264 switch, 2× with sound, 4× silent |
+| Browser media | `web/scripts/e2e-media.ts <id> <password>` | Live viewer with AV1 remembered: decoder configured for H.264, quality monitor shows H264 and Opus, the menu shows AV1 disabled ("ปลายทางไม่รองรับ") with H.264 marked, `AudioDecoder` output, mute/unmute; chat panel round trip; voice call from the toolbar with the fake microphone (the agent's voice decodes as mono Opus, the agent reports the browser's packets), back to idle after hanging up; recording policy "all": the session is uploaded with `codec h264`, `audio opus` and plays with sound; synthetic AV1 + Opus recordings (below): what is drawn and heard at each moment, audio within 60 ms of video, seeking forward, back, across a muted stretch and while paused, AV1 → H.264 switch, 2× with sound, 4× silent |
 | Sign-in | `web/scripts/e2e-auth.ts` | 2FA user in Chrome: TOTP with "จดจำอุปกรณ์นี้ 30 วัน", cookie attributes and lifetime, account page, password-only sign-in, wrong password still fails, admin revokes from the Users page, TOTP required again and the cookie cleared; `aegiron-agent login --remember-device`, second login without a code, admin revoke, code required and the token forgotten; every audit entry |
 
 Each script prints `PASS`/`FAIL` lines and exits non-zero on a failure. They take `AEGIRON_URL` and `AEGIRON_PASSWORD` (admin) and can run against any test server; see the header of each file for its other variables.
 
 ### Test audio
 
-Live audio is captured with ScreenCaptureKit on macOS and needs the Screen Recording permission. For repeatable tests the agent can send a generated tone instead: `AEGIRON_TEST_AUDIO=tone` (440 Hz, 0.5 s on / 0.5 s off). It is read from the environment only; the app, the installers and the login service never set it. `make e2e` uses it unless `E2E_REAL_AUDIO=1`. Real capture can be checked by hand: run the agent without it, play a sound and run `media_probe`, which prints the decoded level every second.
+Live audio is captured with ScreenCaptureKit on macOS and needs the Screen Recording permission. For repeatable tests the agent can send a generated tone instead: `AEGIRON_TEST_AUDIO=tone` (440 Hz, 0.5 s on / 0.5 s off). It is read from the environment only; the app, the installers and the login service never set it. `make e2e` uses it unless `E2E_REAL_AUDIO=1`. The same variable replaces the microphone in voice calls with a 660 Hz tone (agent and desktop viewer); `cargo test` runs two calls back to back with it (`voice::tests`). Real capture can be checked by hand: run the agent without it, play a sound and run `media_probe`, which prints the decoded level every second.
 
 ### Synthetic recordings
 
@@ -54,7 +54,16 @@ The running app logs `request from another launch: Open("<id>")` and asks before
 
 To check that new migrations apply to a database in use: create a database, apply the migrations up to the previous release with `psql -f` (recording each name in `schema_migrations` as `migrations/<file>`), add some rows, then start the new server against it and check `schema_migrations` and the new columns.
 
+### Chat, voice calls and switch sides by hand
+
+Automated: protocol and browser (above), unit tests for the grant rules (`server/internal/hub/switch_test.go`), the one-time secret (`switch::tests`) and the messages (`proto::tests`). By hand, with two Macs (or a Mac and a Windows PC) running the desktop app, both signed in:
+
+1. Connect from A to B. Chat both ways: unread counts on B's connection-manager tab and on A's chat button, a notification on B (macOS).
+2. Call from A's toolbar; B answers in the connection manager (and macOS asks B for the microphone the first time). Talk, mute either side, hang up from either side; let a call ring 30 s to see it declined.
+3. A: การทำงาน → สลับฝั่ง → confirm. B: ควบคุม in the connection manager. A's window closes and B now controls A without a password; A's connection manager shows B. Decline once to see "ปลายทางปฏิเสธการสลับฝั่ง" on A.
+
 ## Not covered on a Mac
 
 - AV1 from a live session (needs a Windows machine with a hardware AV1 encoder; rav1d decoding in the app is covered by `cargo test`)
 - Windows audio capture (WASAPI loopback), Media Foundation encoders
+- Voice calls with a real microphone (the automated tests use the test tone and Chrome's fake microphone) and switch sides between two desktop apps (needs two machines: see above)
