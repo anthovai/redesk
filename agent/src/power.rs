@@ -2,7 +2,8 @@
 //!
 //! macOS: IOPMAssertion (PreventUserIdleDisplaySleep). Windows: a power request, which unlike
 //! SetThreadExecutionState is not tied to the calling thread (sessions run on tokio workers).
-//! Elsewhere it does nothing.
+//! Linux: a systemd-logind "sleep" inhibitor and the desktop's org.freedesktop.ScreenSaver
+//! inhibition (screen blanking), whichever is available. Elsewhere it does nothing.
 
 /// Held for the lifetime of a session; dropping it lets the machine sleep again.
 pub struct KeepAwake {
@@ -143,7 +144,49 @@ mod imp {
     }
 }
 
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(target_os = "linux")]
+mod imp {
+    use std::os::fd::OwnedFd;
+    use zbus::blocking::{Connection, Proxy};
+
+    pub struct Inhibit {
+        /// logind closes the inhibitor when this descriptor is closed.
+        _sleep: Option<OwnedFd>,
+        /// ScreenSaver cookie; also released if the connection closes.
+        screen: Option<(Connection, u32)>,
+    }
+    pub type Handle = Option<Inhibit>;
+
+    fn sleep(reason: &str) -> zbus::Result<OwnedFd> {
+        let conn = Connection::system()?;
+        let p = Proxy::new(&conn, "org.freedesktop.login1", "/org/freedesktop/login1", "org.freedesktop.login1.Manager")?;
+        let fd: zbus::zvariant::OwnedFd = p.call("Inhibit", &("sleep:idle", "Aegiron", reason, "block"))?;
+        Ok(fd.into())
+    }
+
+    fn screen(reason: &str) -> zbus::Result<(Connection, u32)> {
+        let conn = Connection::session()?;
+        let p = Proxy::new(&conn, "org.freedesktop.ScreenSaver", "/org/freedesktop/ScreenSaver", "org.freedesktop.ScreenSaver")?;
+        let cookie: u32 = p.call("Inhibit", &("Aegiron", reason))?;
+        Ok((conn, cookie))
+    }
+
+    pub fn acquire(reason: &str) -> Handle {
+        let s = sleep(reason).map_err(|e| tracing::debug!("logind inhibit: {e}")).ok();
+        let d = screen(reason).map_err(|e| tracing::debug!("screensaver inhibit: {e}")).ok();
+        (s.is_some() || d.is_some()).then_some(Inhibit { _sleep: s, screen: d })
+    }
+
+    pub fn release(h: &mut Handle) {
+        if let Some((conn, cookie)) = h.take().and_then(|i| i.screen) {
+            if let Ok(p) = Proxy::new(&conn, "org.freedesktop.ScreenSaver", "/org/freedesktop/ScreenSaver", "org.freedesktop.ScreenSaver") {
+                let _ = p.call_method("UnInhibit", &(cookie,));
+            }
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
 mod imp {
     pub type Handle = Option<()>;
     pub fn acquire(_: &str) -> Handle {
@@ -163,10 +206,12 @@ mod tests {
     #[test]
     fn guard_is_send_and_releases() {
         assert_send::<KeepAwake>(); // held across .await in session tasks
+        // Linux test machines (containers, CI) often have neither logind nor a desktop session.
+        let required = !cfg!(target_os = "linux");
         let g = KeepAwake::new("Aegiron test");
-        assert!(g.active());
+        assert!(g.active() || !required);
         drop(g);
         let g2 = KeepAwake::new("Aegiron test 2");
-        assert!(g2.active());
+        assert!(g2.active() || !required);
     }
 }

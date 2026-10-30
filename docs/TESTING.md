@@ -8,6 +8,8 @@ make test     # go vet + go test, cargo test, svelte-check and bun test (web/src
 
 Windows code is at least compiled from a Mac: `cd agent && cargo check --target x86_64-pc-windows-gnu --all-targets`.
 
+Linux (x86_64 and aarch64, Ubuntu 24.04) runs in CI and locally in the container of `deploy/linux/Dockerfile`: `deploy/linux/test-x11.sh` starts Xvfb and a PulseAudio null sink and runs `cargo test` with the ignored tests: real X11 capture checked by color through JPEG and H.264 (`agent/tests/linux_x11.rs`), XTEST pointer moves read back, clipboard round trips with `xclip`, audio playback through cpal/ALSA heard by the monitor capture. `deploy/linux/smoke-test.sh` installs the built `.deb`/`.rpm`/`.tar.gz` in clean Ubuntu, Debian and Fedora containers. From a Mac: `docker build -t aegiron-linux-build deploy/linux` then run the script in it with the repository mounted (see `deploy/linux/README.md`). Wayland (the desktop portal) is not covered: there is no portal session in CI.
+
 ## End to end on one machine (`make e2e`)
 
 `scripts/e2e.sh` builds everything and runs the real programs against each other on this machine, isolated from anything already installed:

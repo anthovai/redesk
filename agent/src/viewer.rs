@@ -498,7 +498,7 @@ impl Viewer {
         if !ok {
             return Paste::Text;
         }
-        let files = arboard::Clipboard::new().and_then(|mut c| c.get().file_list()).unwrap_or_default();
+        let files = crate::clipboard::with(|c| c.get().file_list()).unwrap_or_default();
         if files.is_empty() {
             return Paste::Text;
         }
@@ -817,6 +817,10 @@ fn control(v: &Viewer, m: &Value) -> Option<Value> {
             (false, "locked") => st.error = Some(format!("ล็อกชั่วคราว ลองใหม่ใน {} วินาที", m["retry_after"].as_u64().unwrap_or(60))),
             (false, "denied") => st.error = Some("ผู้ใช้ที่เครื่องปลายทางปฏิเสธการเชื่อมต่อ".into()),
             (false, "recording_failed") => st.error = Some("องค์กรกำหนดให้บันทึกเซสชันนี้ แต่เครื่องปลายทางเริ่มบันทึกไม่ได้".into()),
+            // Linux Wayland: no desktop portal, or the local user did not share the screen.
+            (false, "screen_unavailable") => {
+                st.error = Some(format!("เครื่องปลายทางแชร์หน้าจอไม่ได้: {}", m["message"].as_str().unwrap_or("ไม่ทราบสาเหตุ")))
+            }
             _ => {}
         },
         "info" => {
@@ -1388,7 +1392,7 @@ impl Link {
             return;
         }
         let list = local.clone();
-        let set = tokio::task::spawn_blocking(move || arboard::Clipboard::new().and_then(|mut c| c.set().file_list(&list))).await;
+        let set = tokio::task::spawn_blocking(move || crate::clipboard::with(|c| c.set().file_list(&list))).await;
         match set {
             Ok(Ok(())) => {
                 // Pasting these back into the remote window must not upload them again.

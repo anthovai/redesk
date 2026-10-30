@@ -1,0 +1,21 @@
+# Headless agent (no window) as a per-user service, for machines without the desktop app
+# running, e.g. kiosks. Installed by the packages but not enabled:
+#
+#   aegiron-agent init --server https://aegiron.example.com --key <SERVER_PUBLIC_KEY>
+#   systemctl --user enable --now aegiron-agent.service
+#
+# `aegiron-agent install` writes an equivalent unit to ~/.config/systemd/user instead.
+# The desktop app starts from ~/.config/autostart/aegiron.desktop ("start at login" in its
+# settings); do not run both for the same user.
+[Unit]
+Description=Aegiron remote desktop agent
+After=graphical-session.target network-online.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/aegiron-agent run
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

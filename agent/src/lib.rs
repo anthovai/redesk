@@ -3,6 +3,7 @@
 pub mod account;
 pub mod audio;
 pub mod capture;
+pub mod clipboard;
 pub mod codec;
 pub mod config;
 pub mod crypto;
@@ -15,6 +16,8 @@ pub mod local;
 pub mod net;
 pub mod permissions;
 pub mod power;
+#[cfg(target_os = "linux")]
+pub mod portal;
 pub mod proto;
 pub mod recording;
 pub mod service;

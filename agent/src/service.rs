@@ -1,4 +1,7 @@
-//! Run the agent at login as a per-user service (no root): launchd on macOS, systemd --user on Linux.
+//! Run the agent at login as a per-user service (no root): launchd on macOS, the Run key on
+//! Windows. Linux: the desktop app (`aegiron`) starts from an XDG autostart entry when the
+//! desktop session starts (it needs the session's display, D-Bus and tray); the CLI agent
+//! (`aegiron-agent install`) runs as a systemd --user service.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -38,6 +41,48 @@ fn plist_path() -> Result<PathBuf> {
 
 fn unit_path() -> Result<PathBuf> {
     Ok(dirs::config_dir().context("no config dir")?.join("systemd/user/aegiron-agent.service"))
+}
+
+/// XDG autostart entry of the desktop app (~/.config/autostart/aegiron.desktop).
+fn autostart_path() -> Result<PathBuf> {
+    Ok(dirs::config_dir().context("no config dir")?.join("autostart/aegiron.desktop"))
+}
+
+/// Quotes an argument for a .desktop file's Exec key (Desktop Entry Specification).
+fn desktop_quote(arg: &str) -> String {
+    if !arg.is_empty() && arg.chars().all(|c| c.is_ascii_alphanumeric() || "/._-+=:,@".contains(c)) {
+        return arg.to_string();
+    }
+    let mut q = String::from("\"");
+    for c in arg.chars() {
+        if matches!(c, '"' | '`' | '$' | '\\') {
+            q.push('\\');
+        }
+        q.push(c);
+    }
+    q.push('"');
+    // The value of a key is itself unescaped once, so backslashes are doubled again.
+    q.replace('\\', "\\\\")
+}
+
+/// Autostart entry that starts the desktop app hidden in the tray (or with its window when
+/// there is no tray); `--config` only for a profile other than the default.
+fn autostart_entry(gui: &Path, config: Option<&Path>) -> String {
+    let mut exec = vec![desktop_quote(&gui.display().to_string())];
+    if let Some(c) = config {
+        exec.push("--config".into());
+        exec.push(desktop_quote(&c.display().to_string()));
+    }
+    exec.push("--background".into());
+    format!(
+        "[Desktop Entry]\nType=Application\nName=Aegiron\nComment=Remote desktop agent\nExec={}\nIcon=aegiron\nTerminal=false\nX-GNOME-Autostart-enabled=true\nX-KDE-autostart-after=panel\n",
+        exec.join(" ")
+    )
+}
+
+/// The desktop app when this binary is it.
+fn running_gui(exe: &Path) -> bool {
+    exe.file_stem().is_some_and(|n| n == "aegiron")
 }
 
 pub fn log_path() -> Result<PathBuf> {
@@ -101,7 +146,7 @@ pub fn is_installed() -> bool {
     if cfg!(target_os = "macos") {
         plist_path().is_ok_and(|p| p.exists())
     } else if cfg!(target_os = "linux") {
-        unit_path().is_ok_and(|p| p.exists())
+        unit_path().is_ok_and(|p| p.exists()) || autostart_path().is_ok_and(|p| p.exists())
     } else if cfg!(windows) {
         run("reg", &["query", WIN_RUN_KEY, "/v", "Aegiron"]).is_ok()
     } else {
@@ -168,6 +213,12 @@ pub fn install(config: &Path) -> Result<()> {
         let _ = run("launchctl", &["bootout", &format!("{domain}/{LABEL}")]);
         run("launchctl", &["bootstrap", &domain, &plist.display().to_string()])?;
         println!("Installed LaunchAgent {}", plist.display());
+    } else if cfg!(target_os = "linux") && running_gui(&exe) {
+        let entry = autostart_path()?;
+        std::fs::create_dir_all(entry.parent().unwrap())?;
+        let own = (Some(config.clone()) != crate::config::Config::default_path().canonicalize().ok()).then_some(config.as_path());
+        std::fs::write(&entry, autostart_entry(&exe, own))?;
+        println!("Installed autostart entry {}", entry.display());
     } else if cfg!(target_os = "linux") {
         let unit = unit_path()?;
         std::fs::create_dir_all(unit.parent().unwrap())?;
@@ -208,12 +259,16 @@ pub fn uninstall() -> Result<()> {
             std::fs::remove_file(&p)?;
         }
     } else if cfg!(target_os = "linux") {
-        let _ = run("systemctl", &["--user", "disable", "--now", "aegiron-agent.service"]);
         let p = unit_path()?;
         if p.exists() {
+            let _ = run("systemctl", &["--user", "disable", "--now", "aegiron-agent.service"]);
             std::fs::remove_file(&p)?;
+            let _ = run("systemctl", &["--user", "daemon-reload"]);
         }
-        let _ = run("systemctl", &["--user", "daemon-reload"]);
+        let a = autostart_path()?;
+        if a.exists() {
+            std::fs::remove_file(&a)?;
+        }
     } else if cfg!(windows) {
         let _ = run("reg", &["delete", WIN_RUN_KEY, "/v", "Aegiron", "/f"]);
     } else {
@@ -231,11 +286,17 @@ pub fn status() -> Result<()> {
             Err(_) => "not installed".into(),
         }
     } else if cfg!(target_os = "linux") {
-        Command::new("systemctl")
-            .args(["--user", "is-active", "aegiron-agent.service"])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_else(|_| "unknown".into())
+        if unit_path().is_ok_and(|p| p.exists()) {
+            Command::new("systemctl")
+                .args(["--user", "is-active", "aegiron-agent.service"])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_else(|_| "unknown".into())
+        } else if autostart_path().is_ok_and(|p| p.exists()) {
+            "desktop app starts at login".into()
+        } else {
+            "not installed".into()
+        }
     } else if cfg!(windows) {
         if is_installed() { "starts at logon".into() } else { "not installed".into() }
     } else {
@@ -249,6 +310,14 @@ pub fn status() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn autostart_entry_quotes_exec() {
+        let e = autostart_entry(Path::new("/opt/Aegiron App/aegiron"), Some(Path::new("/home/u/a$b.toml")));
+        assert!(e.contains("Exec=\"/opt/Aegiron App/aegiron\" --config \"/home/u/a\\\\$b.toml\" --background\n"), "{e}");
+        assert_eq!(autostart_entry(Path::new("/usr/bin/aegiron"), None).lines().find(|l| l.starts_with("Exec=")), Some("Exec=/usr/bin/aegiron --background"));
+        assert!(running_gui(Path::new("/usr/bin/aegiron")) && !running_gui(Path::new("/usr/bin/aegiron-agent")));
+    }
 
     #[test]
     fn plist_escapes_paths() {

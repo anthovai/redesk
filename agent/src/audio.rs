@@ -1,5 +1,5 @@
 //! Remote audio: the agent captures what the machine is playing (macOS ScreenCaptureKit,
-//! Windows WASAPI loopback), encodes it as Opus (48 kHz stereo, 20 ms frames) and sends it as
+//! Windows WASAPI loopback, Linux PulseAudio/PipeWire monitor source), encodes it as Opus (48 kHz stereo, 20 ms frames) and sends it as
 //! `0x05` packets; viewers decode and play it.
 //!
 //! Opus comes from `unsafe-libopus` (libopus transpiled to Rust), so no C toolchain or cmake
@@ -302,7 +302,7 @@ pub fn stream(out: mpsc::Sender<Vec<u8>>, on: Arc<AtomicBool>, stop: Arc<AtomicB
 
 /// Whether this build can play audio (the viewer only asks for audio if so).
 pub fn playback_supported() -> bool {
-    cfg!(any(windows, target_os = "macos"))
+    cfg!(any(windows, target_os = "macos", target_os = "linux"))
 }
 
 /// Jitter buffer shared between the network task and the audio device callback.
@@ -363,7 +363,7 @@ impl Drop for Player {
     }
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 fn play_thread(ring: Arc<Mutex<Ring>>, stop: Arc<AtomicBool>, ready: std::sync::mpsc::Sender<Result<()>>) {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     let res = (|| -> Result<cpal::Stream> {
@@ -449,7 +449,7 @@ fn play_thread(ring: Arc<Mutex<Ring>>, stop: Arc<AtomicBool>, ready: std::sync::
     }
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 fn play_thread(_ring: Arc<Mutex<Ring>>, _stop: Arc<AtomicBool>, ready: std::sync::mpsc::Sender<Result<()>>) {
     let _ = ready.send(Err(anyhow!("audio playback is not supported on this platform")));
 }
@@ -532,7 +532,11 @@ mod imp {
     }
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(target_os = "linux")]
+#[path = "audio_linux.rs"]
+mod imp;
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 mod imp {
     use super::*;
 
@@ -613,7 +617,7 @@ mod tests {
     /// by CI after installing a virtual audio device) makes a missing device a failure.
     /// The returned guard keeps the device tests from running at the same time: each would hear
     /// the other's tone.
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn have_output() -> Option<std::sync::MutexGuard<'static, ()>> {
         use cpal::traits::HostTrait;
         static DEVICE: Mutex<()> = Mutex::new(());
@@ -627,7 +631,7 @@ mod tests {
     }
 
     /// Records the loudest block captured from system audio.
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn capture_peak(peak: Arc<Mutex<(f32, usize)>>) -> imp::Capture {
         let sink: PcmSink = Box::new(move |d, _, _| {
             let mut p = peak.lock().unwrap();
@@ -637,11 +641,11 @@ mod tests {
         // macOS: include this process's own audio, which the agent normally leaves out.
         #[cfg(target_os = "macos")]
         return imp::start_with(sink, false).unwrap();
-        #[cfg(windows)]
+        #[cfg(not(target_os = "macos"))]
         return imp::start(sink).unwrap();
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn play_tone(secs: usize) {
         let player = Player::new().unwrap();
         for chunk in tone(SAMPLE_RATE as usize * secs, SAMPLE_RATE, 660.0).chunks(FRAME * CHANNELS) {
@@ -652,9 +656,9 @@ mod tests {
     }
 
     /// Manual check on a machine with Screen Recording permission (macOS) or an audio output
-    /// (Windows; CI installs a virtual one): `cargo test --lib audio -- --ignored`. Plays a
+    /// (Windows and Linux; CI installs a virtual one or runs PulseAudio with a null sink): `cargo test --lib audio -- --ignored`. Plays a
     /// sound and expects the capture to hear it.
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     #[test]
     #[ignore]
     fn capture_hears_system_audio() {
@@ -668,7 +672,8 @@ mod tests {
             }
         } else {
             // WASAPI loopback delivers nothing while nothing plays, and Windows has no
-            // command-line player: play a tone through cpal's output path instead.
+            // command-line player: play a tone through cpal's output path instead (on Linux
+            // through ALSA, which the sound server's ALSA plugin routes to the default sink).
             play_tone(2);
         }
         drop(cap);
@@ -679,7 +684,7 @@ mod tests {
 
     /// Manual check: what the viewer's Player plays is heard by the system-audio capture,
     /// i.e. playback through cpal really reaches the output device.
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     #[test]
     #[ignore]
     fn player_output_is_heard() {

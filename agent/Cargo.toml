@@ -3,11 +3,12 @@ name = "aegiron-agent"
 default-run = "aegiron-agent"
 version = "0.5.0"
 edition = "2024"
+description = "Aegiron remote desktop: desktop app and agent"
 
 [dependencies]
 aes-gcm = "0.10.3"
 anyhow = "1.0.104"
-arboard = "3.7.0"
+arboard = { version = "3.7.0", features = ["wayland-data-control"] }
 argon2 = "0.5"
 base64 = "0.22"
 clap = { version = "4.6.7", features = ["derive"] }
@@ -46,11 +47,21 @@ x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
 xcap = "0.9.8"
 unsafe-libopus = "0.2"
 
-# Tray icon on Windows and macOS (Linux would need GTK).
-# Audio playback (and WASAPI loopback capture on Windows) through cpal; on Linux it would need ALSA headers.
+# Audio playback (and WASAPI loopback capture on Windows) through cpal: ALSA on Linux.
+[target.'cfg(any(windows, target_os = "macos", target_os = "linux"))'.dependencies]
+cpal = "0.18"
+
+# Tray icon on Windows and macOS.
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]
 tray-icon = "0.26.1"
-cpal = "0.18"
+
+# Linux: tray icon as a StatusNotifierItem over D-Bus (KDE, most desktops; GNOME with the
+# AppIndicator extension), no GTK. Wayland capture and input through the XDG desktop portal
+# (zbus) with PipeWire video streams: both already come with xcap.
+[target.'cfg(target_os = "linux")'.dependencies]
+tray-icon = { version = "0.26.1", default-features = false, features = ["ksni"], optional = true }
+zbus = "5.17"
+pipewire = "0.10"
 
 # ScreenCaptureKit audio, the VideoToolbox encoder (called through the ObjC runtime / C ABI)
 # and aegiron:// links as Apple Events (kAEGetURL) while the app runs.
@@ -72,6 +83,11 @@ rav1e = { version = "0.8", default-features = false, features = ["threading"] }
 [target.'cfg(target_arch = "aarch64")'.dev-dependencies]
 rav1e = { version = "0.8", default-features = false, features = ["threading", "asm"] }
 
+[features]
+default = ["tray"]
+# Tray icon on Linux (always built on Windows and macOS).
+tray = ["dep:tray-icon"]
+
 [[bin]]
 name = "aegiron-agent"
 path = "src/main.rs"
@@ -80,6 +96,68 @@ path = "src/main.rs"
 [[bin]]
 name = "aegiron"
 path = "src/bin/aegiron.rs"
+
+# Linux packages (deploy/linux/build-packages.sh): cargo deb / cargo generate-rpm.
+[package.metadata.deb]
+name = "aegiron"
+maintainer = "Aegiron <aegiron@localhost>"
+copyright = "Aegiron"
+section = "net"
+priority = "optional"
+extended-description = """\
+Desktop app (aegiron) and command-line agent (aegiron-agent) for Aegiron, a self-hosted \
+remote desktop: control this computer from the Aegiron app or a browser, and control others. \
+Works on X11 and on Wayland through the XDG desktop portal (PipeWire)."""
+# $auto: shared libraries found by dpkg-shlibdeps (PipeWire, ALSA, XCB, GBM, ...). The window
+# libraries are loaded with dlopen by winit/glutin, so dpkg cannot see them: listed by hand.
+depends = "$auto, xdg-utils, libxkbcommon0, libxkbcommon-x11-0, libx11-6, libx11-xcb1, libxcursor1, libxi6, libxrandr2, libwayland-client0, libwayland-cursor0, libwayland-egl1, libegl1, libgl1"
+# PulseAudio's client library is loaded at run time (system audio); the portal is needed on
+# Wayland; zenity/kdialog ask the local user when only the CLI agent runs.
+recommends = "libpulse0, xdg-desktop-portal, pipewire, zenity | kdialog"
+assets = [
+    ["target/release/aegiron", "usr/bin/", "755"],
+    ["target/release/aegiron-agent", "usr/bin/", "755"],
+    ["../deploy/linux/aegiron.desktop", "usr/share/applications/", "644"],
+    ["assets/aegiron.png", "usr/share/icons/hicolor/256x256/apps/aegiron.png", "644"],
+    ["../deploy/linux/aegiron-agent.service", "usr/lib/systemd/user/", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "aegiron"
+license = "Proprietary"
+summary = "Aegiron remote desktop: desktop app and agent"
+url = "https://github.com/anthovai/redesk"
+assets = [
+    { source = "target/release/aegiron", dest = "/usr/bin/aegiron", mode = "755" },
+    { source = "target/release/aegiron-agent", dest = "/usr/bin/aegiron-agent", mode = "755" },
+    { source = "../deploy/linux/aegiron.desktop", dest = "/usr/share/applications/aegiron.desktop", mode = "644" },
+    { source = "assets/aegiron.png", dest = "/usr/share/icons/hicolor/256x256/apps/aegiron.png", mode = "644" },
+    { source = "../deploy/linux/aegiron-agent.service", dest = "/usr/lib/systemd/user/aegiron-agent.service", mode = "644" },
+]
+# Refresh the URL handler (aegiron://) and icon caches; ignored where the tools are missing.
+post_install_script = "update-desktop-database -q /usr/share/applications >/dev/null 2>&1 || :; gtk-update-icon-cache -q /usr/share/icons/hicolor >/dev/null 2>&1 || :"
+post_uninstall_script = "update-desktop-database -q /usr/share/applications >/dev/null 2>&1 || :"
+
+[package.metadata.generate-rpm.requires]
+xdg-utils = "*"
+# Loaded with dlopen by winit/glutin (not found by the automatic requirements).
+libxkbcommon = "*"
+libxkbcommon-x11 = "*"
+libX11 = "*"
+libX11-xcb = "*"
+libXcursor = "*"
+libXi = "*"
+libXrandr = "*"
+libwayland-client = "*"
+libwayland-cursor = "*"
+libwayland-egl = "*"
+libglvnd-egl = "*"
+libglvnd-glx = "*"
+
+[package.metadata.generate-rpm.recommends]
+"pulseaudio-libs" = "*"
+"xdg-desktop-portal" = "*"
+"pipewire" = "*"
 
 [profile.release]
 lto = "thin"

@@ -57,10 +57,14 @@ Byte 0 is the type: `0x01` JSON, `0x02` video rectangle (`x, y, frame_w, frame_h
 
 | Direction | Message |
 |---|---|
-| agent→viewer | `auth_required {password, click}`, `auth_pending`, `auth_result {ok, reason?, attempts_left?, retry_after?}`, `info {hostname, os, displays[], input, clipboard, files, codec, codecs?[], features?, encoder?, audio?, audio_codec?}`, `encoder {encoder,codec}`, `cursor {x,y,visible}`, `clip {s}` |
+| agent→viewer | `auth_required {password, click}`, `auth_pending`, `auth_result {ok, reason?, attempts_left?, retry_after?, message?}`, `info {hostname, os, displays[], input, clipboard, files, codec, codecs?[], features?, encoder?, audio?, audio_codec?}`, `encoder {encoder,codec}`, `cursor {x,y,visible}`, `clip {s}` |
 | viewer→agent | `auth {password, codecs[], features?[], audio?[]}`, `audio {on}`, `mm {x,y}`, `mb {b,down,x,y}`, `wh {dx,dy}`, `key {code,key,down}`, `text {s}`, `clip {s}`, `cfg {fps,quality,max_width,display,codec?}`, `refresh` (alias `keyframe`), `bye` |
 | files viewer→agent | `ls {path}` (`""` = home), `put {id,dir,name,size}` followed by `0x03` chunks and then `put_end {id}`, `get {id,path}`, `cancel {id}` |
 | files agent→viewer | `ls {path,parent,sep,entries[{name,dir,size,mtime}]}`, `put_ok {id,path}`, `put_done {id,path}`, `get_start {id,name,size}` followed by `0x03` chunks and then `get_end {id}`, `fs_error {op,id?,message}` |
+
+`auth_result.reason` when `ok` is false: `wrong_password`, `locked`, `denied`, `recording_failed`, or `screen_unavailable` with a human-readable `message`: a Linux agent in a Wayland session could not get the screen from the XDG desktop portal (no portal or ScreenCast backend, the local user declined the sharing dialog, or nobody answered it within 2 minutes). Viewers show the message; older viewers just see the session end.
+
+On Linux under Wayland the agent captures the screen and injects input through the XDG desktop portal (`ScreenCast` + `RemoteDesktop`, PipeWire video). The portal asks the local user after authentication (or not at all when a restore token from an earlier approval is still valid). `info.displays` then lists the shared monitors in the compositor's logical coordinates, the pointer is drawn into the video (no `cursor` messages), and `info.input` is false when the portal has no `RemoteDesktop` (wlroots), so the session is view-only. Keys are sent as X11 keysyms, buttons as evdev codes, the wheel as discrete axis steps.
 
 ### Video codecs
 
@@ -102,12 +106,12 @@ rav1d decodes without assembly (the x86 code needs nasm and the published crate 
 Byte `0x05`: audio packet: codec u8 (`1` = Opus, 48 kHz, stereo), sequence u32 BE (+1 per 20 ms frame), then one Opus packet (20 ms, about 96 kbit/s).
 
 - The viewer lists the audio codecs it can play in `auth.audio` (`["opus"]`). If the list is missing or does not include `opus`, the agent never sends `0x05`, so older viewers are unaffected.
-- `info.audio` (bool) says whether this session streams audio, and `info.audio_codec` names the codec (`"opus"` or `null`). It is true only when the viewer asked for audio, the device allows it (`allow_audio`, "อนุญาตเสียง" in the app), and the platform can capture: macOS 13+ (ScreenCaptureKit, using the Screen Recording permission, without the agent's own sound) or Windows (WASAPI loopback of the default output device). Linux sends no audio.
+- `info.audio` (bool) says whether this session streams audio, and `info.audio_codec` names the codec (`"opus"` or `null`). It is true only when the viewer asked for audio, the device allows it (`allow_audio`, "อนุญาตเสียง" in the app), and the platform can capture: macOS 13+ (ScreenCaptureKit, using the Screen Recording permission, without the agent's own sound) Windows (WASAPI loopback of the default output device) or Linux (the default output's monitor source through PulseAudio's simple API, also served by PipeWire; libpulse-simple is loaded at run time, so machines without it just have no audio).
 - Mute: viewer→agent `{"t":"audio","on":false}` stops `0x05` packets, and `on:true` resumes them. Older agents ignore it.
 - Audio has its own queue of about 320 ms on the agent. Packets are dropped rather than delayed when the link is congested, so a sequence gap means dropped audio. Viewers play through a jitter buffer of about 80 ms: the browser uses WebCodecs `AudioDecoder` and Web Audio, and the native app uses Opus and the default output device.
 - Tests: `AEGIRON_TEST_AUDIO=tone` in the agent's environment replaces capture with a generated tone (never set by the app or installers; see [TESTING.md](TESTING.md)).
 
-Screen captures do not include the pointer, so the agent sends `cursor` (normalised to the streamed display, `visible=false` when it is on another display) whenever the pointer moves. Viewers draw it while their own pointer is not over the remote screen.
+Screen captures do not include the pointer (except Wayland portal streams, which draw it into the video), so the agent sends `cursor` (normalised to the streamed display, `visible=false` when it is on another display) whenever the pointer moves. Viewers draw it while their own pointer is not over the remote screen.
 
 Uploads keep only the file name (any path the viewer sends is dropped), never overwrite an existing file (`name (1).ext`), must match the announced size, and are deleted if the session ends before `put_end`. Downloads are read on a separate task and share the session's back-pressured outbound queue with video.
 
@@ -134,7 +138,7 @@ Needs both the `clipboard` and `files` permissions. The viewer opts in with `aut
 
 | Direction | Message |
 |---|---|
-| agent→viewer | `clip_files {files[{name,path,dir,size}]}`: files/folders were copied on the agent (macOS `NSPasteboard` file URLs, Windows `CF_HDROP`) |
+| agent→viewer | `clip_files {files[{name,path,dir,size}]}`: files/folders were copied on the agent (macOS `NSPasteboard` file URLs, Windows `CF_HDROP`, Linux `text/uri-list`) |
 | viewer→agent | `clip_files {id,paths[]}`: put these agent paths on the agent's clipboard as files → `fs_ok {op:"clip_files",id}` |
 
 - **Viewer → agent (paste):** when ⌘V/Ctrl+V is pressed in the remote window and this machine's clipboard holds files, the app uploads them (folders included) to `~/Downloads/Aegiron` on the agent, puts the uploaded paths on the agent's clipboard with `clip_files`, then presses paste on the remote side, so pasting into Finder/Explorer copies them there. The files also stay in `Downloads/Aegiron` (the app says so), which is the fallback when the focused remote app does not accept files. Pressing paste again without copying anything new only presses paste remotely.
@@ -274,5 +278,5 @@ The agent checks it during the HTTP upgrade, before any WebSocket frame: the sid
 ## 10. `aegiron://` links and the single app instance
 
 - Links: `aegiron://connect/<id>` or `aegiron://<id>` (also `redesk://`), where `<id>` is 9 digits (spaces or `%20` allowed). Nothing else is accepted: no query string, no extra path, no password. The app always asks before connecting.
-- macOS delivers links as a `kAEGetURL` Apple Event, at launch and while the app runs. The app handles it with `NSAppleEventManager` (installed before the event loop starts and again after launch). Windows passes the link as the first argument.
+- macOS delivers links as a `kAEGetURL` Apple Event, at launch and while the app runs. The app handles it with `NSAppleEventManager` (installed before the event loop starts and again after launch). Windows passes the link as the first argument, Linux as `%u` from `aegiron.desktop` (`MimeType=x-scheme-handler/aegiron;x-scheme-handler/redesk;`).
 - One app instance per user and config file. The first instance holds an exclusive lock on `instance.lock` next to `agent.toml` and listens on a Unix socket `instance.sock` there (folder 0700, socket 0600) or, on Windows, on the named pipe `\\.\pipe\aegiron-<first 8 bytes of SHA-256(config path), hex>` (remote clients rejected; other users cannot write to it). A second launch sends one message, `aegiron-show` or `aegiron-open <9-digit id>` (at most 64 bytes, parsed strictly), and exits.
