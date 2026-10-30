@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
-	import { api, wakeDevice, type AddressEntry, type Device } from '#lib/api.js';
+	import { api, cleanDeviceId, validDeviceId, wakeDevice, type AddressEntry, type Device } from '#lib/api.js';
 	import { ago, formatId } from '#lib/format.js';
 	import Icon from '#lib/Icon.svelte';
 	import PeerCard, { type PeerAction } from '#lib/PeerCard.svelte';
@@ -39,7 +39,7 @@
 		return () => clearInterval(t);
 	});
 
-	const cleanId = (s: string) => s.replace(/\D/g, '');
+	const cleanId = cleanDeviceId;
 	const shown = $derived(
 		entries.filter((e) => {
 			const q = filter.trim().toLowerCase();
@@ -51,7 +51,7 @@
 	function quickConnect(e: SubmitEvent) {
 		e.preventDefault();
 		const id = cleanId(connectId);
-		if (id.length === 9) goto(`/connect/${id}`);
+		if (validDeviceId(id)) goto(`/connect/${id}`);
 	}
 
 	async function save() {
@@ -122,17 +122,16 @@
 	<div class="grid gap-6 p-6 md:grid-cols-[1fr_auto] md:items-end md:p-8">
 		<div>
 			<h1 class="text-2xl font-semibold tracking-tight">เชื่อมต่อเครื่องปลายทาง</h1>
-			<p class="mt-1 text-sm text-muted">ใส่ ID 9 หลักที่แสดงในโปรแกรม Aegiron agent ของเครื่องที่ต้องการควบคุม</p>
+			<p class="mt-1 text-sm text-muted">ใส่ ID ที่แสดงในโปรแกรม Aegiron ของเครื่องที่ต้องการควบคุม (ตัวเลข 9 หลัก หรือ ID ที่ผู้ดูแลตั้งให้)</p>
 		</div>
 		<form class="flex w-full gap-2 md:w-[26rem]" onsubmit={quickConnect}>
 			<input
 				class="input mono text-lg tracking-wider"
 				placeholder="123 456 789"
-				inputmode="numeric"
 				aria-label="Device ID"
 				bind:value={connectId}
 			/>
-			<button class="btn btn-primary shrink-0 px-5" disabled={cleanId(connectId).length !== 9}>
+			<button class="btn btn-primary shrink-0 px-5" disabled={!validDeviceId(cleanId(connectId))}>
 				เชื่อมต่อ <Icon name="link" />
 			</button>
 		</form>
@@ -299,7 +298,7 @@
 			<h3 class="text-lg font-semibold">{editing.isNew ? 'เพิ่มเครื่อง' : 'แก้ไขเครื่อง'}</h3>
 			<div>
 				<label class="label" for="ab-id">Device ID</label>
-				<input id="ab-id" class="input mono" inputmode="numeric" disabled={!editing.isNew} required bind:value={editing.id} />
+				<input id="ab-id" class="input mono" disabled={!editing.isNew} required bind:value={editing.id} />
 			</div>
 			<div>
 				<label class="label" for="ab-alias">ชื่อเรียก</label>
@@ -312,7 +311,7 @@
 			<label class="flex items-center gap-2 text-sm"><input type="checkbox" bind:checked={editing.favorite} /> รายการโปรด</label>
 			<div class="flex justify-end gap-2 pt-2">
 				<button type="button" class="btn" onclick={() => (editing = null)}>ยกเลิก</button>
-				<button class="btn btn-primary" disabled={cleanId(editing.id).length !== 9}>บันทึก</button>
+				<button class="btn btn-primary" disabled={!validDeviceId(cleanId(editing.id))}>บันทึก</button>
 			</div>
 		</form>
 	</div>

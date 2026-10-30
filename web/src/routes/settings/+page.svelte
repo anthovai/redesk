@@ -3,6 +3,7 @@
 	import { ago } from '#lib/format.js';
 	import { bytes, dateTime, fingerprint } from '#lib/format.js';
 	import Icon from '#lib/Icon.svelte';
+	import LdapMailSettings from '#lib/LdapMailSettings.svelte';
 
 	let info = $state<ServerInfo | null>(null);
 	let fp = $state('');
@@ -399,6 +400,8 @@
 		</form>
 		{#if oidcMsg}<p class="text-sm {oidcMsg[1] ? 'text-ok' : 'text-danger'}">{oidcMsg[0]}</p>{/if}
 	</section>
+
+	<LdapMailSettings />
 
 	<section class="card space-y-4 p-6 lg:col-span-2">
 		<div>

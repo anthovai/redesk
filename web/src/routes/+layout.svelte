@@ -10,9 +10,11 @@
 
 	const nav: { href: string; label: string; icon: IconName; admin?: boolean }[] = [
 		{ href: '/', label: 'สมุดที่อยู่', icon: 'book' },
+		{ href: '/address-books', label: 'สมุดที่อยู่ที่แชร์', icon: 'users' },
 		{ href: '/connections', label: 'การเชื่อมต่อ', icon: 'link' },
 		{ href: '/devices', label: 'อุปกรณ์ทั้งหมด', icon: 'monitor', admin: true },
 		{ href: '/groups', label: 'กลุ่มอุปกรณ์', icon: 'layers', admin: true },
+		{ href: '/strategies', label: 'นโยบายอุปกรณ์', icon: 'shield', admin: true },
 		{ href: '/sessions', label: 'เซสชัน', icon: 'activity', admin: true },
 		{ href: '/recordings', label: 'บันทึกเซสชัน', icon: 'video', admin: true },
 		{ href: '/audit', label: 'Audit log', icon: 'shield', admin: true },
