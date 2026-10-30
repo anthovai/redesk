@@ -74,6 +74,7 @@ fn inside(rects: &[[f32; 4]], x: f64, y: f64) -> bool {
 }
 
 /// A key press completes Ctrl+Alt+Shift+Esc.
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
 fn is_escape(ctrl: bool, alt: bool, shift: bool, esc: bool) -> bool {
     ctrl && alt && shift && esc
 }

@@ -5,8 +5,9 @@
 //! `--background` starts hidden in the tray (used by autostart). Launching it again while it
 //! runs just brings the existing window to the front, or hands it the `aegiron://` link
 //! (see `aegiron_agent::instance`: a per-user Unix socket or named pipe, not a TCP port).
-//! Windows passes links as "%1" (registered by the installer). macOS delivers them as a
-//! `kAEGetURL` Apple Event, both at launch and while the app runs (`aegiron_agent::url_event`).
+//! Windows passes links as "%1" (registered by the installer), Linux as `%u` from the
+//! `x-scheme-handler/aegiron` entry in aegiron.desktop. macOS delivers them as a `kAEGetURL`
+//! Apple Event, both at launch and while the app runs (`aegiron_agent::url_event`).
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::path::PathBuf;
@@ -101,7 +102,7 @@ fn main() -> eframe::Result {
     };
 
     let quit = Arc::new(AtomicBool::new(false));
-    let has_tray = cfg!(any(windows, target_os = "macos")) && screenshot.is_none();
+    let has_tray = screenshot.is_none() && tray::available();
     let opts = Options {
         config_path,
         show: show.clone(),
@@ -130,6 +131,8 @@ fn main() -> eframe::Result {
         let size = forced.unwrap_or(geom.map_or(MAIN_SIZE, |g| [g.size[0].max(MAIN_MIN[0]), g.size[1].max(MAIN_MIN[1])]));
         let mut viewport = egui::ViewportBuilder::default()
             .with_title("Aegiron")
+            // Wayland app id / X11 WM_CLASS: matches aegiron.desktop (icon, taskbar grouping).
+            .with_app_id("aegiron")
             .with_inner_size(size)
             .with_min_inner_size(MAIN_MIN)
             .with_icon(Arc::new(egui::IconData { rgba: ui::icon_rgba(64), width: 64, height: 64 }))
@@ -207,11 +210,32 @@ fn init_logging(dir: Option<PathBuf>) {
     }
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", all(target_os = "linux", feature = "tray")))]
 mod tray {
     use super::*;
     use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
     use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+
+    /// Whether a tray icon will be visible. Linux: only if a StatusNotifierItem host runs (KDE,
+    /// Xfce, Cinnamon, Budgie, GNOME with the AppIndicator extension...). Without one the window
+    /// must not hide into a tray nobody can see, so closing it quits and `--background` shows it.
+    pub fn available() -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            let host = (|| {
+                let conn = zbus::blocking::Connection::session().ok()?;
+                let dbus = zbus::blocking::fdo::DBusProxy::new(&conn).ok()?;
+                dbus.name_has_owner("org.kde.StatusNotifierWatcher".try_into().ok()?).ok()
+            })()
+            .unwrap_or(false);
+            if !host {
+                tracing::info!("no system tray (StatusNotifierWatcher) on this desktop; running without a tray icon");
+            }
+            host
+        }
+        #[cfg(not(target_os = "linux"))]
+        true
+    }
 
     pub fn create(ctx: &egui::Context, show: ShowSignal, quit: Arc<AtomicBool>) {
         let open = MenuItem::new("เปิด Aegiron", true, None);
@@ -253,8 +277,11 @@ mod tray {
     }
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(any(windows, target_os = "macos", all(target_os = "linux", feature = "tray"))))]
 mod tray {
     use super::*;
+    pub fn available() -> bool {
+        false
+    }
     pub fn create(_: &egui::Context, _: ShowSignal, _: Arc<AtomicBool>) {}
 }

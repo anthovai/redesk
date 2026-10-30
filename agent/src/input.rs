@@ -24,6 +24,12 @@ pub enum Event {
 /// Spawns the input thread. Dropping the sender ends it, and dropping Enigo releases held keys.
 pub fn spawn(geometry: Geometry) -> mpsc::Sender<Event> {
     let (tx, rx) = mpsc::channel::<Event>();
+    // Wayland: events go to the desktop portal's RemoteDesktop session.
+    #[cfg(target_os = "linux")]
+    if let Some(portal) = crate::portal::current().filter(|p| p.has_input()) {
+        std::thread::spawn(move || portal_loop(rx, &portal, geometry));
+        return tx;
+    }
     std::thread::spawn(move || {
         let mut enigo = match Enigo::new(&Settings { open_prompt_to_get_permissions: true, ..Default::default() }) {
             Ok(e) => e,
@@ -100,6 +106,82 @@ pub fn spawn(geometry: Geometry) -> mpsc::Sender<Event> {
         }
     });
     tx
+}
+
+/// The same events as the enigo loop above, injected through the portal as evdev buttons and
+/// key codes and X11 keysyms (the compositor maps keysyms to its keymap).
+#[cfg(target_os = "linux")]
+fn portal_loop(rx: mpsc::Receiver<Event>, portal: &crate::portal::Portal, geometry: Geometry) {
+    use crate::portal::{keysym_char, keysym_named};
+    let mut geo = geometry;
+    let mut modifiers = 0u8;
+    let mut map = false;
+    let tap = |sym: u32| portal.keysym(sym, true).and_then(|_| portal.keysym(sym, false));
+    for ev in rx {
+        let res = match ev {
+            Event::Geometry(g) => {
+                geo = g;
+                Ok(())
+            }
+            Event::MapKeys(m) => {
+                map = m;
+                Ok(())
+            }
+            Event::Move { x, y, on } => portal.pointer_to(on.unwrap_or(geo), x, y),
+            Event::Rel { dx, dy } => portal.pointer_by(dx as f64, dy as f64),
+            Event::Button { b, down, at, on } => {
+                let moved = match at {
+                    Some((x, y)) => portal.pointer_to(on.unwrap_or(geo), x, y),
+                    None => Ok(()),
+                };
+                moved.and_then(|_| {
+                    let code = match b {
+                        1 => 0x112, // BTN_MIDDLE
+                        2 => 0x111, // BTN_RIGHT
+                        _ => 0x110, // BTN_LEFT
+                    };
+                    portal.button(code, down)
+                })
+            }
+            Event::Wheel { dx, dy } => {
+                let r = if dy != 0 { portal.scroll(true, dy) } else { Ok(()) };
+                r.and_then(|_| if dx != 0 { portal.scroll(false, dx) } else { Ok(()) })
+            }
+            Event::Text(s) => s.chars().try_for_each(|c| tap(keysym_char(c))),
+            Event::Key { code, key, down } => {
+                if let Some(k) = named_key(&key, &code) {
+                    if matches!(k, Key::Control | Key::Meta | Key::Alt) {
+                        modifiers = if down { modifiers.saturating_add(1) } else { modifiers.saturating_sub(1) };
+                    }
+                    match keysym_named(&k) {
+                        Some(sym) => portal.keysym(sym, down),
+                        None => Ok(()),
+                    }
+                } else if let Some(kc) = map.then(|| pc_scancode(&code)).flatten() {
+                    // Map mode: the physical key (evdev code = PC scan code for these keys).
+                    portal.keycode(kc as u32, down)
+                } else if let Some(c) = key.chars().next().filter(|_| key.chars().count() == 1) {
+                    if modifiers > 0 {
+                        // Shortcut: the unshifted key, so held modifiers apply (Ctrl+C, not Ctrl+Shift+c).
+                        let p = match physical_key(&code, &key) {
+                            PhysicalKey::Char(p) => p,
+                            PhysicalKey::Raw(_) => c,
+                        };
+                        portal.keysym(keysym_char(p), down)
+                    } else if down {
+                        tap(keysym_char(c))
+                    } else {
+                        Ok(())
+                    }
+                } else {
+                    Ok(())
+                }
+            }
+        };
+        if let Err(e) = res {
+            tracing::debug!("input event failed: {e:#}");
+        }
+    }
 }
 
 fn dir(down: bool) -> Direction {

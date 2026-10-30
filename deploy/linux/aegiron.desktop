@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=Aegiron
+GenericName=Remote Desktop
+GenericName[th]=รีโมตเดสก์ท็อป
+Comment=Control this computer or others through your organisation's Aegiron server
+Comment[th]=ควบคุมเครื่องนี้หรือเครื่องอื่นผ่านเซิร์ฟเวอร์ Aegiron ขององค์กร
+Exec=aegiron %u
+Icon=aegiron
+Terminal=false
+Categories=Network;RemoteAccess;
+Keywords=remote;desktop;support;vnc;rustdesk;
+MimeType=x-scheme-handler/aegiron;x-scheme-handler/redesk;
+StartupNotify=true
+StartupWMClass=aegiron
+SingleMainWindow=true

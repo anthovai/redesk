@@ -23,6 +23,7 @@ use anyhow::Result;
 static STATE: Mutex<(usize, Option<imp::Shown>)> = Mutex::new((0, None));
 
 /// Text on the black screen for the person at the machine.
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
 fn notice() -> String {
     format!("หน้าจอนี้ถูกซ่อนระหว่างการควบคุมจากระยะไกล (Aegiron)\nกด {} เพื่อยกเลิก", crate::controls::ESCAPE_HINT)
 }

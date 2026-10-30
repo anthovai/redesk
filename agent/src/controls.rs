@@ -439,6 +439,9 @@ fn restart_commands() -> Vec<Vec<&'static str>> {
         ]
     } else if cfg!(windows) {
         vec![vec!["shutdown", "/r", "/t", "0"]]
+    } else if cfg!(target_os = "linux") {
+        // logind lets the active local user reboot (polkit); it may refuse when others are logged in.
+        vec![vec!["systemctl", "reboot"]]
     } else {
         Vec::new()
     }
@@ -544,7 +547,7 @@ mod tests {
         c.allow_privacy_mode = false;
         c.allow_restart = false;
         assert_eq!(Perms::new(&c, [true; 4]).features(), ["view_only", "block_input", "lock"]);
-        // Unsupported here (e.g. macOS privacy without the desktop app, restart on Linux).
+        // Unsupported here (e.g. macOS privacy without the desktop app, block input on Linux).
         assert_eq!(Perms::new(&cfg(), [true, false, true, false]).features(), ["view_only", "block_input", "lock"]);
     }
 
@@ -595,7 +598,7 @@ mod tests {
         assert_eq!(r.unwrap_err().to_string(), "no c");
         assert!(run_first(&[], &mut |_| Ok(())).is_err());
         // Each supported OS has a user-level command.
-        if cfg!(any(target_os = "macos", windows)) {
+        if cfg!(any(target_os = "macos", windows, target_os = "linux")) {
             assert!(!restart_commands().is_empty());
         }
     }

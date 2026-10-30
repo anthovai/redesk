@@ -13,6 +13,11 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  # Headers and tools to build the Linux agent (same list as deploy/linux/Dockerfile).
+  LINUX_BUILD_DEPS: >-
+    pkg-config clang libclang-dev libpipewire-0.3-dev libspa-0.2-dev libasound2-dev libdbus-1-dev
+    libegl-dev libgbm-dev libxcb1-dev libxcb-randr0-dev libxcb-shm0-dev libxcb-xfixes0-dev libxkbcommon-dev
+    libwayland-dev libx11-dev libxi-dev libxtst-dev libgl-dev rpm
 
 jobs:
   # Agent on real Windows: Media Foundation (software H.264 MFT; hardware MFTs only where a GPU
@@ -52,6 +57,89 @@ jobs:
         with:
           workspaces: agent
       - run: cargo test
+
+  # Agent and desktop app on Linux, x86_64 and aarch64: build (with and without the tray), then
+  # every test including the ignored ones on a headless X server and PulseAudio null sink:
+  # real screen capture, XTEST input, clipboard, audio capture and playback.
+  agent-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: agent
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: agent
+          key: ${{ matrix.runner }}
+      - name: Build and test dependencies (as in deploy/linux/Dockerfile)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${{ env.LINUX_BUILD_DEPS }} \
+            xvfb xauth x11-utils x11-xserver-utils xclip pulseaudio pulseaudio-utils libasound2-plugins
+      - run: cargo build --locked --all-targets
+      - name: Build without the tray feature
+        run: cargo check --locked --bins --no-default-features
+      - name: Tests under Xvfb + PulseAudio (deploy/linux/test-x11.sh)
+        run: ../deploy/linux/test-x11.sh
+
+  # .deb, .rpm and .tar.gz the way releases are built (deploy/linux/build-packages.sh).
+  linux-packages:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: agent
+          key: packages-${{ matrix.runner }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb,cargo-generate-rpm
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ${{ env.LINUX_BUILD_DEPS }}
+      - run: deploy/linux/build-packages.sh
+      - uses: actions/upload-artifact@v5
+        with:
+          name: linux-packages-${{ matrix.runner }}
+          path: dist/
+          retention-days: 7
+
+  # Installs each package on a clean system: dependencies resolve, libraries load, the
+  # aegiron:// handler is registered.
+  linux-package-install:
+    needs: linux-packages
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, image: "ubuntu:24.04", kind: deb }
+          - { runner: ubuntu-24.04-arm, image: "ubuntu:24.04", kind: deb }
+          - { runner: ubuntu-24.04, image: "debian:trixie", kind: deb }
+          - { runner: ubuntu-24.04, image: "fedora:42", kind: rpm }
+          - { runner: ubuntu-24.04-arm, image: "fedora:42", kind: rpm }
+          - { runner: ubuntu-24.04, image: "ubuntu:24.04", kind: tar }
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.image }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v6
+        with:
+          name: linux-packages-${{ matrix.runner }}
+          path: dist
+      - name: Install and check
+        run: deploy/linux/smoke-test.sh ${{ matrix.kind }} dist
 
   # The release installer, built the way releases are (cross-compiled with mingw + makensis).
   installer-build:

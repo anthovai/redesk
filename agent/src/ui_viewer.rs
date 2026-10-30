@@ -288,7 +288,7 @@ impl ViewerWindow {
         self.debug_hooks(&phase);
 
         if let Some(text) = clip
-            && arboard::Clipboard::new().and_then(|mut c| c.set_text(text)).is_ok()
+            && crate::clipboard::with(|c| c.set_text(text)).is_ok()
         {
             Self::flash(w, "ได้รับคลิปบอร์ดจากเครื่องปลายทาง");
         }
@@ -850,7 +850,7 @@ impl ViewerWindow {
             }
             let clip = f.info.is_some_and(|i| i.clipboard);
             if menu_row(ui, Lead::Glyph(Glyph::Clipboard), "ส่งคลิปบอร์ดไปเครื่องปลายทาง", "", clip).clicked() {
-                match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+                match crate::clipboard::with(|c| c.get_text()) {
                     Ok(t) => {
                         self.viewer.send(serde_json::json!({"t": "clip", "s": t}));
                         Self::flash(w, "ส่งคลิปบอร์ดแล้ว");

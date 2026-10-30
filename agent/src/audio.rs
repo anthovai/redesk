@@ -1,5 +1,5 @@
 //! Remote audio: the agent captures what the machine is playing (macOS ScreenCaptureKit,
-//! Windows WASAPI loopback), encodes it as Opus (48 kHz stereo, 20 ms frames) and sends it as
+//! Windows WASAPI loopback, Linux PulseAudio/PipeWire monitor source), encodes it as Opus (48 kHz stereo, 20 ms frames) and sends it as
 //! `0x05` packets; viewers decode and play it.
 //!
 //! Opus comes from `unsafe-libopus` (libopus transpiled to Rust), so no C toolchain or cmake
@@ -212,7 +212,7 @@ pub fn test_audio() -> bool {
 pub(crate) enum Source {
     #[allow(dead_code)]
     System(imp::Capture),
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     #[allow(dead_code)]
     Mic(mic::Capture),
     Tone(Arc<AtomicBool>),
@@ -336,13 +336,13 @@ pub fn voice_supported() -> bool {
     playback_supported() && (test_tone() || mic_present())
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 fn mic_present() -> bool {
     use cpal::traits::HostTrait;
     cpal::default_host().default_input_device().is_some()
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 fn mic_present() -> bool {
     false
 }
@@ -355,18 +355,19 @@ pub(crate) fn start_mic(sink: PcmSink) -> Result<Source> {
         tracing::warn!("voice: AEGIRON_TEST_AUDIO=tone, sending a generated test tone instead of the microphone");
         return start_tone_at(sink, 660.0);
     }
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     return mic::start(sink).map(Source::Mic);
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         let _ = sink;
         bail!("voice calls are not supported on this platform")
     }
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 mod mic {
-    //! The default input device through cpal (CoreAudio on macOS, WASAPI on Windows).
+    //! The default input device through cpal (CoreAudio on macOS, WASAPI on Windows, ALSA on
+    //! Linux, which the sound server routes from its default source).
     use super::*;
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
@@ -391,7 +392,7 @@ mod mic {
                     let device = cpal::default_host().default_input_device().ok_or_else(|| anyhow!("no microphone"))?;
                     let def = device.default_input_config().map_err(|e| anyhow!("microphone config: {e}"))?;
                     let (ch, rate) = (def.channels() as usize, def.sample_rate());
-                    let config = cpal::StreamConfig { channels: def.channels(), sample_rate: rate, buffer_size: cpal::BufferSize::Default };
+                    let config = cpal::StreamConfig { channels: def.channels(), sample_rate: rate, buffer_size: buffer_size(&def) };
                     let mut sink = sink;
                     let err = |e| tracing::warn!("microphone: {e}");
                     let stream = match def.sample_format() {
@@ -435,11 +436,24 @@ mod mic {
     }
 }
 
+/// Buffer size for cpal streams. Linux/ALSA: cpal's default asks for the device's largest
+/// buffer, seconds with the PulseAudio/PipeWire plugin, so a microphone delivers its first
+/// samples late and playback lags; 20 ms periods instead. Elsewhere the default is fine.
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+fn buffer_size(def: &cpal::SupportedStreamConfig) -> cpal::BufferSize {
+    #[cfg(target_os = "linux")]
+    if let cpal::SupportedBufferSize::Range { min, max } = def.buffer_size() {
+        return cpal::BufferSize::Fixed((def.sample_rate() / 50).clamp(*min, *max));
+    }
+    let _ = def;
+    cpal::BufferSize::Default
+}
+
 // --- Viewer side: playback ------------------------------------------------------------------
 
 /// Whether this build can play audio (the viewer only asks for audio if so).
 pub fn playback_supported() -> bool {
-    cfg!(any(windows, target_os = "macos"))
+    cfg!(any(windows, target_os = "macos", target_os = "linux"))
 }
 
 /// Jitter buffer shared between the network task and the audio device callback.
@@ -500,7 +514,7 @@ impl Drop for Player {
     }
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 fn play_thread(ring: Arc<Mutex<Ring>>, stop: Arc<AtomicBool>, ready: std::sync::mpsc::Sender<Result<()>>) {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     let res = (|| -> Result<cpal::Stream> {
@@ -509,7 +523,7 @@ fn play_thread(ring: Arc<Mutex<Ring>>, stop: Arc<AtomicBool>, ready: std::sync::
         let def = device.default_output_config().map_err(|e| anyhow!("audio output config: {e}"))?;
         let channels = def.channels() as usize;
         let rate = def.sample_rate();
-        let config = cpal::StreamConfig { channels: def.channels(), sample_rate: rate, buffer_size: cpal::BufferSize::Default };
+        let config = cpal::StreamConfig { channels: def.channels(), sample_rate: rate, buffer_size: buffer_size(&def) };
         // The device rarely runs at exactly 48 kHz stereo f32; convert in the callback.
         let step = SAMPLE_RATE as f64 / rate as f64;
         let mut pos = 0f64;
@@ -586,7 +600,7 @@ fn play_thread(ring: Arc<Mutex<Ring>>, stop: Arc<AtomicBool>, ready: std::sync::
     }
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 fn play_thread(_ring: Arc<Mutex<Ring>>, _stop: Arc<AtomicBool>, ready: std::sync::mpsc::Sender<Result<()>>) {
     let _ = ready.send(Err(anyhow!("audio playback is not supported on this platform")));
 }
@@ -669,7 +683,11 @@ mod imp {
     }
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(target_os = "linux")]
+#[path = "audio_linux.rs"]
+mod imp;
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 mod imp {
     use super::*;
 
@@ -750,7 +768,7 @@ mod tests {
     /// by CI after installing a virtual audio device) makes a missing device a failure.
     /// The returned guard keeps the device tests from running at the same time: each would hear
     /// the other's tone.
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn have_output() -> Option<std::sync::MutexGuard<'static, ()>> {
         use cpal::traits::HostTrait;
         static DEVICE: Mutex<()> = Mutex::new(());
@@ -764,7 +782,7 @@ mod tests {
     }
 
     /// Records the loudest block captured from system audio.
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn capture_peak(peak: Arc<Mutex<(f32, usize)>>) -> imp::Capture {
         let sink: PcmSink = Box::new(move |d, _, _| {
             let mut p = peak.lock().unwrap();
@@ -774,11 +792,11 @@ mod tests {
         // macOS: include this process's own audio, which the agent normally leaves out.
         #[cfg(target_os = "macos")]
         return imp::start_with(sink, false).unwrap();
-        #[cfg(windows)]
+        #[cfg(not(target_os = "macos"))]
         return imp::start(sink).unwrap();
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn play_tone(secs: usize) {
         let player = Player::new().unwrap();
         for chunk in tone(SAMPLE_RATE as usize * secs, SAMPLE_RATE, 660.0).chunks(FRAME * CHANNELS) {
@@ -789,9 +807,9 @@ mod tests {
     }
 
     /// Manual check on a machine with Screen Recording permission (macOS) or an audio output
-    /// (Windows; CI installs a virtual one): `cargo test --lib audio -- --ignored`. Plays a
+    /// (Windows and Linux; CI installs a virtual one or runs PulseAudio with a null sink): `cargo test --lib audio -- --ignored`. Plays a
     /// sound and expects the capture to hear it.
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     #[test]
     #[ignore]
     fn capture_hears_system_audio() {
@@ -805,7 +823,8 @@ mod tests {
             }
         } else {
             // WASAPI loopback delivers nothing while nothing plays, and Windows has no
-            // command-line player: play a tone through cpal's output path instead.
+            // command-line player: play a tone through cpal's output path instead (on Linux
+            // through ALSA, which the sound server's ALSA plugin routes to the default sink).
             play_tone(2);
         }
         drop(cap);
@@ -816,7 +835,7 @@ mod tests {
 
     /// Manual check: what the viewer's Player plays is heard by the system-audio capture,
     /// i.e. playback through cpal really reaches the output device.
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     #[test]
     #[ignore]
     fn player_output_is_heard() {
@@ -830,6 +849,44 @@ mod tests {
         let level = peak.lock().unwrap().0;
         eprintln!("before playback rms {quiet:.4}, during playback {level:.4}");
         assert!(level > 0.05, "player output not heard");
+    }
+
+    /// Manual check (CI on Linux, with PulseAudio): the default microphone through cpal/ALSA
+    /// delivers samples, so voice calls can be offered (`voice_supported`).
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore]
+    fn microphone_delivers_samples() {
+        let Some(_device) = have_output() else { return };
+        assert!(voice_supported(), "no microphone or no playback");
+        // (samples, time of the first block, largest block)
+        let seen = Arc::new(Mutex::new((0usize, None::<std::time::Instant>, 0usize)));
+        let s2 = seen.clone();
+        let t0 = std::time::Instant::now();
+        let mic = mic::start(Box::new(move |d, _, _| {
+            let mut s = s2.lock().unwrap();
+            s.0 += d.len();
+            s.1.get_or_insert_with(std::time::Instant::now);
+            s.2 = s.2.max(d.len());
+        }))
+        .unwrap();
+        // The CI "microphone" is a PulseAudio null sink's monitor, which starts in large
+        // chunks (up to ~2 s) until a low-latency client is connected; a real source is quicker.
+        let deadline = std::time::Instant::now() + Duration::from_secs(6);
+        while seen.lock().unwrap().1.is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let before = seen.lock().unwrap().0;
+        std::thread::sleep(Duration::from_secs(1));
+        drop(mic);
+        let (got, first, block) = *seen.lock().unwrap();
+        let first = first.map(|f| f.duration_since(t0));
+        let per_sec = got - before;
+        eprintln!("microphone: first samples after {first:?}, then {per_sec} samples/s, largest block {block}");
+        assert!(first.is_some(), "microphone delivered nothing");
+        // Real time: 48 kHz stereo is 96000 samples per second.
+        assert!(per_sec > 60_000, "microphone delivered {per_sec} samples in 1 s");
+        assert!(block <= 48_000 / 10 * 2, "blocks of {block} samples (over 100 ms)");
     }
 
     #[test]

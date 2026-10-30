@@ -39,13 +39,29 @@ pub struct DisplayInfo {
 /// Logical geometry of a display, used to map normalised pointer positions to input coordinates.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Geometry {
+    /// Index of the display, or `ALL_DISPLAYS` for the combined view (Wayland input is
+    /// addressed to a portal stream, not to desktop coordinates).
+    pub display: usize,
     pub x: i32,
     pub y: i32,
     pub width: u32,
     pub height: u32,
 }
 
+/// `Geometry::display` of the combined view of all displays.
+pub const ALL_DISPLAYS: usize = usize::MAX;
+
+/// The Wayland portal session in use: screen and input come from it instead of xcap/enigo.
+#[cfg(target_os = "linux")]
+fn portal() -> Option<Arc<crate::portal::Portal>> {
+    crate::portal::current()
+}
+
 pub fn displays() -> Vec<DisplayInfo> {
+    #[cfg(target_os = "linux")]
+    if let Some(p) = portal() {
+        return p.displays();
+    }
     Monitor::all()
         .unwrap_or_default()
         .iter()
@@ -63,16 +79,25 @@ pub fn displays() -> Vec<DisplayInfo> {
 }
 
 pub fn geometry(display: usize) -> Option<Geometry> {
+    #[cfg(target_os = "linux")]
+    if let Some(p) = portal() {
+        return Some(p.geometry(display));
+    }
     let monitors = Monitor::all().ok()?;
-    monitor_geometry(monitors.get(display).or(monitors.first())?)
+    let display = if display < monitors.len() { display } else { 0 };
+    monitor_geometry(monitors.get(display)?).map(|g| Geometry { display, ..g })
 }
 
 fn monitor_geometry(m: &Monitor) -> Option<Geometry> {
-    Some(Geometry { x: m.x().ok()?, y: m.y().ok()?, width: m.width().ok()?, height: m.height().ok()? })
+    Some(Geometry { display: 0, x: m.x().ok()?, y: m.y().ok()?, width: m.width().ok()?, height: m.height().ok()? })
 }
 
 /// Bounding box of all displays: the input geometry of the combined view.
 pub fn all_geometry() -> Option<Geometry> {
+    #[cfg(target_os = "linux")]
+    if let Some(p) = portal() {
+        return bounding((0..p.streams.len()).map(|i| p.geometry(i)));
+    }
     bounding(Monitor::all().ok()?.iter().filter_map(monitor_geometry))
 }
 
@@ -90,12 +115,12 @@ fn bounding(it: impl Iterator<Item = Geometry>) -> Option<Geometry> {
             Some((a, c, d, e)) => (a.min(g.x), c.min(g.y), d.max(x1), e.max(y1)),
         });
     }
-    b.map(|(x0, y0, x1, y1)| Geometry { x: x0, y: y0, width: (x1 - x0) as u32, height: (y1 - y0) as u32 })
+    b.map(|(x0, y0, x1, y1)| Geometry { display: ALL_DISPLAYS, x: x0, y: y0, width: (x1 - x0) as u32, height: (y1 - y0) as u32 })
 }
 
 /// All displays in desktop coordinates as windows are placed (bounding box of `logical_area`).
 pub fn logical_area_all() -> Option<[f32; 4]> {
-    let n = Monitor::all().ok()?.len();
+    let n = displays().len();
     let areas: Vec<[f32; 4]> = (0..n).filter_map(logical_area).collect();
     let x0 = areas.iter().map(|a| a[0]).reduce(f32::min)?;
     let y0 = areas.iter().map(|a| a[1]).reduce(f32::min)?;
@@ -135,6 +160,12 @@ fn composite(parts: &[(Geometry, image::RgbaImage)]) -> Option<image::RgbaImage>
 
 /// The display in desktop coordinates as windows are placed (logical points): x, y, w, h.
 pub fn logical_area(display: usize) -> Option<[f32; 4]> {
+    #[cfg(target_os = "linux")]
+    if let Some(p) = portal() {
+        // Portal streams are described in logical coordinates already.
+        let g = p.geometry(display);
+        return Some([g.x as f32, g.y as f32, g.width as f32, g.height as f32]);
+    }
     let monitors = Monitor::all().ok()?;
     let m = monitors.get(display).or(monitors.first())?;
     let (x, y, w, h) = (m.x().ok()? as f32, m.y().ok()? as f32, m.width().ok()? as f32, m.height().ok()? as f32);
@@ -380,6 +411,7 @@ pub fn run(params: watch::Receiver<Params>, out: mpsc::Sender<Vec<u8>>, stop: Ar
     let mut reported = (reported, last_params.codec);
     let mut pointer = Pointer::new();
     let mut warned = false;
+    let mut last_seq = None;
     while !stop.load(Ordering::Relaxed) {
         let started = Instant::now();
         let p = *params.borrow();
@@ -388,36 +420,20 @@ pub fn run(params: watch::Receiver<Params>, out: mpsc::Sender<Vec<u8>>, stop: Ar
             prev = None;
             enc = None;
         }
-        let monitors = Monitor::all().unwrap_or_default();
-        let Some(m) = monitors.get(p.display).or(monitors.first()) else {
-            std::thread::sleep(Duration::from_secs(1));
-            continue;
-        };
-        let geometry = match p.all {
-            true => bounding(monitors.iter().filter_map(monitor_geometry)).unwrap_or_default(),
-            false => monitor_geometry(m).unwrap_or_default(),
-        };
-        if let Some(msg) = pointer.poll(geometry) {
-            if out.blocking_send(msg).is_err() {
-                return;
-            }
-        }
-        // Privacy mode's black windows are left out on macOS (capture_monitor).
-        let captured = match p.all {
-            // A display that fails to capture is left black rather than ending the picture.
-            true => {
-                let parts: Vec<_> = monitors.iter().filter_map(|m| Some((monitor_geometry(m)?, capture_monitor(m).ok()?))).collect();
-                composite(&parts).ok_or_else(|| anyhow::anyhow!("no display could be captured"))
-            }
-            false => capture_monitor(m),
-        };
-        let img = match captured {
-            Ok(i) => i,
-            Err(e) => {
-                if !warned {
-                    tracing::error!("screen capture failed: {e} (macOS: grant Screen Recording permission)");
-                    warned = true;
+        let img = match grab(&p, &mut pointer, &mut last_seq, prev.is_none() || force_full.load(Ordering::Relaxed), &mut warned) {
+            Grab::Frame(img, cursor) => {
+                if let Some(msg) = cursor {
+                    if out.blocking_send(msg).is_err() {
+                        return;
+                    }
                 }
+                img
+            }
+            Grab::Unchanged => {
+                std::thread::sleep(Duration::from_millis(1000 / p.fps.clamp(1, 60) as u64));
+                continue;
+            }
+            Grab::Failed => {
                 std::thread::sleep(Duration::from_secs(1));
                 continue;
             }
@@ -490,6 +506,92 @@ pub fn run(params: watch::Receiver<Params>, out: mpsc::Sender<Vec<u8>>, stop: Ar
     }
 }
 
+enum Grab {
+    /// A screen image, and a cursor message if the pointer moved.
+    Frame(Image, Option<Vec<u8>>),
+    /// Nothing new since the last frame (the portal only sends frames when the screen changes).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Unchanged,
+    Failed,
+}
+
+/// A captured image: owned (xcap) or shared with the portal's frame slot.
+enum Image {
+    Owned(image::RgbaImage),
+    #[allow(dead_code)]
+    Shared(Arc<image::RgbaImage>),
+}
+
+impl std::ops::Deref for Image {
+    type Target = image::RgbaImage;
+    fn deref(&self) -> &image::RgbaImage {
+        match self {
+            Image::Owned(i) => i,
+            Image::Shared(i) => i,
+        }
+    }
+}
+
+/// Captures what `p` streams: from the Wayland portal's streams when one is in use, else with
+/// xcap (X11, macOS, Windows). `need` asks for an image even if nothing changed.
+#[allow(unused_variables)]
+fn grab(p: &Params, pointer: &mut Pointer, last_seq: &mut Option<u64>, need: bool, warned: &mut bool) -> Grab {
+    #[cfg(target_os = "linux")]
+    if let Some(portal) = portal() {
+        // The pointer is drawn into the portal's video, so no cursor messages.
+        let shown: Vec<usize> = if p.all { (0..portal.streams.len()).collect() } else { vec![p.display] };
+        let frames: Vec<_> = shown.iter().filter_map(|&i| Some((i, portal.latest(i)?))).collect();
+        if frames.len() < shown.len() {
+            return Grab::Unchanged; // a first frame has not arrived yet
+        }
+        // Sequence numbers only grow: their sum changes whenever any shown stream does.
+        let seq: u64 = frames.iter().map(|(_, (s, _))| s).sum();
+        if !need && *last_seq == Some(seq) {
+            return Grab::Unchanged;
+        }
+        *last_seq = Some(seq);
+        return match p.all {
+            false => Grab::Frame(Image::Shared(frames[0].1.1.clone()), None),
+            true => {
+                let parts: Vec<_> = frames.iter().map(|(i, (_, img))| (portal.geometry(*i), (**img).clone())).collect();
+                composite(&parts).map_or(Grab::Failed, |img| Grab::Frame(Image::Owned(img), None))
+            }
+        };
+    }
+    let monitors = Monitor::all().unwrap_or_default();
+    let Some(m) = monitors.get(p.display).or(monitors.first()) else {
+        if !*warned {
+            tracing::error!("screen capture: no display found{}", if cfg!(target_os = "linux") { " (is DISPLAY set? Wayland needs the desktop portal)" } else { "" });
+            *warned = true;
+        }
+        return Grab::Failed;
+    };
+    let geometry = match p.all {
+        true => bounding(monitors.iter().filter_map(monitor_geometry)).unwrap_or_default(),
+        false => monitor_geometry(m).unwrap_or_default(),
+    };
+    let cursor = pointer.poll(geometry);
+    // Privacy mode's black windows are left out on macOS (capture_monitor).
+    let captured = match p.all {
+        // A display that fails to capture is left black rather than ending the picture.
+        true => {
+            let parts: Vec<_> = monitors.iter().filter_map(|m| Some((monitor_geometry(m)?, capture_monitor(m).ok()?))).collect();
+            composite(&parts).ok_or_else(|| anyhow::anyhow!("no display could be captured"))
+        }
+        false => capture_monitor(m),
+    };
+    match captured {
+        Ok(i) => Grab::Frame(Image::Owned(i), cursor),
+        Err(e) => {
+            if !*warned {
+                tracing::error!("screen capture failed: {e} (macOS: grant Screen Recording permission)");
+                *warned = true;
+            }
+            Grab::Failed
+        }
+    }
+}
+
 /// Encodes a whole frame as H.264 or AV1, (re)creating the encoder when the size, codec or
 /// settings change (a new encoder always starts with a keyframe). Ok(None) means the encoder
 /// dropped the frame.
@@ -556,8 +658,8 @@ mod tests {
         let solid = |w, h, v: u8| image::RgbaImage::from_pixel(w, h, image::Rgba([v, v, v, 255]));
         // A 2x "Retina" display at (0,0) 4x3 points and a 1x display to its right, lower down.
         let parts = vec![
-            (Geometry { x: 0, y: 0, width: 4, height: 3 }, solid(8, 6, 200)),
-            (Geometry { x: 4, y: 1, width: 2, height: 2 }, solid(2, 2, 50)),
+            (Geometry { display: 0, x: 0, y: 0, width: 4, height: 3 }, solid(8, 6, 200)),
+            (Geometry { display: 1, x: 4, y: 1, width: 2, height: 2 }, solid(2, 2, 50)),
         ];
         let out = composite(&parts).unwrap();
         assert_eq!((out.width(), out.height()), (12, 6));

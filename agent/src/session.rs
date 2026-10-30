@@ -285,6 +285,38 @@ pub async fn run(
 
     // 4. Stream.
     let cfg = agent.config.lock().unwrap().clone();
+    // Wayland: the screen and input come from the desktop portal, which may ask the local user
+    // first. Without it there is nothing to show, so the session ends with a clear reason.
+    #[cfg(target_os = "linux")]
+    let portal = match crate::portal::wanted() {
+        false => None,
+        true => {
+            let want_input = cfg.allow_input;
+            let opened = tokio::time::timeout(Duration::from_secs(120), tokio::task::spawn_blocking(move || crate::portal::acquire(want_input))).await;
+            match opened {
+                Ok(Ok(Ok(p))) => Some(p),
+                res => {
+                    let why = match res {
+                        Ok(Ok(Err(e))) => format!("{e:#}"),
+                        Ok(Ok(Ok(_))) => unreachable!(),
+                        Ok(Err(e)) => format!("{e}"),
+                        Err(_) => "no answer to the screen-sharing dialog within 2 minutes".into(),
+                    };
+                    tracing::error!("session {sid}: cannot capture the screen on Wayland: {why}");
+                    if std::io::stdout().is_terminal() {
+                        println!("  >>> Cannot share the screen: {why}");
+                    }
+                    send_json(&mut tx, &mut ch, json!({"t": "auth_result", "ok": false, "reason": "screen_unavailable", "message": why})).await?;
+                    bail!("screen capture unavailable: {why}");
+                }
+            }
+        }
+    };
+    // Remote input needs the portal's RemoteDesktop part (wlroots only has ScreenCast).
+    #[cfg(target_os = "linux")]
+    let allow_input = cfg.allow_input && portal.as_ref().is_none_or(|p| p.has_input());
+    #[cfg(not(target_os = "linux"))]
+    let allow_input = cfg.allow_input;
     let mut displays = capture::displays();
     // Resolution changes, restored when `resolution` is dropped at the end of the session.
     let mut resolution = cfg.allow_resolution.then(crate::resolution::backend).flatten().map(crate::resolution::Changer::new);
@@ -330,7 +362,7 @@ pub async fn run(
         "os": std::env::consts::OS,
         "displays": displays,
         "display": 0,
-        "input": cfg.allow_input,
+        "input": allow_input,
         "clipboard": cfg.allow_clipboard,
         "files": cfg.allow_file_transfer,
         "max_fps": cfg.max_fps,
@@ -378,7 +410,7 @@ pub async fn run(
         std::thread::spawn(move || watch_clipboard(out_tx, stop, last_clip, last_files));
     }
     let mut files = files::Files::new();
-    let input_tx = cfg.allow_input.then(|| input::spawn(capture::geometry(0).unwrap_or_default()));
+    let input_tx = allow_input.then(|| input::spawn(capture::geometry(0).unwrap_or_default()));
     // Voice call: this machine's microphone as 0x07 packets (never recorded), and the viewer's
     // voice played here. The person here has 30 s to accept a call.
     let (voice_tx, mut voice_rx) = mpsc::channel::<Vec<u8>>(16);
@@ -540,7 +572,7 @@ pub async fn run(
                     ViewerMsg::Clipboard { s } if cfg.allow_clipboard => {
                         *last_clip.lock().unwrap() = s.clone();
                         tokio::task::spawn_blocking(move || {
-                            if let Err(e) = arboard::Clipboard::new().and_then(|mut c| c.set_text(s)) {
+                            if let Err(e) = crate::clipboard::with(|c| c.set_text(s)) {
                                 tracing::debug!("clipboard set failed: {e}");
                             }
                         });
@@ -1068,8 +1100,17 @@ async fn gui_confirm(question: &str) -> Option<bool> {
         cmd = tokio::process::Command::new("osascript");
         cmd.arg("-e").arg(script);
     } else if cfg!(target_os = "linux") && std::env::var_os("DISPLAY").or(std::env::var_os("WAYLAND_DISPLAY")).is_some() {
-        cmd = tokio::process::Command::new("zenity");
-        cmd.args(["--question", "--title=Aegiron", "--timeout=30", "--ok-label=อนุญาต", "--cancel-label=ปฏิเสธ"]).arg(format!("--text={question}"));
+        // zenity (GNOME and most desktops), else kdialog (KDE).
+        if which("zenity") {
+            cmd = tokio::process::Command::new("zenity");
+            cmd.args(["--question", "--title=Aegiron", "--timeout=30", "--ok-label=อนุญาต", "--cancel-label=ปฏิเสธ"]).arg(format!("--text={question}"));
+        } else if which("kdialog") {
+            cmd = tokio::process::Command::new("kdialog");
+            cmd.args(["--title", "Aegiron", "--yes-label", "อนุญาต", "--no-label", "ปฏิเสธ", "--warningyesno"]).arg(question);
+        } else {
+            tracing::warn!("no zenity or kdialog to ask the local user; install one, or use the Aegiron app or a password");
+            return None;
+        }
     } else {
         return None;
     }
@@ -1080,6 +1121,11 @@ async fn gui_confirm(question: &str) -> Option<bool> {
     } else {
         Some(out.status.success())
     }
+}
+
+/// Whether a program is on PATH.
+fn which(name: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(name).is_file()))
 }
 
 /// Files currently on the clipboard, canonicalised so lists we set ourselves compare equal.
@@ -1103,18 +1149,18 @@ fn set_clipboard_files(id: Option<u32>, paths: &[String], last_files: &Mutex<Vec
     if list.is_empty() {
         return fail("no files".into());
     }
-    let mut cb = match arboard::Clipboard::new() {
-        Ok(cb) => cb,
-        Err(e) => return fail(e.to_string()),
-    };
     // Remember what we set so the watcher does not send it straight back.
     *last_files.lock().unwrap() = list.clone();
-    if let Err(e) = cb.set().file_list(&list) {
-        return fail(e.to_string());
+    let set = crate::clipboard::with(|cb| {
+        cb.set().file_list(&list)?;
+        *last_files.lock().unwrap() = clipboard_files(cb);
+        *last_clip.lock().unwrap() = cb.get_text().unwrap_or_default();
+        Ok(())
+    });
+    match set {
+        Ok(()) => json!({"t": "fs_ok", "op": "clip_files", "id": id}),
+        Err(e) => fail(e.to_string()),
     }
-    *last_files.lock().unwrap() = clipboard_files(&mut cb);
-    *last_clip.lock().unwrap() = cb.get_text().unwrap_or_default();
-    json!({"t": "fs_ok", "op": "clip_files", "id": id})
 }
 
 fn watch_clipboard(out: mpsc::Sender<Vec<u8>>, stop: Arc<AtomicBool>, last: Arc<Mutex<String>>, last_files: Option<Arc<Mutex<Vec<PathBuf>>>>) {

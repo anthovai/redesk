@@ -416,6 +416,9 @@ export class RemoteViewer {
 					this.error = 'ผู้ใช้ที่เครื่องปลายทางปฏิเสธการเชื่อมต่อ';
 				} else if (m.reason === 'recording_failed') {
 					this.error = 'องค์กรกำหนดให้บันทึกเซสชันนี้ แต่เครื่องปลายทางเริ่มบันทึกไม่ได้';
+				} else if (m.reason === 'screen_unavailable') {
+					// Linux Wayland: no desktop portal, or the local user did not share the screen.
+					this.error = `เครื่องปลายทางแชร์หน้าจอไม่ได้: ${m.message ?? 'ไม่ทราบสาเหตุ'}`;
 				}
 				break;
 			case 'info':

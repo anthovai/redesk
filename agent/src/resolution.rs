@@ -1,6 +1,7 @@
 //! Changing the display resolution from the viewer (`res_list` / `res_set`, feature
 //! "resolution"). macOS uses CoreGraphics display modes, Windows `ChangeDisplaySettingsExW`
-//! with `CDS_FULLSCREEN` (nothing is written to the registry). Every display a session changed
+//! with `CDS_FULLSCREEN` (nothing is written to the registry), Linux X11 the `xrandr` tool
+//! (Wayland has no common protocol for it: unsupported there). Every display a session changed
 //! gets its original mode back when the session ends ([`Changer`] restores on drop).
 //!
 //! `AEGIRON_TEST_RESOLUTION=fake` replaces the platform with an in-memory list of modes, so
@@ -39,6 +40,10 @@ fn fake() -> bool {
 
 /// Whether this machine can change resolutions at all.
 pub fn supported() -> bool {
+    #[cfg(target_os = "linux")]
+    if !fake() {
+        return linux::available();
+    }
     fake() || cfg!(any(target_os = "macos", windows))
 }
 
@@ -51,6 +56,8 @@ pub fn backend() -> Option<Box<dyn Backend>> {
     return Some(Box::new(mac::Mac));
     #[cfg(windows)]
     return Some(Box::new(win::Win));
+    #[cfg(target_os = "linux")]
+    return linux::available().then(|| Box::new(linux::XRandr) as Box<dyn Backend>);
     #[allow(unreachable_code)]
     None
 }
@@ -266,6 +273,93 @@ mod mac {
     }
 }
 
+#[cfg(target_os = "linux")]
+mod linux {
+    //! X11 through the `xrandr` tool (x11-xserver-utils): displays in the order of
+    //! `xrandr --listactivemonitors`, which is the RandR monitor order xcap captures in.
+    use super::{Backend, Mode, tidy};
+    use anyhow::{Context, Result, anyhow, bail};
+    use std::process::Command;
+
+    pub struct XRandr;
+
+    /// X11 session (not Wayland, where the portal streams instead) with the xrandr tool.
+    pub fn available() -> bool {
+        !crate::portal::wanted() && std::env::var_os("DISPLAY").is_some() && Command::new("xrandr").arg("--version").output().is_ok_and(|o| o.status.success())
+    }
+
+    fn xrandr(args: &[&str]) -> Result<String> {
+        let out = Command::new("xrandr").args(args).output().context("xrandr")?;
+        if !out.status.success() {
+            bail!("xrandr {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// Output name of the display at `index` (first output of that RandR monitor).
+    fn output(index: usize) -> Result<String> {
+        let list = xrandr(&["--listactivemonitors"])?;
+        parse_monitors(&list).into_iter().nth(index).ok_or_else(|| anyhow!("no display {index}"))
+    }
+
+    /// " 0: +*DP-1 1920/527x1080/296+0+0  DP-1" -> ["DP-1"].
+    pub(super) fn parse_monitors(list: &str) -> Vec<String> {
+        list.lines().filter(|l| l.trim_start().split(':').next().is_some_and(|n| n.trim().parse::<u32>().is_ok())).filter_map(|l| l.split_whitespace().last().map(String::from)).collect()
+    }
+
+    /// Modes of `out` in `xrandr --query` output, and which one is current ("*").
+    pub(super) fn parse_modes(query: &str, out: &str) -> (Vec<Mode>, Option<Mode>) {
+        let (mut modes, mut current) = (Vec::new(), None);
+        let mut inside = false;
+        for line in query.lines() {
+            if !line.starts_with(' ') {
+                inside = line.split_whitespace().next() == Some(out);
+                continue;
+            }
+            if !inside {
+                continue;
+            }
+            let mut parts = line.split_whitespace();
+            let Some((w, h)) = parts.next().and_then(|m| m.split_once('x')) else { continue };
+            // Interlaced modes ("1920x1080i") are left out.
+            let (Ok(w), Ok(h)) = (w.parse::<u32>(), h.parse::<u32>()) else { continue };
+            for rate in parts {
+                let r: String = rate.chars().filter(|c| c.is_ascii_digit() || *c == '.').collect();
+                let Ok(hz) = r.parse::<f64>() else { continue };
+                let m = Mode { w, h, hz: hz.round() as u32 };
+                if rate.contains('*') {
+                    current = Some(m);
+                }
+                modes.push(m);
+            }
+        }
+        (modes, current)
+    }
+
+    impl Backend for XRandr {
+        fn modes(&self, display: usize) -> Result<Vec<Mode>> {
+            let out = output(display)?;
+            Ok(tidy(parse_modes(&xrandr(&["--query"])?, &out).0))
+        }
+
+        fn current(&self, display: usize) -> Result<Mode> {
+            let out = output(display)?;
+            parse_modes(&xrandr(&["--query"])?, &out).1.ok_or_else(|| anyhow!("{out}: no current mode"))
+        }
+
+        fn set(&mut self, display: usize, mode: Mode) -> Result<()> {
+            let out = output(display)?;
+            let size = format!("{}x{}", mode.w, mode.h);
+            let mut args = vec!["--output", out.as_str(), "--mode", size.as_str()];
+            let rate = mode.hz.to_string();
+            if mode.hz > 0 {
+                args.extend(["--rate", rate.as_str()]);
+            }
+            xrandr(&args).map(|_| ())
+        }
+    }
+}
+
 #[cfg(windows)]
 mod win {
     use anyhow::{Result, anyhow, bail};
@@ -386,6 +480,19 @@ mod tests {
         assert_eq!(c.restore(1).unwrap(), Some(Fake::MODES[0]));
         assert!(!c.changed());
         assert_eq!(c.list(5)["t"], "res_error");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn xrandr_output_parses() {
+        let mons = " Monitors: 2\n 0: +*DP-1 1920/527x1080/296+0+0  DP-1\n 1: +HDMI-1 1280/0x1024/0+1920+0  HDMI-1\n";
+        assert_eq!(linux::parse_monitors(mons), ["DP-1", "HDMI-1"]);
+        let q = "Screen 0: minimum 8 x 8, current 3200 x 1080\nDP-1 connected primary 1920x1080+0+0 (normal) 527mm x 296mm\n   1920x1080     60.00*+  59.94    50.00  \n   1280x720      60.00  \n   1920x1080i    60.00  \nHDMI-1 connected 1280x1024+1920+0\n   1280x1024     75.02*+  60.02  \n";
+        let (modes, cur) = linux::parse_modes(q, "DP-1");
+        assert_eq!(cur, Some(Mode { w: 1920, h: 1080, hz: 60 }));
+        assert_eq!(modes.len(), 4);
+        assert!(modes.contains(&Mode { w: 1280, h: 720, hz: 60 }));
+        assert_eq!(linux::parse_modes(q, "HDMI-1").1, Some(Mode { w: 1280, h: 1024, hz: 75 }));
     }
 
     #[test]
