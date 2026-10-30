@@ -53,7 +53,7 @@ Every later message is binary ciphertext. A dropped, reordered, or replayed mess
 
 ## 4. Messages inside the encrypted channel
 
-Byte 0 is the type: `0x01` JSON, `0x02` video rectangle (`x, y, frame_w, frame_h` as u16 BE, followed by a JPEG), `0x03` file chunk (transfer id as u32 BE, followed by up to 64 KiB of data), `0x04` video frame (codec u8 `1` = H.264 or `2` = AV1, flags u8 with bit 0 = keyframe, `width, height` as u16 BE, followed by one access unit: Annex B for H.264, one temporal unit of low-overhead OBUs for AV1), `0x05` audio packet (see [Audio](#audio)).
+Byte 0 is the type: `0x01` JSON, `0x02` video rectangle (`x, y, frame_w, frame_h` as u16 BE, followed by a JPEG), `0x03` file chunk (transfer id as u32 BE, followed by up to 64 KiB of data), `0x04` video frame (codec u8 `1` = H.264 or `2` = AV1, flags u8 with bit 0 = keyframe, `width, height` as u16 BE, followed by one access unit: Annex B for H.264, one temporal unit of low-overhead OBUs for AV1), `0x05` audio packet (see [Audio](#audio)), `0x06` message of an extra display stream (see [Displays, resolution and input modes](#displays-resolution-and-input-modes)).
 
 | Direction | Message |
 |---|---|
@@ -143,6 +143,26 @@ Needs both the `clipboard` and `files` permissions. The viewer opts in with `aut
 Pointer coordinates are normalised to 0–1 over the displayed frame. Plain typing uses the actual character (Thai and other layouts work). Shortcuts with Ctrl/Cmd/Alt use the physical key.
 
 Authentication: 3 attempts per session; 5 consecutive failures lock the agent for 60 s. The temporary password rotates after every successful login.
+
+### Displays, resolution and input modes
+
+Agents from 0.6 add these to `info.features`; a viewer uses each only when it is listed, so older agents never see the new messages and older viewers never send them. `info.displays[]` entries also carry `x`, `y` (position in the same units as `width`/`height`) so a viewer can draw the layout.
+
+| Feature | Direction | Message |
+|---|---|---|
+| `alldisp` | viewer→agent | `cfg {display_all: true}` streams every display as one picture (the bounding box of all displays, each placed by its position; mixed DPI is scaled to the densest display). `cfg {display: n}` goes back to one display. Pointer input, `cursor` and annotations are normalised over the whole picture. |
+| `multidisp` | viewer→agent | `cfg {streams: [1, 2]}`: stream these displays *in addition* to the main one (at most 8; the full list each time, `[]` stops them). |
+| `multidisp` | agent→viewer | Byte `0x06`: display u8, then a complete message of the main stream for that display (`0x02` rectangle, `0x04` video frame, or `0x01` JSON such as `cursor` and `encoder`). Quality, fps, codec and `refresh` apply to every stream. Extra streams are not recorded. |
+| `multidisp` | viewer→agent | `mm {x,y,d}`, `mb {b,down,x,y,d}`: with `d` the position is normalised to display `d` instead of the main stream. |
+| `resolution` | viewer→agent | `res_list {display}` → `res_list {display, current:{w,h,hz}, original:{w,h,hz}, modes:[{w,h,hz}]}` (`w`, `h` in the display's own units: points on macOS, pixels elsewhere; `hz` 0 when unknown) |
+| `resolution` | viewer→agent | `res_set {display, w, h, hz?}` → `res_ok {display, w, h, hz}` and `displays {displays[]}` with the new sizes, or `res_error {display, message}`. `res_restore {display}` puts the original mode back. |
+| `keymode` | viewer→agent | `cfg {keyboard: "map" \| "translate"}` (default `translate`) |
+| `relmouse` | viewer→agent | `mr {dx, dy}`: relative pointer motion in the remote's input units (each clamped to ±2000). `mb {b, down}` without `x`/`y` presses where the pointer is. |
+
+- **Resolution** is only offered when the host allows it (`allow_resolution`, default on; app Settings → ความปลอดภัย → อนุญาตให้เปลี่ยนความละเอียด, or `aegiron-agent set --allow-resolution false`) and the platform can do it: macOS (CoreGraphics `CGDisplayCopyAllDisplayModes` / `CGDisplaySetDisplayMode`, desktop-usable modes only) and Windows (`EnumDisplaySettingsExW` / `ChangeDisplaySettingsExW` with `CDS_FULLSCREEN`, so nothing is written to the registry). `info.resolution: true` says so. The agent remembers each display's mode before the first change and restores it when the session ends, however it ends. `AEGIRON_TEST_RESOLUTION=fake` in the agent's environment replaces the platform with an in-memory list of modes (tests; never set by the app or installers).
+- **Keyboard modes.** `translate` (the default, and what older agents do) types the character of each key, so any layout works without the remote having it, and uses physical keys only for shortcuts with Ctrl/Cmd/Alt. `map` presses the physical key for every key (`code`), down and up, like a keyboard plugged into the remote machine: the remote's own layout decides the character (Thai typing then needs the Thai layout on the remote), and games see real key presses and releases. `text {s}` still types text in both modes.
+- **Relative mouse** is for games and 3D apps that read raw motion: the browser uses pointer lock and the desktop app grabs and hides the cursor; both toggle it with Ctrl+Alt+M (Esc also leaves pointer lock in the browser).
+- **Each display in its own window** (desktop app): the app keeps one session and asks for the other displays with `cfg {streams}`; each extra window renders its `0x06` messages and sends input with `d`.
 
 ## 5. Desktop app sign-in
 

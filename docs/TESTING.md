@@ -33,6 +33,10 @@ Each script prints `PASS`/`FAIL` lines and exits non-zero on a failure. They tak
 
 Live audio is captured with ScreenCaptureKit on macOS and needs the Screen Recording permission. For repeatable tests the agent can send a generated tone instead: `AEGIRON_TEST_AUDIO=tone` (440 Hz, 0.5 s on / 0.5 s off). It is read from the environment only; the app, the installers and the login service never set it. `make e2e` uses it unless `E2E_REAL_AUDIO=1`. Real capture can be checked by hand: run the agent without it, play a sound and run `media_probe`, which prints the decoded level every second.
 
+### Test display resolution
+
+`AEGIRON_TEST_RESOLUTION=fake` on the agent replaces the CoreGraphics / `ChangeDisplaySettingsEx` backend with an in-memory list of modes (1920×1080, 1600×900, 1280×720, 1024×768), so `res_list` / `res_set` / `res_restore` can be exercised without touching the real screen. Like the test audio it is read from the environment only. The unit tests (`cargo test resolution`) use the same fake and check that the original mode comes back when a session ends.
+
 ### Synthetic recordings
 
 A Mac has no AV1 encoder for live sessions, so `agent/examples/make_recording.rs` writes recordings with rav1e (a dev-dependency) and OpenH264: 320×240 at 10 fps, each frame showing its number in base 4 as the gray levels of its quadrants; Opus with a beep in the first half of every second, a muted second (8–9 s) without a sequence gap, and record times that jitter like network sends. `--codec av1|h264|switch`. With `--upload <server> --config <agent.toml> --token <t>` it uploads the file signed with that agent's key, exactly like an agent. The upload needs a pending recording for that token, which the server only creates for a real session and hands to the agent; `e2e-media.ts` inserts the row directly into the test database (`AEGIRON_E2E_DB`).
