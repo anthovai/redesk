@@ -50,14 +50,23 @@ func (a *API) recordingToken(ctx context.Context, sid, deviceID string, userID i
 		a.log.Error("recording settings unavailable", "err", err)
 		return ""
 	}
+	record := false
 	switch st.Mode {
 	case "all":
+		record = true
 	case "groups":
 		d, err := a.store.GetDevice(ctx, deviceID)
-		if err != nil || d.GroupID == nil || !slices.Contains(st.GroupIDs, *d.GroupID) {
-			return ""
+		record = err == nil && d.GroupID != nil && slices.Contains(st.GroupIDs, *d.GroupID)
+	}
+	if !record {
+		// A strategy can require recording for its devices whatever the server-wide mode.
+		strat, err := a.store.EffectiveStrategy(ctx, deviceID)
+		if err != nil {
+			a.log.Error("strategy unavailable", "device", deviceID, "err", err)
 		}
-	default:
+		record = strat != nil && strat.Settings.RecordSessions != nil && *strat.Settings.RecordSessions
+	}
+	if !record {
 		return ""
 	}
 	tok := auth.RandomToken(24)

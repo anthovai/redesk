@@ -1,17 +1,15 @@
 package api
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
-	"regexp"
 	"strings"
 	"time"
 
 	"aegiron/server/internal/hub"
 	"aegiron/server/internal/store"
 )
-
-var deviceIDPattern = regexp.MustCompile(`^[0-9]{9}$`)
 
 type deviceView struct {
 	*store.Device
@@ -122,20 +120,75 @@ func (a *API) updateDevice(w http.ResponseWriter, r *http.Request) {
 		Note     string `json:"note"`
 		Disabled bool   `json:"disabled"`
 		GroupID  *int64 `json:"group_id"`
+		// StrategyID: absent = unchanged, null = follow the group's strategy.
+		StrategyID json.RawMessage `json:"strategy_id"`
 	}
 	if !readJSON(w, r, &req) {
 		return
 	}
 	id := r.PathValue("id")
-	if err := a.store.UpdateDevice(r.Context(), id, trim(req.Alias, 64), trim(req.Note, 1000), req.Disabled, req.GroupID); err != nil {
+	cur, err := a.store.GetDevice(r.Context(), id)
+	if err != nil {
+		storeErr(a, w, err)
+		return
+	}
+	strategyID := cur.StrategyID
+	if len(req.StrategyID) > 0 {
+		strategyID = nil
+		if err := json.Unmarshal(req.StrategyID, &strategyID); err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid strategy_id")
+			return
+		}
+	}
+	if err := a.store.UpdateDevice(r.Context(), id, trim(req.Alias, 64), trim(req.Note, 1000), req.Disabled, req.GroupID, strategyID); err != nil {
 		storeErr(a, w, err)
 		return
 	}
 	if req.Disabled {
 		a.hub.Disconnect(id, "device disabled")
 	}
-	a.audit(r, "device.updated", id, map[string]any{"alias": req.Alias, "disabled": req.Disabled, "group_id": req.GroupID})
+	a.audit(r, "device.updated", id, map[string]any{"alias": req.Alias, "note": trim(req.Note, 1000), "disabled": req.Disabled, "group_id": req.GroupID, "strategy_id": strategyID})
+	a.refreshPolicies()
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// changeDeviceID: POST /api/devices/{id}/change-id {"id": "<new id>"}. The agent learns the new
+// id over signaling (or when it next registers) and keeps its key; address books, sessions and
+// recordings follow the device.
+func (a *API) changeDeviceID(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID string `json:"id"`
+	}
+	if !readJSON(w, r, &req) {
+		return
+	}
+	old := r.PathValue("id")
+	newID := normalizeDeviceID(req.ID)
+	if !hub.ValidDeviceID(newID) {
+		writeErr(w, http.StatusBadRequest, "ID ต้องเป็นตัวเลข 9-16 หลัก หรือตัวอักษร a-z ตัวเลข _ - ยาว 6-32 ตัวที่ขึ้นต้นด้วยตัวอักษร")
+		return
+	}
+	if newID == old {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": newID})
+		return
+	}
+	err := a.store.ChangeDeviceID(r.Context(), old, newID, userFrom(r).ID)
+	switch {
+	case errors.Is(err, store.ErrIDTaken):
+		writeCodeErr(w, http.StatusConflict, "id_taken", "ID นี้มีเครื่องอื่นใช้อยู่แล้ว")
+		return
+	case err != nil:
+		storeErr(a, w, err)
+		return
+	}
+	a.hub.IDChanged(old, newID)
+	a.audit(r, "device.id_changed", newID, map[string]any{"from": old, "to": newID})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": newID})
+}
+
+// normalizeDeviceID drops spaces (IDs are shown as "123 456 789") and lowercases custom IDs.
+func normalizeDeviceID(id string) string {
+	return strings.ToLower(strings.ReplaceAll(strings.TrimSpace(id), " ", ""))
 }
 
 func (a *API) deleteDevice(w http.ResponseWriter, r *http.Request) {
@@ -248,8 +301,8 @@ func (a *API) putAddressEntry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("id")
-	if !deviceIDPattern.MatchString(id) {
-		writeErr(w, http.StatusBadRequest, "device id must be 9 digits")
+	if !hub.ValidDeviceID(id) {
+		writeErr(w, http.StatusBadRequest, "invalid device id")
 		return
 	}
 	tags := []string{}
@@ -287,7 +340,7 @@ func (a *API) createSession(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusTooManyRequests, "too many connection attempts")
 		return
 	}
-	id := strings.ReplaceAll(req.DeviceID, " ", "")
+	id := normalizeDeviceID(req.DeviceID)
 	if ok, err := a.canAccess(r, id); err != nil {
 		a.internal(w, err)
 		return
