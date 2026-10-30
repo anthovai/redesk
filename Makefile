@@ -1,4 +1,4 @@
-.PHONY: dev-db dev-guacd server agent web build test
+.PHONY: dev-db dev-guacd server agent web build test e2e
 
 dev-db:        ## local Postgres via Homebrew
 	brew services start postgresql@16
@@ -25,4 +25,7 @@ build:
 test:
 	cd server && go vet ./... && go test ./...
 	cd agent && cargo test
-	cd web && bun run check
+	cd web && bun run check && bun test src
+
+e2e:           ## end-to-end on this machine: isolated server, agent and headless Chrome (docs/TESTING.md)
+	scripts/e2e.sh
