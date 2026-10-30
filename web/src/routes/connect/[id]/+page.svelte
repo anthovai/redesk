@@ -19,6 +19,15 @@
 	let toast = $state('');
 	let showFiles = $state(false);
 	let dragging = $state(false);
+	let confirmRestart = $state(false);
+	// Seconds until the next reconnect attempt after a restart (ticks while waiting).
+	let now = $state(Date.now());
+	$effect(() => {
+		if (viewer.phase !== 'reconnecting') return;
+		const t = setInterval(() => (now = Date.now()), 500);
+		return () => clearInterval(t);
+	});
+	const reconnectIn = $derived(viewer.reconnect ? Math.max(0, Math.ceil((viewer.reconnect.next - now) / 1000)) : 0);
 	const held = new Map<string, string>(); // code -> key, for releasing on blur
 
 	// Floating toolbar (RustDesk-style): pinned stays open, unpinned collapses to a handle.
@@ -253,7 +262,7 @@
 		return [(ev.clientX - r.left) / r.width, (ev.clientY - r.top) / r.height];
 	}
 
-	const live = $derived(viewer.phase === 'connected' && viewer.info?.input !== false);
+	const live = $derived(viewer.phase === 'connected' && viewer.info?.input !== false && !viewer.viewOnly);
 
 	function onPointerMove(ev: PointerEvent) {
 		if (relative) {
@@ -409,6 +418,23 @@
 		if (viewer.notice) flash(viewer.notice.text);
 	});
 
+	function toggleViewOnly() {
+		viewer.setViewOnly(!viewer.viewOnly);
+		releaseAll();
+		flash(viewer.viewOnly ? 'โหมดดูอย่างเดียว: ไม่ส่งเมาส์และคีย์บอร์ด' : 'กลับมาควบคุมได้แล้ว');
+	}
+
+	// Lock: the agent locks the machine itself when it can; older agents get the lock shortcut.
+	function lockRemote() {
+		if (viewer.hasControl('lock')) return viewer.sessionControl('lock');
+		const mac = viewer.info?.os === 'macos';
+		const mods = mac ? [['ControlLeft', 'Control'], ['MetaLeft', 'Meta']] : [['MetaLeft', 'Meta']];
+		const key = mac ? ['KeyQ', 'q'] : ['KeyL', 'l'];
+		for (const [c, k] of [...mods, key]) viewer.key(c, k, true);
+		for (const [c, k] of [key, ...mods.reverse()]) viewer.key(c, k, false);
+		flash('ส่งคำสั่งล็อกหน้าจอแล้ว');
+	}
+
 	const tb = (active = false) =>
 		`grid size-8 shrink-0 place-items-center rounded-md transition-colors ${active ? 'bg-accent-soft text-accent' : 'text-fg/75 hover:bg-raised hover:text-fg'}`;
 	const mi = 'flex w-full items-center gap-2.5 px-3 py-1.5 text-left text-sm transition-colors hover:bg-accent hover:text-accent-fg';
@@ -490,6 +516,39 @@
 				role="status"
 			>
 				<span class="size-2 animate-pulse rounded-full bg-[#ff453a]"></span> กำลังบันทึก
+			</div>
+		{/if}
+
+		{#if viewer.phase === 'connected' && (viewer.viewOnly || viewer.controls.block_input || viewer.controls.privacy || viewer.controls.lock_after)}
+			<!-- Controls in effect on the remote machine. -->
+			<div class="pointer-events-none absolute bottom-3 left-3 flex flex-wrap gap-1.5" role="status">
+				{#each [[viewer.viewOnly, 'ดูอย่างเดียว'], [viewer.controls.privacy, 'จอปลายทางถูกซ่อน'], [viewer.controls.block_input && !viewer.controls.privacy, 'บล็อกเมาส์/คีย์บอร์ดปลายทาง'], [viewer.controls.lock_after, 'ล็อกเมื่อจบ']] as [on, label] (label)}
+					{#if on}<span class="rounded-full bg-black/65 px-3 py-1 text-xs font-medium text-white shadow-lg backdrop-blur-sm">{label}</span>{/if}
+				{/each}
+			</div>
+		{/if}
+
+		{#if confirmRestart && viewer.phase === 'connected'}
+			<div class="absolute inset-0 z-20 grid place-items-center bg-black/30 p-4">
+				<div class="w-full max-w-[400px] overflow-hidden rounded-xl bg-surface text-fg shadow-[0_20px_60px_rgb(0_0_0/0.5)]" role="alertdialog" aria-modal="true">
+					<div class="flex items-start gap-3 px-6 pt-5 pb-4">
+						<span class="grid size-9 shrink-0 place-items-center rounded-full bg-danger-soft text-danger"><Icon name="power" size={18} /></span>
+						<div class="min-w-0 pt-1.5">
+							<h2 class="font-semibold">รีสตาร์ทเครื่องปลายทาง?</h2>
+							<p class="mt-1 text-sm text-muted">{peerName} จะปิดโปรแกรมทั้งหมดแล้วเริ่มใหม่ งานที่ยังไม่บันทึกอาจหายไป เมื่อเครื่องกลับมาออนไลน์ หน้านี้จะเชื่อมต่อให้อีกครั้ง</p>
+						</div>
+					</div>
+					<div class="flex justify-end gap-2 border-t border-line bg-raised/60 px-6 py-3">
+						<button class="btn min-w-20" onclick={() => (confirmRestart = false)}>ยกเลิก</button>
+						<button
+							class="btn btn-primary min-w-20"
+							onclick={() => {
+								confirmRestart = false;
+								viewer.sessionControl('restart');
+							}}>รีสตาร์ท</button
+						>
+					</div>
+				</div>
 			</div>
 		{/if}
 
@@ -609,8 +668,51 @@
 									{#if viewer.info?.input}
 										<button class={mi} role="menuitem" onclick={() => act(sendCtrlAltDel)}><Icon name="keyboard" size={15} /> ส่ง Ctrl+Alt+Del</button>
 									{/if}
+									{#if viewer.hasControl('lock') || (viewer.info?.input && !viewer.viewOnly)}
+										<button class={mi} role="menuitem" onclick={() => act(lockRemote)}><Icon name="lock" size={15} /> ล็อกหน้าจอเครื่องปลายทาง</button>
+									{/if}
+									{#if viewer.hasControl('lock')}
+										<button class={mi} role="menuitemcheckbox" aria-checked={viewer.controls.lock_after} onclick={() => act(() => viewer.sessionControl('lock_after', !viewer.controls.lock_after))}>
+											<Icon name="lock" size={15} /> <span class="flex-1">ล็อกเมื่อจบการเชื่อมต่อ</span>
+											{#if viewer.controls.lock_after}<Icon name="check" size={15} />{/if}
+										</button>
+									{/if}
+									{#if viewer.hasControl('restart')}
+										<button class={mi} role="menuitem" onclick={() => act(() => (confirmRestart = true))}><Icon name="power" size={15} /> รีสตาร์ทเครื่องปลายทาง</button>
+									{/if}
 									<button class={mi} role="menuitem" onclick={() => act(() => viewer.refresh())}><Icon name="refresh" size={15} /> รีเฟรชภาพ (ขอคีย์เฟรมใหม่)</button>
 									<button class={mi} role="menuitem" disabled={!viewer.frame.w} onclick={() => act(saveScreenshot)}><Icon name="camera" size={15} /> บันทึกภาพหน้าจอ</button>
+									{#if viewer.info?.input}
+										<div class="my-1 border-t border-line"></div>
+										<button class={mi} role="menuitemcheckbox" aria-checked={viewer.viewOnly} onclick={() => act(toggleViewOnly)}>
+											<Icon name="eye" size={15} /> <span class="flex-1">ดูอย่างเดียว</span>
+											{#if viewer.viewOnly}<Icon name="check" size={15} />{/if}
+										</button>
+										{#if viewer.hasControl('block_input')}
+											<button
+												class={mi}
+												role="menuitemcheckbox"
+												aria-checked={viewer.controls.block_input}
+												title="คนที่เครื่องปลายทางใช้เมาส์และคีย์บอร์ดไม่ได้ จนกว่าจะปิดหรือจบการเชื่อมต่อ (กด Ctrl+Alt+Shift+Esc ที่เครื่องนั้นเพื่อยกเลิก)"
+												onclick={() => act(() => viewer.sessionControl('block_input', !viewer.controls.block_input))}
+											>
+												<Icon name="ban" size={15} /> <span class="flex-1">บล็อกเมาส์และคีย์บอร์ดปลายทาง</span>
+												{#if viewer.controls.block_input}<Icon name="check" size={15} />{/if}
+											</button>
+										{/if}
+										{#if viewer.hasControl('privacy')}
+											<button
+												class={mi}
+												role="menuitemcheckbox"
+												aria-checked={viewer.controls.privacy}
+												title="หน้าจอปลายทางเป็นสีดำสำหรับคนที่อยู่หน้าเครื่อง แต่คุณยังเห็นภาพตามปกติ และบล็อกเมาส์/คีย์บอร์ดของเครื่องนั้นด้วย"
+												onclick={() => act(() => viewer.sessionControl('privacy', !viewer.controls.privacy))}
+											>
+												<Icon name="shield" size={15} /> <span class="flex-1">โหมดความเป็นส่วนตัว</span>
+												{#if viewer.controls.privacy}<Icon name="check" size={15} />{/if}
+											</button>
+										{/if}
+									{/if}
 									{#if viewer.info?.clipboard || viewer.info?.input}
 										<div class="my-1 border-t border-line"></div>
 									{/if}
@@ -898,6 +1000,28 @@
 								<button class="btn btn-primary min-w-20" disabled={viewer.authBusy}>{viewer.authBusy ? 'กำลังตรวจสอบ…' : 'ตกลง'}</button>
 							</div>
 						</form>
+					{:else if viewer.phase === 'reconnecting'}
+						<div class="flex items-center gap-3 px-6 pt-5">
+							<span class="grid size-9 shrink-0 place-items-center rounded-full bg-accent-soft text-accent"><Icon name="power" size={18} /></span>
+							<div class="min-w-0">
+								<h2 class="font-semibold">เครื่องปลายทางกำลังรีสตาร์ท</h2>
+								<p class="truncate text-xs text-muted">{peerName} · <span class="mono">{formatId(viewer.deviceId)}</span></p>
+							</div>
+						</div>
+						<div class="px-6 py-5" role="status">
+							<p class="text-sm">
+								{reconnectIn > 0
+									? `รอให้เครื่องกลับมาออนไลน์ · ลองครั้งที่ ${viewer.reconnect?.attempt ?? 1} ใน ${reconnectIn} วินาที`
+									: `กำลังเชื่อมต่ออีกครั้ง (ครั้งที่ ${viewer.reconnect?.attempt ?? 1})…`}
+							</p>
+							<div class="mt-3 h-1 overflow-hidden rounded-full bg-raised">
+								<div class="progress h-full w-1/3 rounded-full bg-accent"></div>
+							</div>
+							<p class="mt-3 text-xs text-muted">จะเชื่อมต่อให้อัตโนมัติโดยไม่ต้องใส่รหัสผ่าน (ภายใน 15 นาที)</p>
+						</div>
+						<div class="flex justify-end border-t border-line bg-raised/60 px-6 py-3">
+							<button class="btn min-w-20" onclick={() => viewer.close()}>เลิกรอ</button>
+						</div>
 					{:else if viewer.phase === 'closed'}
 						<div class="flex items-start gap-3 px-6 pt-5 pb-4">
 							<span class="grid size-9 shrink-0 place-items-center rounded-full {viewer.error ? 'bg-danger-soft text-danger' : 'bg-raised text-muted'}">

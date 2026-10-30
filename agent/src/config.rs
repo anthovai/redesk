@@ -111,6 +111,14 @@ pub struct PolicySettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_resolution: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_block_input: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_privacy_mode: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_lock: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_restart: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_tunnel: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_tunnel_lan: Option<bool>,
@@ -139,6 +147,10 @@ pub enum Managed {
     AllowAudio,
     AllowWhiteboard,
     AllowResolution,
+    AllowBlockInput,
+    AllowPrivacyMode,
+    AllowLock,
+    AllowRestart,
     AllowTunnel,
     AllowTunnelLan,
     AllowTerminal,
@@ -223,6 +235,20 @@ pub struct Config {
     /// Let viewers change this machine's display resolution (restored when the session ends).
     #[serde(default = "yes")]
     pub allow_resolution: bool,
+    /// Let viewers block the keyboard and mouse of this machine during their session (also
+    /// needs `allow_input`; macOS and Windows).
+    #[serde(default = "yes")]
+    pub allow_block_input: bool,
+    /// Let viewers black out this screen for people at the machine while they still see it
+    /// (also needs `allow_input`; Windows 10 2004+, and macOS with the desktop app).
+    #[serde(default = "yes")]
+    pub allow_privacy_mode: bool,
+    /// Let viewers lock this machine, now or when their session ends.
+    #[serde(default = "yes")]
+    pub allow_lock: bool,
+    /// Let viewers restart this machine (macOS and Windows).
+    #[serde(default = "yes")]
+    pub allow_restart: bool,
     /// Allow direct sessions (LAN/TCP and P2P over UDP hole punching). False = always through
     /// the server relay (enterprise policy). Applies to both incoming and outgoing sessions.
     #[serde(default = "yes")]
@@ -247,9 +273,9 @@ pub struct Config {
     /// owner-only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trusted_logins: Vec<TrustedLogin>,
-    /// Lock this machine's screen when a remote session ends (strategy key of the same name).
-    /// The only caller is session::LockOnEnd -> power::lock_screen, so another lock
-    /// implementation can replace it without touching the config or the strategy.
+    /// Lock this machine's screen whenever a remote session ends (strategy key of the same
+    /// name). Done by the session controls (controls::SessionCtl), like a viewer's
+    /// "lock after session", but without needing `allow_lock`.
     #[serde(default)]
     pub lock_after_session: bool,
     /// The organisation's strategy for this device, as last received from the server (kept so
@@ -297,6 +323,10 @@ impl Config {
             unlock_pin: None,
             allow_whiteboard: true,
             allow_resolution: true,
+            allow_block_input: true,
+            allow_privacy_mode: true,
+            allow_lock: true,
+            allow_restart: true,
             direct_enabled: true,
             direct_port: crate::direct::DEFAULT_PORT,
             proxy: None,
@@ -323,6 +353,10 @@ impl Config {
             Managed::AllowAudio => s.allow_audio.is_some(),
             Managed::AllowWhiteboard => s.allow_whiteboard.is_some(),
             Managed::AllowResolution => s.allow_resolution.is_some(),
+            Managed::AllowBlockInput => s.allow_block_input.is_some(),
+            Managed::AllowPrivacyMode => s.allow_privacy_mode.is_some(),
+            Managed::AllowLock => s.allow_lock.is_some(),
+            Managed::AllowRestart => s.allow_restart.is_some(),
             Managed::AllowTunnel => s.allow_tunnel.is_some(),
             Managed::AllowTunnelLan => s.allow_tunnel_lan.is_some(),
             Managed::AllowTerminal => s.allow_terminal.is_some(),
@@ -342,6 +376,7 @@ impl Config {
             (self.allow_input, self.allow_clipboard, self.allow_file_transfer, self.allow_audio, self.allow_whiteboard),
             (self.direct_enabled, self.lan_discovery, self.lock_after_session),
             (self.allow_resolution, self.allow_tunnel, self.allow_tunnel_lan, self.allow_terminal),
+            (self.allow_block_input, self.allow_privacy_mode, self.allow_lock, self.allow_restart),
         );
         let s = &p.settings;
         fn set<T: Copy>(dst: &mut T, v: Option<T>) {
@@ -360,6 +395,10 @@ impl Config {
         set(&mut self.allow_audio, s.allow_audio);
         set(&mut self.allow_whiteboard, s.allow_whiteboard);
         set(&mut self.allow_resolution, s.allow_resolution);
+        set(&mut self.allow_block_input, s.allow_block_input);
+        set(&mut self.allow_privacy_mode, s.allow_privacy_mode);
+        set(&mut self.allow_lock, s.allow_lock);
+        set(&mut self.allow_restart, s.allow_restart);
         set(&mut self.allow_tunnel, s.allow_tunnel);
         set(&mut self.allow_tunnel_lan, s.allow_tunnel_lan);
         set(&mut self.allow_terminal, s.allow_terminal);
@@ -373,6 +412,7 @@ impl Config {
             (self.allow_input, self.allow_clipboard, self.allow_file_transfer, self.allow_audio, self.allow_whiteboard),
             (self.direct_enabled, self.lan_discovery, self.lock_after_session),
             (self.allow_resolution, self.allow_tunnel, self.allow_tunnel_lan, self.allow_terminal),
+            (self.allow_block_input, self.allow_privacy_mode, self.allow_lock, self.allow_restart),
         );
         before != after
     }
@@ -498,7 +538,7 @@ mod tests {
         c.permanent_password = Some("hash".into());
         c.verification = Verification::Both;
         let p: Policy = serde_json::from_str(
-            r#"{"id":3,"name":"Kiosk","settings":{"allow_terminal":false,"allow_tunnel":true,"approve_mode":"click","allow_file_transfer":false,"allow_permanent_password":false,"direct_enabled":false,"lock_after_session":true,"record_sessions":true}}"#,
+            r#"{"id":3,"name":"Kiosk","settings":{"allow_restart":false,"allow_terminal":false,"allow_tunnel":true,"approve_mode":"click","allow_file_transfer":false,"allow_permanent_password":false,"direct_enabled":false,"lock_after_session":true,"record_sessions":true}}"#,
         )
         .unwrap();
         assert!(c.set_policy(Some(p.clone())));
@@ -507,6 +547,7 @@ mod tests {
         assert_eq!((c.verification, c.permanent_password.as_deref()), (Verification::Temporary, None));
         assert!(c.is_managed(Managed::AllowFileTransfer) && c.is_managed(Managed::PermanentPassword));
         assert!(!c.is_managed(Managed::AllowInput) && c.allow_input);
+        assert!(!c.allow_restart && c.is_managed(Managed::AllowRestart) && !c.is_managed(Managed::AllowLock));
         assert!(c.allow_tunnel && !c.allow_terminal && c.is_managed(Managed::AllowTerminal) && !c.is_managed(Managed::AllowTunnelLan));
         // Same policy again: nothing to save.
         assert!(!c.set_policy(Some(p)));

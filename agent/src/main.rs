@@ -81,6 +81,19 @@ enum Cmd {
         /// Send this machine's audio to viewers (macOS 13+, Windows).
         #[arg(long)]
         allow_audio: Option<bool>,
+        /// Let viewers block this machine's keyboard and mouse (needs input; macOS, Windows)
+        #[arg(long)]
+        allow_block_input: Option<bool>,
+        /// Let viewers black out this screen while they control it (needs input; Windows 10 2004+,
+        /// macOS with the desktop app)
+        #[arg(long)]
+        allow_privacy_mode: Option<bool>,
+        /// Let viewers lock this machine, now or when the session ends
+        #[arg(long)]
+        allow_lock: Option<bool>,
+        /// Let viewers restart this machine (macOS, Windows)
+        #[arg(long)]
+        allow_restart: Option<bool>,
         /// H.264 encoder: auto (hardware when available) or software (OpenH264)
         #[arg(long, value_enum)]
         video_encoder: Option<EncoderPref>,
@@ -276,6 +289,10 @@ async fn main() -> Result<()> {
             allow_whiteboard,
             allow_resolution,
             allow_audio,
+            allow_block_input,
+            allow_privacy_mode,
+            allow_lock,
+            allow_restart,
             video_encoder,
             max_fps,
             jpeg_quality,
@@ -301,6 +318,10 @@ async fn main() -> Result<()> {
                 (Managed::AllowWhiteboard, allow_whiteboard.is_some()),
                 (Managed::AllowAudio, allow_audio.is_some()),
                 (Managed::AllowResolution, allow_resolution.is_some()),
+                (Managed::AllowBlockInput, allow_block_input.is_some()),
+                (Managed::AllowPrivacyMode, allow_privacy_mode.is_some()),
+                (Managed::AllowLock, allow_lock.is_some()),
+                (Managed::AllowRestart, allow_restart.is_some()),
                 (Managed::AllowTunnel, allow_tunnel.is_some()),
                 (Managed::AllowTunnelLan, allow_tunnel_lan.is_some()),
                 (Managed::AllowTerminal, allow_terminal.is_some()),
@@ -321,6 +342,10 @@ async fn main() -> Result<()> {
             if let Some(v) = allow_whiteboard { c.allow_whiteboard = v; }
             if let Some(v) = allow_resolution { c.allow_resolution = v; }
             if let Some(v) = allow_audio { c.allow_audio = v; }
+            if let Some(v) = allow_block_input { c.allow_block_input = v; }
+            if let Some(v) = allow_privacy_mode { c.allow_privacy_mode = v; }
+            if let Some(v) = allow_lock { c.allow_lock = v; }
+            if let Some(v) = allow_restart { c.allow_restart = v; }
             if let Some(v) = video_encoder { c.video_encoder = v; }
             if let Some(v) = max_fps { c.max_fps = v.clamp(1, 60); }
             if let Some(v) = jpeg_quality { c.jpeg_quality = v.clamp(10, 95); }
@@ -362,6 +387,7 @@ async fn main() -> Result<()> {
             println!("Device key:   {}", fingerprint(identity(&c)?.verifying_key().as_bytes()));
             println!("Server key:   {}", fingerprint(&B64.decode(&c.server_key)?));
             println!("Input: {}, clipboard: {}, file transfer: {}, whiteboard: {}, resolution: {}, audio: {}", c.allow_input, c.allow_clipboard, c.allow_file_transfer, c.allow_whiteboard, c.allow_resolution, c.allow_audio);
+            println!("Controls:     block input {}, privacy mode {}, lock {}, restart {}", c.allow_block_input, c.allow_privacy_mode, c.allow_lock, c.allow_restart);
             println!("Encoder:      {:?}", c.video_encoder);
             let tunnel = match (c.allow_tunnel, c.allow_tunnel_lan) {
                 (false, _) => "off",
@@ -437,6 +463,10 @@ fn refuse_managed(c: &Config, wanted: &[(Managed, bool)]) -> Result<()> {
         Managed::AllowAudio => "--allow-audio",
         Managed::AllowWhiteboard => "--allow-whiteboard",
         Managed::AllowResolution => "--allow-resolution",
+        Managed::AllowBlockInput => "--allow-block-input",
+        Managed::AllowPrivacyMode => "--allow-privacy-mode",
+        Managed::AllowLock => "--allow-lock",
+        Managed::AllowRestart => "--allow-restart",
         Managed::AllowTunnel => "--allow-tunnel",
         Managed::AllowTunnelLan => "--allow-tunnel-lan",
         Managed::AllowTerminal => "--allow-terminal",

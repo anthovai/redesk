@@ -316,6 +316,10 @@ export interface StrategySettings {
 	allow_audio?: boolean;
 	allow_whiteboard?: boolean;
 	allow_resolution?: boolean;
+	allow_block_input?: boolean;
+	allow_privacy_mode?: boolean;
+	allow_lock?: boolean;
+	allow_restart?: boolean;
 	allow_tunnel?: boolean;
 	allow_tunnel_lan?: boolean;
 	allow_terminal?: boolean;

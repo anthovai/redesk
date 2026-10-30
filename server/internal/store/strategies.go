@@ -21,6 +21,11 @@ type StrategySettings struct {
 	AllowAudio             *bool `json:"allow_audio,omitempty"`
 	AllowWhiteboard        *bool `json:"allow_whiteboard,omitempty"`
 	AllowResolution        *bool `json:"allow_resolution,omitempty"`
+	// Session controls a viewer may use (block input, privacy mode, lock, restart).
+	AllowBlockInput  *bool `json:"allow_block_input,omitempty"`
+	AllowPrivacyMode *bool `json:"allow_privacy_mode,omitempty"`
+	AllowLock        *bool `json:"allow_lock,omitempty"`
+	AllowRestart     *bool `json:"allow_restart,omitempty"`
 	// Tunnels and the remote terminal (allow_tunnel_lan: tunnels may reach other LAN hosts).
 	AllowTunnel    *bool `json:"allow_tunnel,omitempty"`
 	AllowTunnelLAN *bool `json:"allow_tunnel_lan,omitempty"`

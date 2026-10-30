@@ -475,7 +475,7 @@ impl App {
             };
             changed |= row(ui, "อนุญาตให้เปลี่ยนความละเอียด", hint, &mut res, Managed::AllowResolution);
             sep(ui);
-            changed |= row(ui, "ล็อกหน้าจอเมื่อจบเซสชัน", "ล็อกเครื่องนี้ทันทีที่ผู้ควบคุมคนสุดท้ายตัดการเชื่อมต่อ", &mut lock, Managed::LockAfterSession);
+            changed |= row(ui, "ล็อกหน้าจอเมื่อจบเซสชัน", "ล็อกเครื่องนี้ทุกครั้งที่จบการเชื่อมต่อ", &mut lock, Managed::LockAfterSession);
             changed
         });
         if changed {
@@ -513,6 +513,41 @@ impl App {
                 c.allow_tunnel = tunnel;
                 c.allow_tunnel_lan = lan;
                 c.allow_terminal = term;
+            });
+        }
+
+        card_title(ui, "การควบคุมเครื่องนี้จากระยะไกล");
+        let (mut block, mut privacy, mut lock, mut restart) = (c.allow_block_input, c.allow_privacy_mode, c.allow_lock, c.allow_restart);
+        let supports = crate::controls::platform().supports(true);
+        let changed = card(ui, |ui| {
+            let needs_input = if c.allow_input { "" } else { " (ต้องเปิด \"ควบคุมเมาส์และคีย์บอร์ด\" ด้วย)" };
+            let mut changed = row(
+                ui,
+                "บล็อกเมาส์และคีย์บอร์ดของเครื่องนี้",
+                &format!("ผู้ควบคุมสั่งให้คนที่อยู่หน้าเครื่องใช้เมาส์/คีย์บอร์ดไม่ได้ระหว่างเชื่อมต่อ กด {} เพื่อยกเลิกได้เสมอ{needs_input}", crate::controls::ESCAPE_HINT),
+                &mut block,
+                Managed::AllowBlockInput,
+            );
+            sep(ui);
+            let hint = if supports[1] {
+                format!("ผู้ควบคุมทำให้จอของเครื่องนี้เป็นสีดำ (แต่ตัวเองยังเห็นภาพ) และบล็อกเมาส์/คีย์บอร์ด{needs_input}")
+            } else {
+                "ต้องใช้ Windows 10 (2004) ขึ้นไป หรือแอป Aegiron บน macOS".to_string()
+            };
+            changed |= row(ui, "โหมดความเป็นส่วนตัว", &hint, &mut privacy, Managed::AllowPrivacyMode);
+            sep(ui);
+            changed |= row(ui, "ล็อกหน้าจอ", "ผู้ควบคุมล็อกเครื่องนี้ได้ทันที หรือให้ล็อกเมื่อจบการเชื่อมต่อ", &mut lock, Managed::AllowLock);
+            sep(ui);
+            let hint = if supports[3] { "ผู้ควบคุมรีสตาร์ทเครื่องนี้ได้ แล้วเชื่อมต่อกลับเองเมื่อเครื่องเปิดขึ้นมา (ต้องตั้งให้ Aegiron เริ่มอัตโนมัติ)" } else { "รองรับเฉพาะ macOS และ Windows" };
+            changed |= row(ui, "รีสตาร์ทเครื่อง", hint, &mut restart, Managed::AllowRestart);
+            changed
+        });
+        if changed {
+            self.save_config(|c| {
+                c.allow_block_input = block;
+                c.allow_privacy_mode = privacy;
+                c.allow_lock = lock;
+                c.allow_restart = restart;
             });
         }
 

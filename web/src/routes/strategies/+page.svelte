@@ -12,12 +12,16 @@
 		{ key: 'allow_audio', label: 'ส่งเสียง', hint: '' },
 		{ key: 'allow_whiteboard', label: 'วาดบนหน้าจอ', hint: '' },
 		{ key: 'allow_resolution', label: 'เปลี่ยนความละเอียดหน้าจอ', hint: '' },
+		{ key: 'allow_block_input', label: 'บล็อกเมาส์/คีย์บอร์ดของเครื่อง', hint: '' },
+		{ key: 'allow_privacy_mode', label: 'โหมดความเป็นส่วนตัว', hint: '' },
+		{ key: 'allow_lock', label: 'ผู้ควบคุมสั่งล็อกหน้าจอ', hint: '' },
+		{ key: 'allow_restart', label: 'ผู้ควบคุมสั่งรีสตาร์ท', hint: '' },
 		{ key: 'allow_tunnel', label: 'TCP tunnel', hint: '' },
 		{ key: 'allow_tunnel_lan', label: 'tunnel ไปเครื่องอื่นใน LAN', hint: 'ปิด = tunnel ไปได้เฉพาะ localhost ของเครื่องนั้น' },
 		{ key: 'allow_terminal', label: 'เทอร์มินัล', hint: '' },
 		{ key: 'direct_enabled', label: 'เชื่อมต่อโดยตรง (LAN / P2P)', hint: 'ปิด = ทุกเซสชันผ่าน relay ของเซิร์ฟเวอร์' },
 		{ key: 'lan_discovery', label: 'ให้เครื่องในวงแลนค้นพบ', hint: '' },
-		{ key: 'lock_after_session', label: 'ล็อกหน้าจอเมื่อจบเซสชัน', hint: '' },
+		{ key: 'lock_after_session', label: 'ล็อกหน้าจอเมื่อจบเซสชัน', hint: 'ทุกเซสชัน ไม่ขึ้นกับการอนุญาตให้ผู้ควบคุมสั่งล็อก' },
 		{ key: 'record_sessions', label: 'บันทึกทุกเซสชัน', hint: 'บังคับที่เซิร์ฟเวอร์ ไม่ว่าตั้งค่าบันทึกเซสชันไว้อย่างไร' }
 	];
 

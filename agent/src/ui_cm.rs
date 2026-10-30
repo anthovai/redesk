@@ -60,6 +60,10 @@ struct Perms {
     files: bool,
     whiteboard: bool,
     audio: bool,
+    block_input: bool,
+    privacy: bool,
+    lock: bool,
+    restart: bool,
 }
 
 fn split_who(who: &str) -> (String, String) {
@@ -111,6 +115,10 @@ enum Glyph {
     Folder,
     Pen,
     Speaker,
+    Block,
+    Shield,
+    Lock,
+    Power,
 }
 
 fn glyph(ui: &Ui, rect: Rect, g: Glyph, color: Color32) {
@@ -156,6 +164,28 @@ fn glyph(ui: &Ui, rect: Rect, g: Glyph, color: Color32) {
             p.line_segment([at(12.2, 8.0), at(11.0, 10.5)], st);
             p.line_segment([at(13.4, 3.5), at(15.0, 8.0)], st);
             p.line_segment([at(15.0, 8.0), at(13.4, 12.5)], st);
+        }
+        Glyph::Block => {
+            p.circle_stroke(at(8.0, 8.0), 6.4 * s, st);
+            p.line_segment([at(3.5, 12.5), at(12.5, 3.5)], st);
+        }
+        Glyph::Shield => {
+            p.add(Shape::closed_line(vec![at(8.0, 1.5), at(14.0, 3.8), at(13.2, 10.0), at(8.0, 14.6), at(2.8, 10.0), at(2.0, 3.8)], st));
+            p.line_segment([at(5.2, 8.0), at(10.8, 8.0)], st);
+        }
+        Glyph::Lock => {
+            p.rect_filled(Rect::from_min_max(at(2.8, 7.0), at(13.2, 14.6)), 2.0 * s, color);
+            p.rect_stroke(Rect::from_min_max(at(5.0, 2.0), at(11.0, 9.0)), 3.0 * s, st, egui::StrokeKind::Middle);
+        }
+        Glyph::Power => {
+            let pts: Vec<Pos2> = (0..=24)
+                .map(|i| {
+                    let a = (-0.17 + 0.84 * i as f32 / 24.0) * std::f32::consts::TAU;
+                    at(8.0 + 5.6 * a.cos(), 8.8 + 5.6 * a.sin())
+                })
+                .collect();
+            p.add(Shape::line(pts, st));
+            p.line_segment([at(8.0, 1.6), at(8.0, 7.6)], st);
         }
     }
 }
@@ -207,9 +237,21 @@ impl App {
             .as_ref()
             .map(|a| {
                 let c = a.config.lock().unwrap();
-                Perms { input: c.allow_input, clipboard: c.allow_clipboard, files: c.allow_file_transfer, whiteboard: c.allow_whiteboard, audio: c.allow_audio }
+                // What viewers may use here (the device setting and what this platform can do).
+                let ctl = crate::controls::Perms::new(&c, crate::controls::platform().supports(true));
+                Perms {
+                    input: c.allow_input,
+                    clipboard: c.allow_clipboard,
+                    files: c.allow_file_transfer,
+                    whiteboard: c.allow_whiteboard,
+                    audio: c.allow_audio,
+                    block_input: ctl.block_input,
+                    privacy: ctl.privacy,
+                    lock: ctl.lock,
+                    restart: ctl.restart,
+                }
             })
-            .unwrap_or(Perms { input: false, clipboard: false, files: false, whiteboard: false, audio: false });
+            .unwrap_or(Perms { input: false, clipboard: false, files: false, whiteboard: false, audio: false, block_input: false, privacy: false, lock: false, restart: false });
 
         // Tabs in arrival order: live sessions, then requests waiting for an answer.
         let mut entries: Vec<Entry> = sessions
@@ -294,6 +336,11 @@ impl App {
                 vctx.send_viewport_cmd(ViewportCommand::Minimized(false));
                 vctx.send_viewport_cmd(ViewportCommand::Focus);
                 vctx.send_viewport_cmd(ViewportCommand::RequestUserAttention(egui::UserAttentionType::Critical));
+            }
+            // While a viewer blocks this machine's input, local clicks still reach this window
+            // (macOS asks the input blocker; Windows hit-tests the window itself).
+            if let Some(r) = ui.input(|i| i.viewport().outer_rect) {
+                crate::block_input::set_passthrough(vec![[r.left(), r.top(), r.width(), r.height()]]);
             }
             if ui.input(|i| i.viewport().close_requested()) {
                 // Closing would hide a request or a live session: keep it, out of the way.
@@ -583,6 +630,27 @@ fn details(ui: &mut Ui, e: &Entry, perms: Perms) {
             let text = if matches!(e.kind, Kind::Pending(..)) { "เซสชันนี้จะถูกบันทึก" } else { "กำลังบันทึก" };
             recording_chip(ui, text);
         }
+        if let Kind::Session(s) = &e.kind {
+            // What the viewer turned on, so the person here always knows.
+            let c = &s.controls;
+            let on = |f: &std::sync::atomic::AtomicBool| f.load(Ordering::Relaxed);
+            let states = [
+                (on(&c.view_only), "ผู้ควบคุมดูอย่างเดียว", pal.accent),
+                (on(&c.privacy), "หน้าจอนี้ถูกซ่อน (โหมดความเป็นส่วนตัว)", pal.danger),
+                (on(&c.block_input) && !on(&c.privacy), "เมาส์และคีย์บอร์ดของเครื่องนี้ถูกบล็อก", pal.danger),
+                (on(&c.lock_after), "จะล็อกเครื่องเมื่อจบการเชื่อมต่อ", pal.warn),
+            ];
+            for (show, text, color) in states {
+                if show {
+                    ui.add_space(6.0);
+                    state_chip(ui, text, color);
+                }
+            }
+            if on(&c.block_input) || on(&c.privacy) {
+                ui.add_space(4.0);
+                ui.label(RichText::new(format!("กด {} หรือ ตัดการเชื่อมต่อ เพื่อใช้เครื่องได้ทันที", crate::controls::ESCAPE_HINT)).size(12.0).color(pal.muted));
+            }
+        }
     });
     ui.add_space(14.0);
     if !e.purpose.is_empty() {
@@ -615,6 +683,24 @@ fn details(ui: &mut Ui, e: &Entry, perms: Perms) {
         perm_tile(ui, Glyph::Pen, "วาดบนหน้าจอ", perms.whiteboard, size);
         perm_tile(ui, Glyph::Speaker, "เสียง", perms.audio, size);
     });
+    ui.horizontal(|ui| {
+        perm_tile(ui, Glyph::Block, "บล็อกอินพุต", perms.block_input, size);
+        perm_tile(ui, Glyph::Shield, "โหมดส่วนตัว", perms.privacy, size);
+    });
+    ui.horizontal(|ui| {
+        perm_tile(ui, Glyph::Lock, "ล็อกหน้าจอ", perms.lock, size);
+        perm_tile(ui, Glyph::Power, "รีสตาร์ท", perms.restart, size);
+    });
+}
+
+/// A centered status chip: colored dot and text on a soft tint.
+fn state_chip(ui: &mut Ui, text: &str, color: Color32) {
+    let pal = Palette::of(ui);
+    let galley = ui.painter().layout(text.to_owned(), semi(12.5), pal.fg, ui.available_width() - 40.0);
+    let (r, _) = ui.allocate_exact_size(galley.size() + vec2(36.0, 8.0), Sense::hover());
+    ui.painter().rect_filled(r, 12.0, color.gamma_multiply(0.14));
+    ui.painter().circle_filled(r.left_center() + vec2(14.0, 0.0), 4.0, color);
+    ui.painter().galley(pos2(r.left() + 24.0, r.center().y - galley.size().y / 2.0), galley, pal.fg);
 }
 
 /// Red "recording" chip: the person at this machine always sees when a session is recorded.
