@@ -117,6 +117,11 @@
 						{:else}
 							<span class="mono">{formatId(s.device_id)}</span>
 						{/if}
+						{#if s.type === 'terminal'}
+							<span class="badge" title="เทอร์มินัล (shell) บนเครื่องปลายทาง">เทอร์มินัล</span>
+						{:else if s.type === 'tunnel'}
+							<span class="badge" title="TCP tunnel">tunnel → <span class="mono">{s.target}</span></span>
+						{/if}
 					</td>
 					<td class="{cls} whitespace-nowrap">{label}</td>
 					<td class="whitespace-nowrap">{duration(s.started_at, s.ended_at)}</td>

@@ -187,6 +187,12 @@ enum ServerMsg {
         /// Present when the viewer may also connect directly (see direct.rs).
         #[serde(default)]
         direct: Option<crate::direct::Offer>,
+        /// Session type ("screen", "tunnel", "terminal"); absent = screen.
+        #[serde(default, rename = "type")]
+        kind: Option<String>,
+        /// Tunnel target `host:port`.
+        #[serde(default)]
+        target: Option<String>,
     },
     /// Wake-on-LAN request: send magic packets for these MACs on our LAN.
     #[serde(rename = "wol")]
@@ -282,7 +288,7 @@ async fn run_once(agent: &Arc<Agent>) -> Result<()> {
         "lan": net.lan,
         // Advertised even when direct sessions are off: the agent then declines each offer at
         // once (see direct::agent_link), so toggling the setting needs no reconnect.
-        "features": [crate::direct::FEATURE],
+        "features": [crate::direct::FEATURE, crate::remote::FEATURE_TUNNEL, crate::remote::FEATURE_TERMINAL],
         "nat": crate::direct::nat_type().map(|n| n.as_str()),
     });
     tx.send(Message::Text(reg.to_string().into())).await?;
@@ -346,11 +352,18 @@ async fn run_once(agent: &Arc<Agent>) -> Result<()> {
             m = tokio::time::timeout(Duration::from_secs(70), rx.next()) => {
                 let Some(m) = m.context("server silent for 70s")? else { return Ok(()) };
                 match parse(m?) {
-                    Some(ServerMsg::Session { sid, token, relay, viewer, record, direct }) => {
+                    Some(ServerMsg::Session { sid, token, relay, viewer, record, direct, kind, target }) => {
                         let agent = agent.clone();
                         tokio::spawn(async move {
                             tracing::info!("session {sid} requested by {} from {}", viewer.email, viewer.ip);
-                            if let Err(e) = crate::session::run(agent.clone(), &sid, &token, &relay, viewer, record, direct).await {
+                            let kind = match crate::remote::SessionKind::from_request(kind.as_deref(), target.as_deref()) {
+                                Ok(k) => k,
+                                Err(e) => {
+                                    agent.send_server(json!({"t": "session_reject", "sid": sid, "reason": format!("{e}")}));
+                                    return;
+                                }
+                            };
+                            if let Err(e) = crate::session::run(agent.clone(), &sid, &token, &relay, viewer, record, direct, kind).await {
                                 tracing::warn!("session {sid} ended: {e:#}");
                                 agent.send_server(json!({"t": "session_reject", "sid": sid, "reason": format!("{e}")}));
                             }

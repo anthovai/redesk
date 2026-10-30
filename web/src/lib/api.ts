@@ -104,6 +104,10 @@ export interface RemoteSession {
 	endpoint_id: number | null;
 	endpoint_name: string | null;
 	provider: string | null;
+	/** "screen", "tunnel" or "terminal" (absent on older servers). */
+	type?: string;
+	/** Tunnel target host:port as seen from the device. */
+	target?: string;
 }
 
 export interface EnrollToken {
@@ -136,7 +140,8 @@ export interface ServerInfo {
 }
 
 export interface SessionTicket {
-	ticket: { sid: string; token: string; relay_path: string };
+	/** `type`: the session type the server started (absent on servers before tunnels and terminals). */
+	ticket: { sid: string; token: string; relay_path: string; type?: string; target?: string };
 	device: { id: string; public_key: string; hostname: string; os: string; alias: string };
 }
 
@@ -310,6 +315,10 @@ export interface StrategySettings {
 	allow_file_transfer?: boolean;
 	allow_audio?: boolean;
 	allow_whiteboard?: boolean;
+	allow_resolution?: boolean;
+	allow_tunnel?: boolean;
+	allow_tunnel_lan?: boolean;
+	allow_terminal?: boolean;
 	direct_enabled?: boolean;
 	lan_discovery?: boolean;
 	lock_after_session?: boolean;

@@ -174,6 +174,11 @@ fn control_row(ui: &mut Ui, title: &str, desc: &str, enabled: bool, paint: impl 
     if enabled { resp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { resp }
 }
 
+/// RustDesk-style checkbox row.
+fn check_row(ui: &mut Ui, title: &str, desc: &str, value: &mut bool) -> bool {
+    check_row_enabled(ui, title, desc, value, true)
+}
+
 /// Description of a row the organisation's strategy manages (shown greyed out and locked).
 fn managed_desc(desc: &str, managed: bool) -> String {
     if managed { format!("{desc} · {MANAGED_TEXT}") } else { desc.to_string() }
@@ -420,6 +425,16 @@ impl App {
             self.save_config(|c| c.viewer_codec = pref);
         }
 
+        card_title(ui, "หน้าต่างควบคุมเครื่องอื่น");
+        let mut tabs = self.local.viewer_tabs;
+        let changed = card(ui, |ui| {
+            check_row(ui, "เปิดเป็นแท็บในหน้าต่างเดียว", "แต่ละการเชื่อมต่อเป็นแท็บหนึ่ง คลิกขวาที่แท็บเพื่อแยกเป็นหน้าต่างใหม่ (ถ้าปิด จะเปิดหน้าต่างละเครื่อง)", &mut tabs)
+        });
+        if changed {
+            self.local.viewer_tabs = tabs;
+            self.mark_local();
+        }
+
         if cfg!(target_os = "macos") {
             permissions_ui::permissions_card(ui);
         }
@@ -436,6 +451,7 @@ impl App {
         card_title(ui, "สิทธิ์ของผู้ควบคุม");
         let (mut input, mut clip, mut files, mut board, mut sound) = (c.allow_input, c.allow_clipboard, c.allow_file_transfer, c.allow_whiteboard, c.allow_audio);
         let mut lock = c.lock_after_session;
+        let mut res = c.allow_resolution;
         let changed = card(ui, |ui| {
             let mut changed = row(ui, "ควบคุมเมาส์และคีย์บอร์ด", "ถ้าปิด ผู้เชื่อมต่อจะดูหน้าจอได้อย่างเดียว", &mut input, Managed::AllowInput);
             sep(ui);
@@ -452,6 +468,13 @@ impl App {
             };
             changed |= row(ui, "อนุญาตเสียง", hint, &mut sound, Managed::AllowAudio);
             sep(ui);
+            let hint = if crate::resolution::supported() {
+                "ผู้ควบคุมเปลี่ยนความละเอียดของหน้าจอนี้ได้ และคืนค่าเดิมเมื่อจบเซสชัน"
+            } else {
+                "ผู้ควบคุมเปลี่ยนความละเอียดของหน้าจอนี้ได้ (macOS และ Windows เท่านั้น)"
+            };
+            changed |= row(ui, "อนุญาตให้เปลี่ยนความละเอียด", hint, &mut res, Managed::AllowResolution);
+            sep(ui);
             changed |= row(ui, "ล็อกหน้าจอเมื่อจบเซสชัน", "ล็อกเครื่องนี้ทันทีที่ผู้ควบคุมคนสุดท้ายตัดการเชื่อมต่อ", &mut lock, Managed::LockAfterSession);
             changed
         });
@@ -463,6 +486,33 @@ impl App {
                 c.allow_whiteboard = board;
                 c.allow_audio = sound;
                 c.lock_after_session = lock;
+                c.allow_resolution = res;
+            });
+        }
+
+        card_title(ui, "TCP tunnel และเทอร์มินัล");
+        let (mut tunnel, mut lan, mut term) = (c.allow_tunnel, c.allow_tunnel_lan, c.allow_terminal);
+        let changed = card(ui, |ui| {
+            let mut changed = row(ui, "อนุญาต TCP tunnel", "ผู้เชื่อมต่อส่งต่อพอร์ตจากเครื่องของเขามายังพอร์ตบนเครื่องนี้ (เช่น RDP, SSH, ฐานข้อมูล)", &mut tunnel, Managed::AllowTunnel);
+            if tunnel {
+                sep(ui);
+                changed |= row(
+                    ui,
+                    "ให้ tunnel ไปเครื่องอื่นในเครือข่ายภายในได้",
+                    "ถ้าปิด tunnel ไปได้เฉพาะเครื่องนี้ (localhost) ไม่ว่าจะเปิดหรือปิด ก็ไม่ไปอินเทอร์เน็ต",
+                    &mut lan,
+                    Managed::AllowTunnelLan,
+                );
+            }
+            sep(ui);
+            changed |= row(ui, "อนุญาตเทอร์มินัล", "ผู้เชื่อมต่อเปิด shell บนเครื่องนี้ได้ ทำงานด้วยสิทธิ์ของผู้ใช้ที่เปิด Aegiron", &mut term, Managed::AllowTerminal);
+            changed
+        });
+        if changed {
+            self.save_config(|c| {
+                c.allow_tunnel = tunnel;
+                c.allow_tunnel_lan = lan;
+                c.allow_terminal = term;
             });
         }
 

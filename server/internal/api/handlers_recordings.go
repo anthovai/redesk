@@ -43,30 +43,40 @@ func recordingSignedMessage(deviceID, sid, sha string) []byte {
 	return []byte("aegiron-recording-v1\n" + deviceID + "\n" + sid + "\n" + sha)
 }
 
+// recordingApplies reports whether the policy says sessions with this device are recorded.
+func (a *API) recordingApplies(ctx context.Context, deviceID string) (bool, error) {
+	st, err := a.store.GetRecordingSettings(ctx)
+	if err != nil {
+		return false, err
+	}
+	switch st.Mode {
+	case "all":
+		return true, nil
+	case "groups":
+		d, err := a.store.GetDevice(ctx, deviceID)
+		if err != nil {
+			return false, err
+		}
+		if d.GroupID != nil && slices.Contains(st.GroupIDs, *d.GroupID) {
+			return true, nil
+		}
+	}
+	// A strategy can require recording for its devices whatever the server-wide mode.
+	strat, err := a.store.EffectiveStrategy(ctx, deviceID)
+	if err != nil {
+		return false, err
+	}
+	return strat != nil && strat.Settings.RecordSessions != nil && *strat.Settings.RecordSessions, nil
+}
+
 // recordingToken is the hub hook: decides by policy whether to record a new session.
 func (a *API) recordingToken(ctx context.Context, sid, deviceID string, userID int64, viewerIP string) string {
-	st, err := a.store.GetRecordingSettings(ctx)
+	must, err := a.recordingApplies(ctx, deviceID)
 	if err != nil {
 		a.log.Error("recording settings unavailable", "err", err)
 		return ""
 	}
-	record := false
-	switch st.Mode {
-	case "all":
-		record = true
-	case "groups":
-		d, err := a.store.GetDevice(ctx, deviceID)
-		record = err == nil && d.GroupID != nil && slices.Contains(st.GroupIDs, *d.GroupID)
-	}
-	if !record {
-		// A strategy can require recording for its devices whatever the server-wide mode.
-		strat, err := a.store.EffectiveStrategy(ctx, deviceID)
-		if err != nil {
-			a.log.Error("strategy unavailable", "device", deviceID, "err", err)
-		}
-		record = strat != nil && strat.Settings.RecordSessions != nil && *strat.Settings.RecordSessions
-	}
-	if !record {
+	if !must {
 		return ""
 	}
 	tok := auth.RandomToken(24)

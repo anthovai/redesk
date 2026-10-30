@@ -33,7 +33,7 @@ func randomDeviceID() string {
 
 // register connects and registers id with key; it returns the server's reply
 // ("registered" or "error"). The connection stays open after "registered".
-func (e *testEnv) register(id string, key ed25519.PrivateKey) (*fakeAgent, map[string]any) {
+func (e *testEnv) register(id string, key ed25519.PrivateKey, features ...string) (*fakeAgent, map[string]any) {
 	e.t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -47,7 +47,8 @@ func (e *testEnv) register(id string, key ed25519.PrivateKey) (*fakeAgent, map[s
 	nonce := "client-nonce-" + auth.RandomToken(8)
 	sig := ed25519.Sign(key, []byte("redesk-register-v1\n"+id+"\n"+ch["nonce"].(string)+"\n"+nonce))
 	a.write(ctx, map[string]any{"t": "register", "id": id, "pk": base64.StdEncoding.EncodeToString(key.Public().(ed25519.PublicKey)),
-		"nonce": nonce, "sig": base64.StdEncoding.EncodeToString(sig), "hostname": "test-host", "os": "testos", "version": "0.6.0"})
+		"nonce": nonce, "sig": base64.StdEncoding.EncodeToString(sig), "hostname": "test-host", "os": "testos", "version": "0.6.0",
+		"features": features})
 	return a, a.read(ctx)
 }
 
@@ -260,8 +261,21 @@ func TestChangeDeviceID(t *testing.T) {
 		t.Fatalf("old id, other key: %v", r)
 	}
 	// The agent registers under the new id; the old id is then free.
-	if _, r := e.register(newID, key); r["t"] != "registered" {
+	ag, r = e.register(newID, key, "tunnel1", "terminal1")
+	if r["t"] != "registered" {
 		t.Fatalf("new id: %v", r)
+	}
+	// Terminal and tunnel sessions reach the custom id (typed in any case).
+	for _, req := range []map[string]any{
+		{"device_id": strings.ToUpper(newID), "type": "terminal"},
+		{"device_id": newID, "type": "tunnel", "target": "127.0.0.1:22"},
+	} {
+		if st, r := e.post(nil, "POST", "/api/sessions", adm, req); st != 200 {
+			t.Fatalf("%v: %d %v", req["type"], st, r)
+		}
+		if m := ag.next("session"); m["sid"] == nil {
+			t.Fatalf("%v session: %v", req["type"], m)
+		}
 	}
 	if _, err := e.st.RenamedDevice(context.Background(), old); err == nil {
 		t.Fatal("old id still reserved after the agent confirmed")

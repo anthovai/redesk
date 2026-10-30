@@ -20,6 +20,11 @@ type StrategySettings struct {
 	AllowFileTransfer      *bool `json:"allow_file_transfer,omitempty"`
 	AllowAudio             *bool `json:"allow_audio,omitempty"`
 	AllowWhiteboard        *bool `json:"allow_whiteboard,omitempty"`
+	AllowResolution        *bool `json:"allow_resolution,omitempty"`
+	// Tunnels and the remote terminal (allow_tunnel_lan: tunnels may reach other LAN hosts).
+	AllowTunnel    *bool `json:"allow_tunnel,omitempty"`
+	AllowTunnelLAN *bool `json:"allow_tunnel_lan,omitempty"`
+	AllowTerminal  *bool `json:"allow_terminal,omitempty"`
 	// DirectEnabled false keeps every session on the relay (no LAN/P2P).
 	DirectEnabled *bool `json:"direct_enabled,omitempty"`
 	LANDiscovery  *bool `json:"lan_discovery,omitempty"`
