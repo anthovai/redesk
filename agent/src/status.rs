@@ -27,6 +27,9 @@ pub struct SessionInfo {
     pub recording: bool,
     /// Chat, voice call and switch sides with this viewer (connection manager).
     pub link: Arc<SessionLink>,
+    /// What a tunnel or terminal session does (Thai, e.g. "เปิดเทอร์มินัล…"); empty for
+    /// remote control.
+    pub purpose: String,
 }
 
 /// One chat message of a session (kept in memory only, gone when the session ends).
@@ -128,6 +131,8 @@ pub struct ApprovalRequest {
     pub ip: String,
     /// The session will be recorded if accepted (shown to the person deciding).
     pub recording: bool,
+    /// What is asked for besides remote control (see [`SessionInfo::purpose`]).
+    pub purpose: String,
     pub reply: oneshot::Sender<bool>,
 }
 

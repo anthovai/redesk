@@ -41,7 +41,7 @@ const downloaded: Uint8Array[] = [];
 // What arrived, by kind; `mark()` starts a new counting window.
 let stats = { jpeg: 0, h264: 0, av1: 0, keyframes: 0, firstVideoKey: null as boolean | null, audio: 0, audioGaps: 0, bytes: 0 };
 let lastSeq = -1;
-// Voice call (0x06) from the agent: packets, sequence gaps, and the packets themselves, which
+// Voice call (0x07) from the agent: packets, sequence gaps, and the packets themselves, which
 // are sent straight back as this viewer's microphone (bun has no Opus encoder).
 let voice = { packets: 0, gaps: 0, lastSeq: -1, echo: false };
 let voiceSeq = 0;
@@ -111,7 +111,7 @@ ws.onmessage = (ev) => {
 				lastSeq = seq;
 				return;
 			}
-			if (plain[0] === 6) {
+			if (plain[0] === 7) {
 				const seq = new DataView(plain.buffer, plain.byteOffset).getUint32(2);
 				if (plain[1] === 1 && plain.length > 6) voice.packets++;
 				if (voice.lastSeq >= 0 && seq !== voice.lastSeq + 1) voice.gaps++;
@@ -222,7 +222,7 @@ if (expectCm) {
 	check(voiceMsgs.some((m) => m.op === 'accept'), 'voice call accepted', voiceMsgs);
 	voice = { packets: 0, gaps: 0, lastSeq: voice.lastSeq, echo: true };
 	await sleep(2000);
-	check(voice.packets >= 80 && voice.gaps === 0, 'voice: 0x06 Opus packets every 20 ms without gaps', voice);
+	check(voice.packets >= 80 && voice.gaps === 0, 'voice: 0x07 Opus packets every 20 ms without gaps', voice);
 	await send({ t: 'voice', op: 'mute', muted: true });
 	await send({ t: 'voice', op: 'hangup' });
 	await sleep(800);

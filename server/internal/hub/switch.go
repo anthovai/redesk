@@ -82,7 +82,8 @@ func (h *Hub) SessionOf(sid string, userID int64) (string, error) {
 		rl = h.directs[sid]
 	}
 	h.mu.Unlock()
-	if rl == nil || rl.userID != userID {
+	// Only remote-control sessions: tunnels and terminals have no switch sides.
+	if rl == nil || rl.userID != userID || rl.kind != KindScreen {
 		return "", ErrNoSession
 	}
 	select {
@@ -126,7 +127,7 @@ func (h *Hub) switchConnect(ctx context.Context, a *agentConn, m agentMsg) {
 		return
 	}
 	viewer := ViewerInfo{Name: sg.name, IP: a.ip}
-	t, err := h.startSession(ctx, sg.to, sg.userID, viewer, m.Direct, a.id)
+	t, err := h.startSession(ctx, sg.to, sg.userID, viewer, m.Direct, SessionOptions{}, a.id)
 	if err != nil {
 		code := "unavailable"
 		if errors.Is(err, ErrOffline) {

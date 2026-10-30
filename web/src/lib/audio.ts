@@ -2,7 +2,7 @@
 // WebCodecs and played through Web Audio with a small jitter buffer.
 
 export const OPUS_CONFIG: AudioDecoderConfig = { codec: 'opus', sampleRate: 48000, numberOfChannels: 2 };
-/** Voice calls (0x06): mono Opus, 20 ms frames, in both directions. */
+/** Voice calls (0x07): mono Opus, 20 ms frames, in both directions. */
 export const VOICE_CONFIG: AudioDecoderConfig = { codec: 'opus', sampleRate: 48000, numberOfChannels: 1 };
 const VOICE_ENCODER: AudioEncoderConfig = { codec: 'opus', sampleRate: 48000, numberOfChannels: 1, bitrate: 32000 };
 

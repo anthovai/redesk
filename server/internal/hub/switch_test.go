@@ -31,7 +31,7 @@ func TestSwitchGrantIsOneTimeAndBound(t *testing.T) {
 
 func TestOfferSwitchNeedsTheViewersActiveSession(t *testing.T) {
 	h := New(nil, nil, slog.New(slog.DiscardHandler), nil)
-	rl := &relay{sid: "s1", deviceID: "111111111", userID: 7, paired: make(chan struct{}), done: make(chan struct{})}
+	rl := &relay{sid: "s1", deviceID: "111111111", userID: 7, kind: KindScreen, paired: make(chan struct{}), done: make(chan struct{})}
 	h.relays["s1"] = rl
 	h.agents["222222222"] = &agentConn{id: "222222222", out: make(chan []byte, 1)}
 
@@ -39,6 +39,10 @@ func TestOfferSwitchNeedsTheViewersActiveSession(t *testing.T) {
 		t.Fatalf("offered before the session was paired: %v", err)
 	}
 	close(rl.paired)
+	h.relays["t1"] = &relay{sid: "t1", deviceID: "111111111", userID: 7, kind: KindTerminal, paired: rl.paired, done: rl.done}
+	if _, err := h.OfferSwitch("t1", 7, "222222222", "pc", nil); !errors.Is(err, ErrNoSession) {
+		t.Fatalf("offered from a terminal session: %v", err)
+	}
 	if _, err := h.OfferSwitch("s1", 8, "222222222", "pc", nil); !errors.Is(err, ErrNoSession) {
 		t.Fatalf("another user offered: %v", err)
 	}

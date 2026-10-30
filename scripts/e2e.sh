@@ -8,7 +8,8 @@
 # Env: E2E_PORT (21200), E2E_DB (aegiron_e2e, dropped and recreated), PG_BIN (folder with psql,
 # createdb, dropdb), CHROME_PATH, E2E_NO_BUILD=1 (reuse existing builds), E2E_KEEP=1 (leave the
 # server and agent running and print how to reach them), E2E_REAL_AUDIO=1 (capture system audio
-# instead of the test tone; needs Screen Recording permission and something playing).
+# instead of the test tone; needs Screen Recording permission and something playing),
+# E2E_STEPS (space-separated subset of: protocol native media auth remote; default all).
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -62,10 +63,11 @@ for _ in $(seq 50); do curl -fs "$URL/healthz" >/dev/null 2>&1 && break; sleep 0
 KEY=$(sed -n 's/.*server identity" public_key="\([^"]*\)".*/\1/p' "$WORK/server.log")
 [ -n "$KEY" ] || { echo "server did not start"; exit 1; }
 
-echo "=== agent (scratch config, no input, no LAN/direct)"
+echo "=== agent (scratch config, no input, no LAN/direct; tunnels to this machine and terminals allowed)"
 AGENT=("$REL/aegiron-agent" --config "$WORK/agent/agent.toml")
 "${AGENT[@]}" init --server "$URL" --key "$KEY" >/dev/null
-"${AGENT[@]}" set --allow-audio true --allow-input false --allow-clipboard false --direct false >/dev/null
+"${AGENT[@]}" set --allow-audio true --allow-input false --allow-clipboard false --direct false \
+	--allow-tunnel true --allow-tunnel-lan false --allow-terminal true >/dev/null
 sed -i.bak 's/^lan_discovery = true/lan_discovery = false/' "$WORK/agent/agent.toml"
 TONE=tone
 [ -n "${E2E_REAL_AUDIO:-}" ] && TONE=
@@ -84,19 +86,36 @@ export AEGIRON_URL="$URL" AEGIRON_PASSWORD="$ADMIN_PW" ROOT ID REL
 export AEGIRON_EXPECT_CM=$([ -n "$CM" ] && echo 1 || echo 0)
 export PW=
 FAILED=0
-step() { echo; echo "=== $1"; shift; PW=$(pw); "$@" || FAILED=$((FAILED + 1)); }
+# step <key> <title> <command...>; E2E_STEPS="remote auth" runs only those.
+step() {
+	local key=$1
+	shift
+	if [ -n "${E2E_STEPS:-}" ] && [[ " $E2E_STEPS " != *" $key "* ]]; then return; fi
+	echo; echo "=== $1"; shift; PW=$(pw)
+	# A step fails if it exits non-zero, prints a FAIL line, or dies with an uncaught error
+	# (a crashed script does not always exit non-zero, and may never reach its own summary).
+	local log="$WORK/step-$key.log" code=0
+	"$@" 2>&1 | tee "$log" || code=$? # pipefail: the step's own status
+	if [ "$code" -ne 0 ] || grep -qE '^(FAIL |error: |Uncaught |[A-Za-z]*Error: )' "$log"; then
+		echo "=== step $key FAILED (exit $code)"
+		FAILED=$((FAILED + 1))
+	fi
+}
 
-step "protocol: codecs, audio, mute, chat, voice call (web/scripts/e2e-viewer.ts)" \
+step protocol "protocol: codecs, audio, mute, chat, voice call (web/scripts/e2e-viewer.ts)" \
 	bash -c 'cd "$ROOT/web" && bun scripts/e2e-viewer.ts "$ID" "$PW"'
-step "native viewer asks for AV1 (examples/media_probe)" bash -c '
+step native "native viewer asks for AV1 (examples/media_probe)" bash -c '
 	out=$(AEGIRON_CODEC=av1 AEGIRON_AUDIO_OUT=0 "$REL/examples/media_probe" "$ID" "$PW" 5 2>/dev/null | grep -E "^t=|SUMMARY")
 	echo "$out" | tail -3
 	echo "$out" | grep -q "codec=h264" && echo "$out" | grep -qE "audio_seconds_nonsilent=[1-9]"'
-step "browser: live viewer, chat, voice call, recordings, AV1 playback (web/scripts/e2e-media.ts)" \
+step media "browser: live viewer, chat, voice call, recordings, AV1 playback (web/scripts/e2e-media.ts)" \
 	env AEGIRON_AGENT_CONFIG="$WORK/agent/agent.toml" AEGIRON_E2E_DB="$DB_URL" PSQL="$PG_BIN/psql" \
 	AEGIRON_MAKE_RECORDING="$REL/examples/make_recording" bash -c 'cd "$ROOT/web" && bun scripts/e2e-media.ts "$ID" "$PW"'
-step "browser + CLI: remembered 2FA devices (web/scripts/e2e-auth.ts)" \
+step auth "browser + CLI: remembered 2FA devices (web/scripts/e2e-auth.ts)" \
 	env AEGIRON_AGENT_BIN="$REL/aegiron-agent" bash -c 'cd "$ROOT/web" && bun scripts/e2e-auth.ts'
+step remote "CLI + browser: TCP tunnels and terminals (web/scripts/e2e-remote.ts)" \
+	env AEGIRON_AGENT_BIN="$REL/aegiron-agent" AEGIRON_AGENT_CONFIG="$WORK/agent/agent.toml" \
+	bash -c 'cd "$ROOT/web" && bun scripts/e2e-remote.ts "$ID"'
 
 echo
 if [ $FAILED -ne 0 ]; then

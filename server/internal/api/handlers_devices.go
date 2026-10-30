@@ -278,8 +278,16 @@ func (a *API) deleteAddressEntry(w http.ResponseWriter, r *http.Request) {
 func (a *API) createSession(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		DeviceID string `json:"device_id"`
+		// Session type: "screen" (default), "tunnel" (with Target host:port) or "terminal".
+		Type   string `json:"type"`
+		Target string `json:"target"`
 	}
 	if !readJSON(w, r, &req) {
+		return
+	}
+	opts, err := hub.SessionOptions{Kind: req.Type, Target: req.Target}.Normalize()
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	u := userFrom(r)
@@ -311,9 +319,23 @@ func (a *API) createSession(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusConflict, "device key was reset; waiting for the agent to re-register")
 		return
 	}
+	// Tunnelled traffic cannot be recorded: where the policy records this device, no tunnels.
+	if opts.Kind == hub.KindTunnel {
+		if must, err := a.recordingApplies(r.Context(), d.ID); err != nil {
+			a.internal(w, err)
+			return
+		} else if must {
+			a.audit(r, "session.denied", d.ID, map[string]any{"reason": "recording_required", "type": opts.Kind, "target": opts.Target})
+			writeErr(w, http.StatusUnprocessableEntity, "sessions with this device must be recorded, and tunnels cannot be recorded")
+			return
+		}
+	}
 	ip := a.clientIP(r)
-	t, err := a.hub.StartSession(r.Context(), d.ID, u.ID, hub.ViewerInfo{Email: u.Email, Name: u.Name, IP: ip}, r.URL.Query().Get("direct") == "1")
+	t, err := a.hub.StartSessionOf(r.Context(), d.ID, u.ID, hub.ViewerInfo{Email: u.Email, Name: u.Name, IP: ip}, r.URL.Query().Get("direct") == "1", opts)
 	switch {
+	case errors.Is(err, hub.ErrUnsupported):
+		writeErr(w, http.StatusUnprocessableEntity, err.Error())
+		return
 	case errors.Is(err, hub.ErrOffline):
 		writeErr(w, http.StatusConflict, "device is offline")
 		return
@@ -324,7 +346,14 @@ func (a *API) createSession(w http.ResponseWriter, r *http.Request) {
 		a.internal(w, err)
 		return
 	}
-	a.audit(r, "session.request", d.ID, map[string]any{"sid": t.SID})
+	detail := map[string]any{"sid": t.SID}
+	if opts.Kind != hub.KindScreen {
+		detail["type"] = opts.Kind
+		if opts.Target != "" {
+			detail["target"] = opts.Target
+		}
+	}
+	a.audit(r, "session.request", d.ID, detail)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ticket": t,
 		"device": map[string]any{"id": d.ID, "public_key": d.PublicKey, "hostname": d.Hostname, "os": d.OS, "alias": d.Alias},

@@ -1,4 +1,4 @@
-//! Two-way voice calls inside a session: each side sends its microphone as Opus `0x06` packets
+//! Two-way voice calls inside a session: each side sends its microphone as Opus `0x07` packets
 //! (48 kHz mono, 20 ms) and plays the other side's. Used by the agent (host) and the desktop
 //! viewer alike; the browser viewer has its own implementation in web/src/lib/audio.ts.
 //!
@@ -29,7 +29,7 @@ pub struct Call {
 }
 
 impl Call {
-    /// Opens the microphone (blocking for up to a few seconds) and starts sending `0x06`
+    /// Opens the microphone (blocking for up to a few seconds) and starts sending `0x07`
     /// packets to `out`; packets are dropped rather than queued when it is full.
     pub fn start(out: mpsc::Sender<Vec<u8>>) -> Result<Call> {
         let stop = Arc::new(AtomicBool::new(false));
@@ -70,7 +70,7 @@ impl Call {
         Ok(Call { stop, muted, dec: None, player: None, silent, level: None })
     }
 
-    /// Plays one `0x06` message from the other side.
+    /// Plays one `0x07` message from the other side.
     pub fn receive(&mut self, msg: &[u8]) {
         let Some((proto::AUDIO_OPUS, _seq, packet)) = proto::parse_voice(msg) else { return };
         if self.dec.is_none() {

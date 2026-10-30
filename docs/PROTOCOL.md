@@ -24,7 +24,7 @@ server → agent  {"t":"registered","sig":Ed25519(server_key, "redesk-server-v1\
 - Wake-on-LAN: `POST /api/devices/{id}/wake` picks an online agent on the same LAN (same public IP and/or subnet) and sends it `{"t":"wol","macs":[...],"target":"<id>"}`. The helper broadcasts the magic packet (UDP 9 and 7) and reports `wol_sent`. Errors: `online_already`, `no_mac`, `no_helper`, `helper_busy`, `rate_limited`.
 - LAN discovery (not through the server): a viewer broadcasts `redesk-discover v1` to UDP 21120; agents on the same subnet with `lan_discovery = true` answer `{id, hostname, os}`, rate-limited.
 - Session request: `{"t":"session","sid","token","relay":"/ws/relay","viewer":{"email","name","ip"}}`.
-- Session request: `{"t":"session",…,"switch":true}` marks a switch-sides session ([§11](#11-chat-voice-calls-and-switch-sides)).
+- Session request: `{"t":"session",…,"switch":true}` marks a switch-sides session ([§12](#12-chat-voice-calls-and-switch-sides)).
 - Agent → server audit events: `{"t":"event","sid","kind","detail"}` with `kind` in `auth_failed | auth_ok | denied | locked | file_upload | file_download | wol_sent`. They are stored as `agent.<kind>` and attributed to the viewer of that session.
 
 ## 2. Relay (`/ws/relay?sid=&token=`)
@@ -54,7 +54,7 @@ Every later message is binary ciphertext. A dropped, reordered, or replayed mess
 
 ## 4. Messages inside the encrypted channel
 
-Byte 0 is the type: `0x01` JSON, `0x02` video rectangle (`x, y, frame_w, frame_h` as u16 BE, followed by a JPEG), `0x03` file chunk (transfer id as u32 BE, followed by up to 64 KiB of data), `0x04` video frame (codec u8 `1` = H.264 or `2` = AV1, flags u8 with bit 0 = keyframe, `width, height` as u16 BE, followed by one access unit: Annex B for H.264, one temporal unit of low-overhead OBUs for AV1), `0x05` audio packet (see [Audio](#audio)), `0x06` voice-call packet (see [§11](#11-chat-voice-calls-and-switch-sides)).
+Byte 0 is the type: `0x01` JSON, `0x02` video rectangle (`x, y, frame_w, frame_h` as u16 BE, followed by a JPEG), `0x03` file chunk (transfer id as u32 BE, followed by up to 64 KiB of data), `0x04` video frame (codec u8 `1` = H.264 or `2` = AV1, flags u8 with bit 0 = keyframe, `width, height` as u16 BE, followed by one access unit: Annex B for H.264, one temporal unit of low-overhead OBUs for AV1), `0x05` audio packet (see [Audio](#audio)), `0x06` message of an extra display stream (see [Displays, resolution and input modes](#displays-resolution-and-input-modes)), `0x07` voice-call packet (see [§12](#12-chat-voice-calls-and-switch-sides)), `0x10` tunnel data and `0x11` terminal data (tunnel and terminal sessions only, see §11).
 
 | Direction | Message |
 |---|---|
@@ -144,6 +144,26 @@ Needs both the `clipboard` and `files` permissions. The viewer opts in with `aut
 Pointer coordinates are normalised to 0–1 over the displayed frame. Plain typing uses the actual character (Thai and other layouts work). Shortcuts with Ctrl/Cmd/Alt use the physical key.
 
 Authentication: 3 attempts per session; 5 consecutive failures lock the agent for 60 s. The temporary password rotates after every successful login.
+
+### Displays, resolution and input modes
+
+Agents from 0.6 add these to `info.features`; a viewer uses each only when it is listed, so older agents never see the new messages and older viewers never send them. `info.displays[]` entries also carry `x`, `y` (position in the same units as `width`/`height`) so a viewer can draw the layout.
+
+| Feature | Direction | Message |
+|---|---|---|
+| `alldisp` | viewer→agent | `cfg {display_all: true}` streams every display as one picture (the bounding box of all displays, each placed by its position; mixed DPI is scaled to the densest display). `cfg {display: n}` goes back to one display. Pointer input, `cursor` and annotations are normalised over the whole picture. |
+| `multidisp` | viewer→agent | `cfg {streams: [1, 2]}`: stream these displays *in addition* to the main one (at most 8; the full list each time, `[]` stops them). |
+| `multidisp` | agent→viewer | Byte `0x06`: display u8, then a complete message of the main stream for that display (`0x02` rectangle, `0x04` video frame, or `0x01` JSON such as `cursor` and `encoder`). Quality, fps, codec and `refresh` apply to every stream. Extra streams are not recorded. |
+| `multidisp` | viewer→agent | `mm {x,y,d}`, `mb {b,down,x,y,d}`: with `d` the position is normalised to display `d` instead of the main stream. |
+| `resolution` | viewer→agent | `res_list {display}` → `res_list {display, current:{w,h,hz}, original:{w,h,hz}, modes:[{w,h,hz}]}` (`w`, `h` in the display's own units: points on macOS, pixels elsewhere; `hz` 0 when unknown) |
+| `resolution` | viewer→agent | `res_set {display, w, h, hz?}` → `res_ok {display, w, h, hz}` and `displays {displays[]}` with the new sizes, or `res_error {display, message}`. `res_restore {display}` puts the original mode back. |
+| `keymode` | viewer→agent | `cfg {keyboard: "map" \| "translate"}` (default `translate`) |
+| `relmouse` | viewer→agent | `mr {dx, dy}`: relative pointer motion in the remote's input units (each clamped to ±2000). `mb {b, down}` without `x`/`y` presses where the pointer is. |
+
+- **Resolution** is only offered when the host allows it (`allow_resolution`, default on; app Settings → ความปลอดภัย → อนุญาตให้เปลี่ยนความละเอียด, or `aegiron-agent set --allow-resolution false`) and the platform can do it: macOS (CoreGraphics `CGDisplayCopyAllDisplayModes` / `CGDisplaySetDisplayMode`, desktop-usable modes only) and Windows (`EnumDisplaySettingsExW` / `ChangeDisplaySettingsExW` with `CDS_FULLSCREEN`, so nothing is written to the registry). `info.resolution: true` says so. The agent remembers each display's mode before the first change and restores it when the session ends, however it ends. `AEGIRON_TEST_RESOLUTION=fake` in the agent's environment replaces the platform with an in-memory list of modes (tests; never set by the app or installers).
+- **Keyboard modes.** `translate` (the default, and what older agents do) types the character of each key, so any layout works without the remote having it, and uses physical keys only for shortcuts with Ctrl/Cmd/Alt. `map` presses the physical key for every key (`code`), down and up, like a keyboard plugged into the remote machine: the remote's own layout decides the character (Thai typing then needs the Thai layout on the remote), and games see real key presses and releases. `text {s}` still types text in both modes.
+- **Relative mouse** is for games and 3D apps that read raw motion: the browser uses pointer lock and the desktop app grabs and hides the cursor; both toggle it with Ctrl+Alt+M (Esc also leaves pointer lock in the browser).
+- **Each display in its own window** (desktop app): the app keeps one session and asks for the other displays with `cfg {streams}`; each extra window renders its `0x06` messages and sends input with `d`.
 
 ## 5. Desktop app sign-in
 
@@ -278,11 +298,68 @@ The agent checks it during the HTTP upgrade, before any WebSocket frame: the sid
 - macOS delivers links as a `kAEGetURL` Apple Event, at launch and while the app runs. The app handles it with `NSAppleEventManager` (installed before the event loop starts and again after launch). Windows passes the link as the first argument.
 - One app instance per user and config file. The first instance holds an exclusive lock on `instance.lock` next to `agent.toml` and listens on a Unix socket `instance.sock` there (folder 0700, socket 0600) or, on Windows, on the named pipe `\\.\pipe\aegiron-<first 8 bytes of SHA-256(config path), hex>` (remote clients rejected; other users cannot write to it). A second launch sends one message, `aegiron-show` or `aegiron-open <9-digit id>` (at most 64 bytes, parsed strictly), and exits.
 
-## 11. Chat, voice calls and switch sides
+## 11. TCP tunnels and remote terminals
 
-In-session communication between the viewer and the person at the controlled machine, like RustDesk's chat, voice call and "switch sides". Everything travels inside the §4 encrypted channel: the server never sees chat text or voice, and nothing of it is stored (not on the server, not in session recordings, not on disk). All of it needs the desktop app (`aegiron`) on the controlled machine, whose connection manager shows it; the headless `aegiron-agent` never offers it.
+Two session types that stream no screen, like RustDesk's *TCP tunneling* and *terminal*. They use the same session request, relay or direct path, handshake (§3) and authentication (password and/or approval, lockout, one-time password rotation) as remote control; only what follows `auth_result {ok:true}` differs.
 
-**Negotiation.** The agent lists `chat`, `voice` and `switch` in `info.features` (with the existing `fs2`, `clipfiles`); the viewer lists what it supports in `auth.features`. A feature is used only when both sides list it, so 0.4/0.5 agents and viewers never see these messages, and agents ignore them from viewers that did not list the feature.
+**Negotiation (old peers refuse cleanly)**
+
+- Agents that run them add `"tunnel1"` and `"terminal1"` to `register.features`.
+- The viewer asks with `POST /api/sessions {device_id, type: "tunnel", target: "host:port"}` or `{device_id, type: "terminal"}` (absent `type` = `"screen"`). The target is `host:port` (`[v6]:port`) as seen from the controlled machine; the host name is lower-cased. A bad target or type is `400`. An online agent that did not advertise the feature gets nothing and the viewer gets `422 the device's Aegiron version does not support this session type`. Older servers reject the unknown fields with `400`.
+- The ticket always carries `type` (and `target`); viewers of tunnels and terminals refuse a ticket without the type they asked for. The agent's `session` request carries `"type"` and `"target"`; older agents never receive one.
+- The viewer repeats the type in `auth {…, session: "tunnel"|"terminal", target}`. If it differs from the server's request the agent answers `auth_result {ok:false, reason:"session_mismatch"}`. After authentication the agent sends `info {session, hostname, os, …}`; a viewer that gets an `info` without the expected `session` (an agent that started a screen session) closes.
+
+**Device permissions** (off by default; checked right after the handshake, before any password is used, refused with `auth_result {ok:false, reason}` and reported as `agent.denied {reason, session, target}`):
+
+| Setting (`agent.toml`, app Settings → ความปลอดภัย, `aegiron-agent set`) | Default | Refusal |
+|---|---|---|
+| `allow_tunnel` / `--allow-tunnel` | off | `tunnel_disabled` |
+| `allow_tunnel_lan` / `--allow-tunnel-lan`: tunnels may also reach private networks (10/8, 172.16/12, 192.168/16, 169.254/16, fc00::/7, fe80::/10) | off: loopback only | `target_not_allowed` |
+| `allow_terminal` / `--allow-terminal` | off | `terminal_disabled` |
+
+Tunnels never reach public addresses. The agent resolves the target itself; every address the name resolves to must be allowed, and only those addresses are connected to. The approval prompt says what is asked ("เปิด TCP tunnel ไปที่ localhost:3389", "เปิดเทอร์มินัล (shell) บนเครื่องนี้"), and the connection manager shows it for the whole session.
+
+**Recording.** Tunnelled traffic cannot be recorded: when the policy records a device (§7), `POST /api/sessions` refuses tunnels with `422` and audits `session.denied {reason: "recording_required"}` (an agent that still gets a recording token for a tunnel refuses with `recording_required`). Terminal sessions are recorded like `script(1)`: the agent records the `0x11` output it sends and `{"t":"term_size","cols","rows"}` at start and on every resize, never the keystrokes. The server stores such recordings with `codec = "terminal"`, and the console plays them in xterm.js with their timing.
+
+**Audit.** `session.request`, `session.start` and `session.end` (relay and direct) carry `type` and, for tunnels, `target`; so do the agent events of the session. Agent events: `tunnel_open {target}`, `tunnel_closed {target, connections, bytes_up, bytes_down}`, `terminal_open {shell, cols, rows}`, `terminal_closed {reason: "exited"|"viewer_left"|"local_user", code?}`. `GET /api/sessions` lists `type` and `target` (column `remote_sessions.kind`/`target`, migration `010_session_types.sql`).
+
+Both ends send `{"t":"ping"}` at least every 30 s while idle (ignored by the receiver) and give up after 120 s without any message.
+
+### Tunnels
+
+The viewer listens on `127.0.0.1:<local port>` (bound before the session starts, so a busy port fails at once) and turns every accepted connection into a stream; the agent connects each stream to the session's target. Up to 64 streams at a time.
+
+| Direction | Message |
+|---|---|
+| viewer→agent | `tcp_open {id}` (`id` u32, non-zero, chosen by the viewer) |
+| agent→viewer | `tcp_opened {id}`, or `tcp_error {id, message}` (connect failed or refused; the viewer closes the local connection) |
+| both | `0x10` data: stream id (u32 BE) followed by 1–32 KiB |
+| both | `tcp_ack {id, n}`: `n` bytes of that stream were written to the local socket |
+| both | `tcp_eof {id}`: the sender's socket reached end of file (half-close): the receiver shuts down the write side of its socket after the data before it, and may keep sending |
+| both | `tcp_close {id}`: the sender's socket failed; the receiver drops the stream |
+
+Flow control: a side never has more than 256 KiB of a stream unacknowledged, and acknowledges only what it has written to its socket, so a slow consumer slows its own stream and nothing else; a peer that exceeds the window gets `tcp_close`. A stream is gone once both directions sent `tcp_eof`, or after `tcp_close`. The info message carries `target`, `window` and `max_streams`.
+
+Clients: `aegiron-agent tunnel <id> <local>:<host>:<port>` (password prompted or `AEGIRON_REMOTE_PASSWORD`), and in the app the peer menu's *TCP tunnel…* (local port, host, port, presets RDP/SSH/VNC/HTTP; on Windows it can start `mstsc` on the local port once open). Open tunnels are listed at the bottom right with their connections and traffic until stopped.
+
+### Terminal
+
+After `info` the viewer sends `term_open {cols, rows}`; the agent then starts the user's shell (`$SHELL`, else the account's shell, else `/bin/sh`, as a login shell; on Windows PowerShell, else `%COMSPEC%`) in a pseudo-terminal (openpty, ConPTY on Windows) in the home folder, with `TERM=xterm-256color`, `LANG=en_US.UTF-8` when no locale is set, and answers `term_started {shell}`. It runs as the agent's user.
+
+| Direction | Message |
+|---|---|
+| agent→viewer | `0x11` + PTY output (raw bytes; UTF-8 can be split across messages) |
+| viewer→agent | `0x11` + keystrokes as a terminal sends them (Ctrl-C is byte `0x03`, which the PTY turns into SIGINT) |
+| viewer→agent | `term_resize {cols, rows}` (2–500 × 1–300) |
+| agent→viewer | `term_exit {code, message?}` when the shell exits (`message` when it could not start); the session then ends |
+
+Clients: the console's `/terminal/<id>` (xterm.js 5.5.0, menu *เทอร์มินัล* on a device), the app's terminal window (peer menu *เปิดเทอร์มินัล*; a VT100/xterm renderer with 256 colours, scrollback, paste, Thai through the system Thai font), and `aegiron-agent terminal <id> [--command CMD]` (raw mode on macOS/Linux; with `--command` it runs `CMD`, then `exit`, and returns the remote status).
+
+## 12. Chat, voice calls and switch sides
+
+In-session communication between the viewer and the person at the controlled machine, like RustDesk's chat, voice call and "switch sides". Everything travels inside the §4 encrypted channel: the server never sees chat text or voice, and nothing of it is stored (not on the server, not in session recordings, not on disk). All of it needs the desktop app (`aegiron`) on the controlled machine, whose connection manager shows it; the headless `aegiron-agent` never offers it. Only remote-control (screen) sessions have it: tunnel and terminal sessions (§11) never list these features, and the server issues switch-sides grants only for screen sessions. In the desktop app's tabbed viewer, a background tab shows its unread chat count on the tab.
+
+**Negotiation.** The agent lists `chat`, `voice` and `switch` in `info.features` (with the existing `fs2`, `clipfiles` and the display features); the viewer lists what it supports in `auth.features`. A feature is used only when both sides list it, so 0.4/0.5 agents and viewers never see these messages, and agents ignore them from viewers that did not list the feature.
 
 | Feature | Agent offers it when | Viewers that send it |
 |---|---|---|
@@ -298,13 +375,13 @@ Both directions: `chat {text}`, at most 4000 characters (longer is cut, blank is
 
 ```
 viewer → agent  voice {op:"call"}                  the person at the agent has 30 s to answer
-agent  → viewer voice {op:"accept"}                both sides now send 0x06 packets
+agent  → viewer voice {op:"accept"}                both sides now send 0x07 packets
              or voice {op:"decline", reason:"declined"|"timeout"|"unavailable"}
 either side     voice {op:"mute", muted}           informational: the muted side stops sending
 either side     voice {op:"hangup"}                also cancels a call not yet answered
 ```
 
-Byte `0x06`: same layout as `0x05`: codec u8 (`1` = Opus), sequence u32 BE (+1 per 20 ms frame), one Opus packet, 48 kHz, 20 ms, **mono** at about 32 kbit/s (decoders also accept stereo). Packets flow only while a call that the person at the agent accepted is on, never before `accept` or after `hangup`, and are dropped rather than queued under congestion. They are never recorded, and system audio (`0x05`) continues independently.
+Byte `0x07`: same layout as `0x05`: codec u8 (`1` = Opus), sequence u32 BE (+1 per 20 ms frame), one Opus packet, 48 kHz, 20 ms, **mono** at about 32 kbit/s (decoders also accept stereo). Packets flow only while a call that the person at the agent accepted is on, never before `accept` or after `hangup`, and are dropped rather than queued under congestion. They are never recorded, and system audio (`0x05`) continues independently.
 
 - **Agent**: an incoming call rings in the connection manager (รับสาย / ปฏิเสธ, declined automatically after 30 s, `reason:"timeout"`); during a call it shows the duration, ปิดไมค์ and วางสาย. A microphone that cannot be opened declines with `unavailable`. The agent reports `agent.voice_call` to the audit log when a call is accepted.
 - **Desktop app** (both ends): microphone through cpal (CoreAudio, WASAPI), mono Opus (VOIP mode), playback through the default output with a ~80 ms jitter buffer. There is no echo cancellation, so two desktop apps on loudspeakers can echo; headsets avoid it. macOS asks for the Microphone permission the first time (`NSMicrophoneUsageDescription` in the app bundle; MDM cannot pre-grant the microphone).

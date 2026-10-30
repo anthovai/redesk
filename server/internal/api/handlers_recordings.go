@@ -43,21 +43,33 @@ func recordingSignedMessage(deviceID, sid, sha string) []byte {
 	return []byte("aegiron-recording-v1\n" + deviceID + "\n" + sid + "\n" + sha)
 }
 
+// recordingApplies reports whether the policy says sessions with this device are recorded.
+func (a *API) recordingApplies(ctx context.Context, deviceID string) (bool, error) {
+	st, err := a.store.GetRecordingSettings(ctx)
+	if err != nil {
+		return false, err
+	}
+	switch st.Mode {
+	case "all":
+		return true, nil
+	case "groups":
+		d, err := a.store.GetDevice(ctx, deviceID)
+		if err != nil {
+			return false, err
+		}
+		return d.GroupID != nil && slices.Contains(st.GroupIDs, *d.GroupID), nil
+	}
+	return false, nil
+}
+
 // recordingToken is the hub hook: decides by policy whether to record a new session.
 func (a *API) recordingToken(ctx context.Context, sid, deviceID string, userID int64, viewerIP string) string {
-	st, err := a.store.GetRecordingSettings(ctx)
+	must, err := a.recordingApplies(ctx, deviceID)
 	if err != nil {
 		a.log.Error("recording settings unavailable", "err", err)
 		return ""
 	}
-	switch st.Mode {
-	case "all":
-	case "groups":
-		d, err := a.store.GetDevice(ctx, deviceID)
-		if err != nil || d.GroupID == nil || !slices.Contains(st.GroupIDs, *d.GroupID) {
-			return ""
-		}
-	default:
+	if !must {
 		return ""
 	}
 	tok := auth.RandomToken(24)

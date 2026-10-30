@@ -15,7 +15,27 @@ export interface DisplayInfo {
 	width: number;
 	height: number;
 	primary: boolean;
+	/** Position in the same units as width/height (agents from 0.6). */
+	x?: number;
+	y?: number;
 }
+
+/** A display mode for `res_list` / `res_set` (feature "resolution"). */
+export interface DisplayMode {
+	w: number;
+	h: number;
+	/** Refresh rate, 0 when unknown. */
+	hz: number;
+}
+
+export interface ModeList {
+	display: number;
+	current: DisplayMode;
+	original: DisplayMode;
+	modes: DisplayMode[];
+}
+
+export type KeyboardMode = 'translate' | 'map';
 
 export interface AgentInfo {
 	hostname: string;
@@ -40,6 +60,8 @@ export interface AgentInfo {
 	/** The agent streams its audio to this viewer (0x05 Opus packets). */
 	audio?: boolean;
 	audio_codec?: string | null;
+	/** The remote resolution can be changed from here (feature "resolution", host allows it). */
+	resolution?: boolean;
 }
 
 /** One chat message of this session (kept in the page only; never stored by the server). */
@@ -105,7 +127,7 @@ const MSG_FRAME = 0x02;
 const MSG_FILE = 0x03;
 const MSG_VIDEO = 0x04;
 const MSG_AUDIO = 0x05;
-const MSG_VOICE = 0x06;
+const MSG_VOICE = 0x07;
 const AUDIO_OPUS = 1;
 const CODEC_KEY = 'aegiron.viewer.codec';
 
@@ -181,10 +203,16 @@ export class RemoteViewer {
 	callSince = $state(0);
 	micMuted = $state(false);
 	remoteMuted = $state(false);
-	/** One-off message for the page to show (call declined, microphone blocked, ...). */
-	notice = $state<string | null>(null);
 	/** This browser can take part in voice calls. */
 	canVoice = $state(false);
+	/** Streaming every display as one picture (feature "alldisp"). */
+	displayAll = $state(false);
+	/** Display modes of the display asked for with `listModes` (feature "resolution"). */
+	modes = $state<ModeList | null>(null);
+	/** How keys reach the remote machine (feature "keymode"); this session only. */
+	keyboard = $state<KeyboardMode>('translate');
+	/** A message for the page to show once (resolution changes); `n` changes every time. */
+	notice = $state<{ text: string; n: number } | null>(null);
 
 	private ws: WebSocket | null = null;
 	private ch: Channel | null = null;
@@ -195,6 +223,8 @@ export class RemoteViewer {
 	private canvas: HTMLCanvasElement | null = null;
 	private ctx: CanvasRenderingContext2D | null = null;
 	private pendingMove: [number, number] | null = null;
+	private pendingRel: [number, number] = [0, 0];
+	private relScheduled = false;
 	private moveScheduled = false;
 	private frames = 0;
 	private bytesIn = 0;
@@ -377,6 +407,19 @@ export class RemoteViewer {
 			case 'get_end':
 				if (this.folderDownloads.has(m.id)) this.finishFolderDownload(m.id);
 				else this.finishDownload(m.id);
+				break;
+			case 'res_list':
+				this.modes = { display: m.display, current: m.current, original: m.original, modes: m.modes ?? [] };
+				break;
+			case 'res_ok':
+				if (this.modes && this.modes.display === m.display) this.modes = { ...this.modes, current: { w: m.w, h: m.h, hz: m.hz ?? 0 } };
+				this.say(`เปลี่ยนความละเอียดเป็น ${m.w}×${m.h} แล้ว`);
+				break;
+			case 'res_error':
+				this.say(`เปลี่ยนความละเอียดไม่สำเร็จ: ${m.message ?? ''}`);
+				break;
+			case 'displays':
+				if (this.info && Array.isArray(m.displays)) this.info = { ...this.info, displays: m.displays };
 				break;
 			case 'cursor':
 				this.cursor = m.visible ? { x: m.x, y: m.y } : null;
@@ -828,7 +871,7 @@ export class RemoteViewer {
 			await mic.open();
 		} catch (e) {
 			this.endCall();
-			this.notice = e instanceof DOMException && e.name === 'NotAllowedError' ? 'เบราว์เซอร์ไม่อนุญาตให้ใช้ไมโครโฟน' : 'เปิดไมโครโฟนไม่สำเร็จ';
+			this.say(e instanceof DOMException && e.name === 'NotAllowedError' ? 'เบราว์เซอร์ไม่อนุญาตให้ใช้ไมโครโฟน' : 'เปิดไมโครโฟนไม่สำเร็จ');
 			return;
 		}
 		if (this.mic !== mic) return; // hung up while asking
@@ -864,7 +907,7 @@ export class RemoteViewer {
 				} catch (e) {
 					console.warn('voice: cannot start the microphone', e);
 					this.hangup();
-					this.notice = 'เปิดไมโครโฟนไม่สำเร็จ';
+					this.say('เปิดไมโครโฟนไม่สำเร็จ');
 					return;
 				}
 				this.call = 'active';
@@ -873,17 +916,18 @@ export class RemoteViewer {
 			case 'decline':
 				if (this.call === 'idle') return;
 				this.endCall();
-				this.notice =
+				this.say(
 					m.reason === 'timeout'
 						? 'ปลายทางไม่รับสาย'
 						: m.reason === 'unavailable'
 							? 'ปลายทางรับสายไม่ได้ (ไม่อนุญาตการโทร หรือไม่มีไมโครโฟน)'
-							: 'ปลายทางปฏิเสธการโทร';
+							: 'ปลายทางปฏิเสธการโทร'
+				);
 				break;
 			case 'hangup':
 				if (this.call === 'idle') return;
 				this.endCall();
-				this.notice = 'ปลายทางวางสายแล้ว';
+				this.say('ปลายทางวางสายแล้ว');
 				break;
 			case 'mute':
 				this.remoteMuted = !!m.muted;
@@ -931,6 +975,27 @@ export class RemoteViewer {
 		this.send({ t: 'mb', b, down, x, y });
 	}
 
+	/** Relative pointer motion in the remote's input units (feature "relmouse"), one message per frame. */
+	relativeMove(dx: number, dy: number) {
+		this.pendingRel[0] += dx;
+		this.pendingRel[1] += dy;
+		if (this.relScheduled) return;
+		this.relScheduled = true;
+		requestAnimationFrame(() => {
+			this.relScheduled = false;
+			const clamp = (v: number) => Math.max(-2000, Math.min(2000, Math.round(v)));
+			const [dx, dy] = [clamp(this.pendingRel[0]), clamp(this.pendingRel[1])];
+			// Keep the fraction that did not make a whole unit for the next frame.
+			this.pendingRel = this.pendingRel.map((v) => v - Math.round(v)) as [number, number];
+			if (dx || dy) this.send({ t: 'mr', dx, dy });
+		});
+	}
+
+	/** Button press/release where the remote pointer is (relative mode). */
+	relativeButton(b: number, down: boolean) {
+		this.send({ t: 'mb', b, down });
+	}
+
 	wheel(dx: number, dy: number) {
 		this.send({ t: 'wh', dx, dy });
 	}
@@ -949,7 +1014,54 @@ export class RemoteViewer {
 
 	configure(cfg: { fps?: number; quality?: number; max_width?: number; display?: number }) {
 		this.send({ t: 'cfg', ...cfg });
-		if (cfg.display !== undefined && this.info) this.info.display = cfg.display;
+		if (cfg.display !== undefined) {
+			this.displayAll = false;
+			if (this.info) this.info.display = cfg.display;
+		}
+	}
+
+	/** Optional capability of the agent (`info.features`). */
+	has(feature: string): boolean {
+		return !!this.info?.features?.includes(feature);
+	}
+
+	/** Every display as one picture (feature "alldisp"); `configure({display})` goes back to one. */
+	showAllDisplays() {
+		if (!this.has('alldisp')) return;
+		this.displayAll = true;
+		this.send({ t: 'cfg', display_all: true });
+	}
+
+	/** Whether the remote resolution can be changed (feature "resolution", allowed by the host). */
+	get canResize(): boolean {
+		return this.has('resolution') && !!this.info?.resolution;
+	}
+
+	listModes(display: number) {
+		if (!this.canResize) return;
+		if (this.modes?.display !== display) this.modes = null;
+		this.send({ t: 'res_list', display });
+	}
+
+	setResolution(display: number, mode: DisplayMode) {
+		if (!this.canResize) return;
+		this.send({ t: 'res_set', display, w: mode.w, h: mode.h, ...(mode.hz ? { hz: mode.hz } : {}) });
+	}
+
+	restoreResolution(display: number) {
+		if (!this.canResize) return;
+		this.send({ t: 'res_restore', display });
+	}
+
+	/** Map (physical key positions) or translate (characters); feature "keymode". */
+	setKeyboard(mode: KeyboardMode) {
+		if (!this.has('keymode')) return;
+		this.keyboard = mode;
+		this.send({ t: 'cfg', keyboard: mode });
+	}
+
+	private say(text: string) {
+		this.notice = { text, n: (this.notice?.n ?? 0) + 1 };
 	}
 
 	refresh() {
